@@ -1,0 +1,32 @@
+defaults:
+  - PowerGridworld_evovernight13node_config
+  - _self_
+
+agents: [EVChargingEnv, EVChargingEnv, EVChargingEnv, EVChargingEnv, EVChargingEnv, EVChargingEnv, EVChargingEnv, EVChargingEnv, EVChargingEnv, EVChargingEnv, EVChargingEnv]
+start_time: "08-12-2020 20:00:00"
+end_time: "08-13-2020 08:00:00"
+control_timedelta: 900 #seconds
+
+# The buses with EVs in the Power Gridworld
+busses: ['634a', '634b', '634c', '645', '675a', '675b', '675c', '670a', '670b', '670c', '684c']
+
+# Grid Model Parameters
+cls: "OpenDSSSolver"
+feeder_file: "ieee_13_dss/IEEE13Nodeckt.dss"
+loadshape_file: "ieee_13_dss/annual_hourly_load_profile.csv"
+system_load_rescale_factor: 0.9
+
+
+# Per agent parameters
+num_vehicles: 70
+minutes_per_step: 15
+max_charge_rate_kw: 7.
+peak_threshold: 700.
+vehicle_multiplier: 1.
+rescale_spaces: False
+unserved_penalty: 0.0
+
+envcomm_path: "/Users/brookleigh/Documents/GitHub/IEEE_13_node_testbench/PowerGridworld/gridworld/envcomm.py"
+
+python_env_path: "/opt/anaconda3/envs/gridworld/bin/python"
+
