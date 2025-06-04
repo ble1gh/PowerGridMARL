@@ -1,0 +1,9 @@
+defaults:
+  - customenv_13nodeevovernight_config
+  - _self_
+
+max_steps: 200
+n_agents: 5
+start_time: "08-12-2020 20:00:00"
+end_time: "08-13-2020 08:00:00"
+control_timedelta: 900
