@@ -1,0 +1,69 @@
+_wandb:
+    value:
+        cli_version: 0.19.11
+        code_path: code/examples/SingleAgent/ValleyFilling_SAC.py
+        m: []
+        python_version: 3.10.16
+        t:
+            "1":
+                - 1
+                - 55
+            "2":
+                - 1
+                - 55
+            "3":
+                - 13
+                - 16
+                - 23
+                - 35
+                - 55
+            "4": 3.10.16
+            "5": 0.19.11
+            "8":
+                - 5
+            "12": 0.19.11
+            "13": darwin-arm64
+alpha:
+    value: 10
+autotune:
+    value: true
+batch_size:
+    value: 256
+buffer_size:
+    value: 1000000
+capture_video:
+    value: true
+cuda:
+    value: false
+env_id:
+    value: PowerGridworld-v0
+exp_name:
+    value: ValleyFilling_SAC
+gamma:
+    value: 0.99
+learning_starts:
+    value: 5000
+num_envs:
+    value: 4
+policy_frequency:
+    value: 2
+policy_lr:
+    value: 0.0001
+q_lr:
+    value: 0.0005
+seed:
+    value: 1
+target_network_frequency:
+    value: 1
+tau:
+    value: 0.005
+torch_deterministic:
+    value: true
+total_timesteps:
+    value: 1000000
+track:
+    value: true
+wandb_entity:
+    value: null
+wandb_project_name:
+    value: PowerGridworld_valleyfilling_SAC

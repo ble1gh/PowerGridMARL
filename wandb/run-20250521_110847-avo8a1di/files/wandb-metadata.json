@@ -1,0 +1,44 @@
+{
+  "os": "macOS-15.4.1-arm64-arm-64bit",
+  "python": "CPython 3.10.16",
+  "startedAt": "2025-05-21T17:08:47.501081Z",
+  "program": "/Users/brookleigh/Documents/GitHub/IEEE_13_node_testbench/PowerGridworld/examples/SingleAgent/ValleyFilling_SAC.py",
+  "codePath": "examples/SingleAgent/ValleyFilling_SAC.py",
+  "git": {
+    "remote": "https://github.com/ble1gh/PowerGridworld.git",
+    "commit": "f369166644345c38e1da5c2aa05ab694923561c6"
+  },
+  "email": "brookpleigh@gmail.com",
+  "root": "/Users/brookleigh/Documents/GitHub/IEEE_13_node_testbench/PowerGridworld",
+  "host": "MacBook-Pro-4.local",
+  "executable": "/opt/anaconda3/envs/gridworld/bin/python",
+  "codePathLocal": "examples/SingleAgent/ValleyFilling_SAC.py",
+  "cpu_count": 14,
+  "cpu_count_logical": 14,
+  "disk": {
+    "/": {
+      "total": "494384795648",
+      "used": "460220329984"
+    },
+    "/System/Volumes/Data": {
+      "total": "494384795648",
+      "used": "460220329984"
+    }
+  },
+  "memory": {
+    "total": "25769803776"
+  },
+  "cpu": {
+    "count": 14,
+    "countLogical": 14
+  },
+  "apple": {
+    "name": "Apple M4 Pro",
+    "ecpuCores": 4,
+    "pcpuCores": 10,
+    "gpuCores": 20,
+    "memoryGb": 24,
+    "swapTotalBytes": "5368709120",
+    "ramTotalBytes": "25769803776"
+  }
+}
