@@ -26,9 +26,7 @@ def hydra_experiment(cfg: DictConfig) -> None:
         cfg (DictConfig): the hydra config dictionary
 
     """
-    print("cfg: ",cfg)
     hydra_choices = HydraConfig.get().runtime.choices
-    print("hydra_choices: ", hydra_choices)
     task_name = hydra_choices.task
     algorithm_name = hydra_choices.algorithm
 

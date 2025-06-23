@@ -143,7 +143,7 @@ class Logger:
                 gobal_done,
                 any_episode_ended,
                 to_log,
-                log_individual_agents=False,  # Turn on if you want single agent granularity
+                log_individual_agents=True,  # Turn on if you want single agent granularity
             )
             # group_episode_rewards has shape (n_episodes) as we took the mean over agents in the group
             groups_episode_rewards.append(group_episode_rewards)
@@ -315,14 +315,37 @@ class Logger:
 
     def _get_episode_reward(
         self, group: str, td: TensorDictBase, remove_agent_dim: bool = False
-    ):
+    ) -> torch.Tensor:
+        # Try to get the reward from a flattened tuple key first
         episode_reward = td.get(("next", group, "episode_reward"), None)
+
+        # If that fails, try to get it from the nested structure, which is what the env produces
         if episode_reward is None:
-            episode_reward = (
-                td.get(("next", "episode_reward"))
-                .expand(td.get(group).shape)
-                .unsqueeze(-1)
+            next_td = td.get(("next", group), None)
+            if next_td is not None:
+                episode_reward = next_td.get("episode_reward", None)
+
+        # If it's still None, try the global fallback
+        if episode_reward is None:
+            global_episode_reward = td.get(("next", "episode_reward"), None)
+            if global_episode_reward is not None:
+                # This is the part that was erroring.
+                # We need to make sure td.get(group) is not None.
+                group_td = td.get(group, None)
+                if group_td is not None:
+                    episode_reward = global_episode_reward.expand(
+                        group_td.shape
+                    ).unsqueeze(-1)
+
+        # If after all attempts, episode_reward is still None, we have a problem.
+        if episode_reward is None:
+            # The original code would crash here. Let's raise a more informative error.
+            raise KeyError(
+                f"Could not find episode_reward at ('next', '{group}', 'episode_reward'), "
+                f"nested in ('next', '{group}'), or at ('next', 'episode_reward'). "
+                f"Please check your environment's `step()` function and the structure of the returned TensorDict."
             )
+
         return episode_reward.mean(-2) if remove_agent_dim else episode_reward
 
     def _log_individual_and_group_rewards(

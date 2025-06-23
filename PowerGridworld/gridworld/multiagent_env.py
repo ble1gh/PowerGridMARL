@@ -10,11 +10,11 @@ import pandas as pd
 from gridworld.base import ComponentEnv, MultiComponentEnv
 from gridworld.log import logger
 
-try:
-    from ray.rllib.env.multi_agent_env import MultiAgentEnv as Env
-except ImportError:
-    Env = object
-    logger.warning("rllib MultiAgentEnv not found, using generic object class")
+from torchrl.envs import EnvBase
+
+from torchrl.data import Composite, Bounded, CompositeSpec, Binary, Categorical
+from tensordict import TensorDict
+import torch
 
 from gymnasium.spaces import Box
 
@@ -36,7 +36,7 @@ bus_name_mapping = {
 }
 
 
-class MultiAgentEnv(Env):
+class MultiAgentEnv(EnvBase):
     """This class implements the multi-agent environment created from a list
     of agents of either type, ComponentEnv or MultiComponentEnv."""
 
@@ -49,6 +49,7 @@ class MultiAgentEnv(Env):
             rescale_spaces: bool = True,
             **kwargs
     ):
+        super().__init__()
 
         self.common_config = common_config
         self.rescale_spaces = rescale_spaces
@@ -69,6 +70,7 @@ class MultiAgentEnv(Env):
         self.history = None
         self.voltages = None
         self.obs_dict = {}
+        self._global_reward_components = {}
 
         # Call the agent constructors with both common and agent-specific 
         # configuration arguments.
@@ -99,32 +101,252 @@ class MultiAgentEnv(Env):
         self.pf_solver = pf_config["cls"](**pf_config["config"])
 
         # Create the gym observation and action spaces.
-        self.observation_space = {
-            agent.name: Box(
-                low=np.concatenate([agent.observation_space.low, [0]]),
-                high=np.concatenate([agent.observation_space.high, [np.inf]]),
-                dtype=np.float32
-            )
-            for agent in self.agents
-        }
+        try:
+            self.observation_space = {
+                agent.name: Box(
+                    low=agent.observation_space.low,
+                    high=agent.observation_space.high,
+                    dtype=np.float64
+                )
+                for agent in self.agents
+            }
+        except Exception as e:
+            print("Exception while building observation_spec:", e)
+            raise
+
         self.action_space = {
             agent.name: agent.action_space for agent in self.agents}
+        
+        n_agents = len(self.agents)
+        obs_dim = self.agents[0].observation_space.shape[0]+1  # +1 for voltage
+        act_dim = self.agents[0].action_space.shape[0]
 
-    def close(self):
-        """Clean up resources used by the environment."""
+        # Get bounds from any agent (they are all the same)
+        obs_low = torch.as_tensor(self.agents[0].observation_space.low, dtype=torch.float32)
+        obs_high = torch.as_tensor(self.agents[0].observation_space.high, dtype=torch.float32)
+        # Append 0 to obs_low and inf to obs_high for the voltage dimension
+        obs_low = torch.cat([obs_low, torch.tensor([0.0], dtype=torch.float32)])
+        obs_high = torch.cat([obs_high, torch.tensor([float('inf')], dtype=torch.float32)])
+        # print("obs_low shape:", obs_low.shape)
+        # print("obs_high shape:", obs_high.shape)
+        act_high = torch.as_tensor(self.agents[0].action_space.high, dtype=torch.float32)
+        act_low = torch.as_tensor(self.agents[0].action_space.low, dtype=torch.float32)
+
+        # First create a per-agent spec without batching
+        agent_obs_spec = Composite({
+            "observation": Bounded(
+                low=obs_low,
+                high=obs_high,
+                shape=(obs_dim,),
+                dtype=torch.float32
+            )
+        })
+
+        # Then expand it to match your agent count
+        self.observation_spec = Composite({
+            "agents": agent_obs_spec.expand(n_agents)
+        })
+        # print("Observation spec:", self.observation_spec)
+
+        # Same for action spec
+        agent_act_spec = Composite({
+            "action": Bounded(
+                low=act_low,
+                high=act_high,
+                shape=(act_dim,),
+                dtype=torch.float32
+            )
+        })
+
+        self.action_spec = Composite({
+            "agents": agent_act_spec.expand(n_agents)
+        })
+
+        # Define reward spec
+        agent_reward_spec = Composite({
+            "reward": Bounded(
+                low=float("-inf"),
+                high=float("inf"),
+                shape=(1,),
+                dtype=torch.float32
+            ),
+            "episode_reward": Bounded(
+                low=float("-inf"),
+                high=float("inf"),
+                shape=(1,),
+                dtype=torch.float32
+            )
+        })
+
+        # Expand to all agents
+        self.reward_spec = Composite({
+            "agents": agent_reward_spec.expand(n_agents)
+        })
+
+        self.done_spec = Composite({
+            "agents": Composite({
+                "done": Categorical(n=2, dtype=torch.bool, shape=(1,)),
+                "terminated": Categorical(n=2, dtype=torch.bool, shape=(1,)),
+                "truncated": Categorical(n=2, dtype=torch.bool, shape=(1,)),
+            }).expand(n_agents),
+            "done": Categorical(n=2, dtype=torch.bool, shape=(1,)),
+            "terminated": Categorical(n=2, dtype=torch.bool, shape=(1,)),
+            "truncated": Categorical(n=2, dtype=torch.bool, shape=(1,)),
+        })
+
+        self.info_spec = Composite({
+            "agents": Composite({
+                "agent_info": Composite({
+                    "real_power_unserved": Bounded(low=float(0.0), high=float("inf"), shape=(), dtype=torch.float32),
+                    "peak_reward": Bounded(low=float("-inf"), high=float(0.0), shape=(), dtype=torch.float32),
+                })
+            }).expand(n_agents),
+            "info": Composite({
+                "power_loss_reward": Bounded(low=float("-inf"), high=float(0.0), shape=(), dtype=torch.float32),
+                "voltage_reward": Bounded(low=float("-inf"), high=float(0.0), shape=(), dtype=torch.float32),
+                "load_penalty": Bounded(low=float("-inf"), high=float(0.0), shape=(), dtype=torch.float32),
+            })
+        })
+
+
+    def close(self, raise_if_closed=True):
+        """Clean up resources used by the environment.
+    
+        Args:
+            raise_if_closed (bool): If True, raising an error if the environment
+                is already closed is allowed. Default is True.
+        """
+        # Add a check for whether the environment is already closed
+        if hasattr(self, '_closed') and self._closed:
+            if raise_if_closed:
+                raise RuntimeError("Trying to close an environment that is already closed")
+            return
+            
         # Close the power flow solver if it has a close method
         if hasattr(self.pf_solver, "close"):
-            self.pf_solver.close()
-
+            try:
+                self.pf_solver.close()
+            except Exception as e:
+                logger.warning(f"Error closing power flow solver: {e}")
+                
         # Close all agents if they have a close method
         for agent in self.agents:
             if hasattr(agent, "close"):
-                agent.close()
-
+                try:
+                    agent.close()
+                except Exception as e:
+                    logger.warning(f"Error closing agent {agent.name}: {e}")
+        
+        # Mark the environment as closed
+        self._closed = True
+        
         # Log that the environment has been closed
         logger.info("MultiAgentEnv has been closed.")
+    
+    # Remove the '*' from the signature to allow positional arguments
+    def _reset(self, tensordict=None, **kwargs):
+        # Get observations from environment logic
+        obs_dict = self._reset_logic(**kwargs)
 
-    @abstractmethod
+        # Reset info reward components
+        self._global_reward_components = {}
+        self.episode_reward = 0
+        
+        agent_obs = torch.stack([
+            torch.as_tensor(obs_dict[agent_name], dtype=torch.float32)
+            for agent_name in self.agent_names
+        ])
+        
+        # Create TensorDict matching spec structure 
+        obs_td = TensorDict({
+            "agents": TensorDict({
+                "observation": agent_obs,
+            }, batch_size=[len(self.agent_names)])
+        }, batch_size=[])
+        # print(f"Observation on Reset: {obs_td}")
+        
+        return obs_td
+
+    def _step(self, tensordict=None):
+        # Extract actions from tensordict
+        actions = tensordict["agents"]["action"].clone()
+        
+        # Convert actions to dictionary format for env logic
+        action_dict = {
+            self.agent_names[i]: actions[i].cpu().numpy() 
+            for i in range(len(self.agent_names))
+        }
+        
+        # Call environment step logic
+        obs, rewards, dones, truncated, per_agent_info = self._step_logic(action_dict)
+        
+        # Stack all agent observations into a single tensor [n_agents, obs_dim]
+        agent_obs = torch.stack([
+            torch.as_tensor(obs[agent_name], dtype=torch.float32) 
+            for agent_name in self.agent_names
+        ])
+        
+        # Create per-agent reward tensor
+        agent_rewards = torch.tensor([
+            rewards[agent_name] for agent_name in self.agent_names
+        ], dtype=torch.float32).unsqueeze(-1)
+        
+        # Get done and truncated as boolean tensors
+        agent_dones = torch.tensor([
+            dones[agent_name] for agent_name in self.agent_names
+        ], dtype=torch.bool).unsqueeze(-1)
+        
+        agent_truncs = torch.tensor([
+            truncated[agent_name] if isinstance(truncated, dict) else truncated 
+            for agent_name in self.agent_names
+        ], dtype=torch.bool).unsqueeze(-1)
+        
+        # Create per-agent episode reward tensor
+        agent_episode_rewards = torch.tensor([
+            self.obs_dict["episode_reward"].get(agent_name, 0) 
+            for agent_name in self.agent_names
+        ], dtype=torch.float32).unsqueeze(-1)
+        
+        # Create per-agent info dictionary
+        per_agent_info_td = TensorDict({
+            "real_power_unserved": torch.tensor([
+                per_agent_info[agent_name].get("real_power_unserved", 0) 
+                for agent_name in self.agent_names
+            ], dtype=torch.float32),
+            "peak_reward": torch.tensor([
+                per_agent_info[agent_name].get("peak_reward", 0) 
+                for agent_name in self.agent_names
+            ], dtype=torch.float32),
+        }, batch_size=[len(self.agent_names)])
+        
+        # Create group-level info dictionary
+        group_info_td = TensorDict({
+            key: torch.tensor(value, dtype=torch.float32)
+            for key, value in self._global_reward_components.items()
+        }, batch_size=[])
+
+        # Create output TensorDict
+        next_obs = TensorDict({
+            "agents": TensorDict({
+                "observation": agent_obs,  # Per-agent observations
+                "reward": agent_rewards,  # Per-agent rewards
+                "episode_reward": agent_episode_rewards,  # Per-agent episode rewards
+                "terminated": agent_dones,  # Per-agent termination flags
+                "truncated": agent_truncs,  # Per-agent truncated flags
+                "done": agent_dones | agent_truncs,  # Per-agent done flags
+                "agent_info": per_agent_info_td,  # Per-agent info
+            }, batch_size=[len(self.agent_names)]),
+            "info": group_info_td,  # Group-level info
+            "done": (agent_dones.squeeze(-1) | agent_truncs.squeeze(-1)).any().reshape(1),
+            "terminated": agent_dones.any().reshape(1),
+            "truncated": agent_truncs.any().reshape(1),
+        }, batch_size=[])
+
+        # print(f"Next Obs reward: {next_obs['agents']['reward']}")
+        # print(f"Next Obs episode reward: {next_obs['agents']['episode_reward']}")
+    
+        return next_obs
+
     def get_external_obs_vars(
         self, 
         agent: Union[ComponentEnv, MultiComponentEnv],
@@ -161,12 +383,13 @@ class MultiAgentEnv(Env):
         return agent_rewards
 
 
-    def reset(self, seed=None, options=None, **kwargs) -> Tuple[Dict[str, any], dict]:
+    def _reset_logic(self, seed=None, options=None, **kwargs) -> Tuple[Dict[str, any], dict]:
         """Reset the environment and return the initial observations for all agents."""
         self.episode_step = 0
         self.time = self.start_time
         self.history = {"timestamp": [], "voltage": [], "agent_power_p": [], "base_load": [], "losses": []}
         self.episode_reward = 0
+        self.obs_dict = {}
 
         # Run OpenDSS to have voltage info
         self.pf_solver.calculate_power_flow(current_time=self.time)
@@ -182,7 +405,7 @@ class MultiAgentEnv(Env):
         # Return observations and an empty info dictionary
         obs = self.get_obs()
         obs = self.obs_transform(obs)
-        return obs, {}
+        return obs
 
 
     def get_obs(self) -> Dict[str, any]:
@@ -193,10 +416,9 @@ class MultiAgentEnv(Env):
         return obs
 
 
-    def step(self, action: Dict[str, any]) -> Tuple[dict, dict, dict, dict]:
+    def _step_logic(self, action: Dict[str, any]) -> Tuple[dict, dict, dict, dict]:
         self.episode_step += 1
-        self.time += self.control_timedelta
-        self.obs_dict = {}
+        self.time += pd.Timedelta(seconds=self.control_timedelta)
 
         # Initialize agent outputs.
         obs, rew, done, meta = {}, {}, {}, {}
@@ -204,7 +426,7 @@ class MultiAgentEnv(Env):
         agent_power_p = []
 
         # For each agent, call the step method and inject any external variables
-        # as keyword arguments.  Accumulate the real/reactive power from each
+        # as keyword arguments. Accumulate the real/reactive power from each
         # agent for use in power flow calculation.
         for agent in self.agents:
             name = agent.name
@@ -242,24 +464,36 @@ class MultiAgentEnv(Env):
         self.history["base_load"].append(self.base_load)
         self.history["losses"].append(self.losses)
 
-        # Check for terminal condition.  Currently, we stop the entire simulation
-        # if any agent is `done`, although the RLLib API allows agents to finish
-        # at different times.
-        any_done = np.any(list(done.values()))  # will fail otherwise
+        # Check for terminal condition.
+        any_done = np.any(list(done.values()))
         max_steps_reached = (self.episode_step == self.max_episode_steps - 1)
         time_up = self.time >= self.end_time
         done = any_done or max_steps_reached or time_up
         # print(f"Episode step: {self.episode_step}, Done: {done}, Time up: {time_up}, Max steps reached: {max_steps_reached}")
 
-        # Create the dones dict that will be returned.  We assume all are done
-        # or not simulataneously.
+        # Create the dones dict that will be returned.
         dones = {a.name: done for a in self.agents}
-        dones["__all__"] = done
 
         # Transform rewards and meta
         rew = self.reward_transform(rew)
-        meta = self.meta_transform(meta)
+        # meta = self.meta_transform(meta)
         obs = self.obs_transform(obs)
+
+        # Extract agent-specific reward components from meta
+        per_agent_info = {}
+        for agent_name, agent_meta in meta.items():
+            if agent_name in self.agent_names:  # Ensure it's an actual agent
+                # Extract "real_power_unserved" and "peak_reward" if available
+                if isinstance(agent_meta, dict):
+                    per_agent_info[agent_name] = {}
+                    if "real_power_unserved" in agent_meta:
+                        per_agent_info[agent_name]["real_power_unserved"] = agent_meta["real_power_unserved"]
+                    if "peak_reward" in agent_meta:
+                        per_agent_info[agent_name]["peak_reward"] = agent_meta["peak_reward"]
+
+        # Update meta with global reward components
+        if hasattr(self, '_global_reward_components'):
+            meta["reward_components"] = self._global_reward_components
 
         for agent_name in rew:
             if "episode" not in meta[agent_name]:
@@ -267,26 +501,9 @@ class MultiAgentEnv(Env):
             meta[agent_name]["episode"]["r"] += rew[agent_name]
             meta[agent_name]["episode"]["l"] = self.episode_step
 
-        # Add final observations for truncated episodes
-        if done or max_steps_reached or time_up:
-            # meta["final_observation"] = obs
-            meta["final_observation"] = obs
-            # Calculate the total episodic reward and length
-            total_reward = sum(rew.values())
-            episode_length = self.episode_step
+        truncated = {a.name: False for a in self.agents}
 
-            # Populate meta["final_info"]
-            meta["final_info"] = {
-                "episode": {
-                    "r": self.episode_reward,  # Total episodic reward
-                    "l": episode_length,  # Episode length
-                }
-            }
-            #print(f"Episode finished. Total reward: {self.episode_reward}, Length: {episode_length}")
-
-        truncated = False
-
-        return obs, rew, dones, truncated, meta
+        return obs, rew, dones, truncated, per_agent_info
 
     def obs_transform(self, obs_dict) -> dict:
         """Function to transform the agent observations based on centralized view."""
@@ -307,12 +524,10 @@ class MultiAgentEnv(Env):
         return obs_dict
 
     def reward_transform(self, rew_dict) -> dict:
-        """Function to transform the agent rewards based on centralized view.
-        Pass-through by default."""
-        
+        """Function to transform the agent rewards based on centralized view."""
+    
         # Calculate the power loss reward
-        power_loss_reward = -self.losses[0]/1e5
-        # logger.info(f"Power loss reward: {power_loss_reward}")
+        power_loss_reward = -self.losses[0] / 1e5
 
         # Calculate voltage violation reward
         voltage_reward = 0
@@ -321,13 +536,13 @@ class MultiAgentEnv(Env):
         if np.any(np.array(list(self.voltages.values())) < 0.95):
             voltage_differences = [0.95 - v for v in self.voltages.values() if v < 0.95]
             total_voltage_difference = sum(voltage_differences)
-            voltage_reward = -total_voltage_difference*1e3
-        
-        # Assuming `output` is the variable containing the data
+            voltage_reward = -total_voltage_difference * 1e3
+
+        # Calculate load penalty
         total_load = []
         for item in self.history['base_load'][:]:
-            bus_names, data_array = item  # Unpack the tuple
-            load = data_array[:, 0].sum()  # Extract the first column
+            bus_names, data_array = item
+            load = data_array[:, 0].sum()
             total_load.append(load)
 
         # Convert the list of arrays to a 2D numpy array
@@ -340,30 +555,52 @@ class MultiAgentEnv(Env):
         
         # print(f"Voltage reward: {voltage_reward}")
 
-        # Add power_loss_reward to all agent rewards
+        # Store global reward components for group-level logging
+        self._global_reward_components = {
+            "power_loss_reward": float(power_loss_reward),
+            "voltage_reward": float(voltage_reward),
+            "load_penalty": float(load_penalty),
+        }
+
+        # Add global rewards to each agent's reward individually
         for agent_name in rew_dict:
             if isinstance(rew_dict[agent_name], (int, float)):
-                rew_dict[agent_name] += power_loss_reward + voltage_reward + load_penalty
+                rew_dict[agent_name] += power_loss_reward + voltage_reward
             else:
-                # Alert if the reward is not a number
                 logger.warning(f"Reward for agent {agent_name} is not a number: {rew_dict[agent_name]}")
 
-        # Add up total reward for all agents
-        reward_all_vehicles = sum(value for value in rew_dict.values() if isinstance(value, (int, float)))
+        # Track individual agent rewards for the episode
+        for agent_name in rew_dict:
+            if "episode_reward" not in self.obs_dict:
+                self.obs_dict["episode_reward"] = {}
+            self.obs_dict["episode_reward"][agent_name] = (
+                self.obs_dict["episode_reward"].get(agent_name, 0) + rew_dict[agent_name]
+            )
 
-        self.episode_reward += reward_all_vehicles
-        # logger.info(f"Episode reward: {self.episode_reward}")
-        # logger.info(f"Agent rewards: {rew_dict}")
         return rew_dict
 
 
-    def meta_transform(self, meta) -> dict:
-        """Function to augment the agent meta info based on centralized view.
-        Pass-through by default.
-        """
-        return meta
+    # def meta_transform(self, meta) -> dict:
+    #     """Function to augment the agent meta info based on centralized view.
+    #     Pass-through by default.
+    #     """
+    #     return meta
 
 
     @property
     def agent_dict(self) -> Dict[str, ComponentEnv]:
         return {a.name: a for a in self.agents}
+    
+    # def _reset(self, *args, **kwargs):
+    #     # Implement your reset logic or call your existing reset logic
+    #     return self.reset(*args, **kwargs)
+
+    # def _step(self, *args, **kwargs):
+    #     # Implement your step logic or call your existing step logic
+    #     return self.step(*args, **kwargs)
+
+    def _set_seed(self, seed: int):
+        # Implement your seeding logic if needed
+        self.seed = seed
+        np.random.seed(seed)
+        # If your agents or other components need seeding, do it here

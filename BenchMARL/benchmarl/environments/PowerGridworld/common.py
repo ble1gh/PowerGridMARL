@@ -13,6 +13,7 @@ from tensordict import TensorDictBase
 
 from torchrl.data import CompositeSpec
 from torchrl.envs import EnvBase
+from torchrl.envs.transforms import RewardSum, Transform
 #from torchrl.envs.libs import YourTorchRLEnvConstructor
 
 # PowerGridworld environment requirements
@@ -51,7 +52,6 @@ class PowerGridworldClass(TaskClass):
         config = copy.deepcopy(self.config)
         # Extract agent types and busses from config
         agent_types = config.get("agents", [])
-        print("Loaded agent types:", agent_types)
         busses = config.get("busses", [])
         n_agents = len(agent_types)
         if not busses or len(busses) != n_agents:
@@ -79,8 +79,6 @@ class PowerGridworldClass(TaskClass):
                     "unserved_penalty": config.get("unserved_penalty", 0.0),
                 }
             })
-        
-        print("Agents configuration:", agents)
 
         # Common config
         common_config = {
@@ -108,6 +106,20 @@ class PowerGridworldClass(TaskClass):
 
         # Return a function that creates the environment
         return lambda: MultiAgentEnv(**env_config)
+    
+    def get_reward_sum_transform(self, env: EnvBase) -> Transform:
+        """Define the reward sum transform with proper keys."""
+        from torchrl.envs.transforms import RewardSum
+    
+        # Use flat keys for rewards
+        return RewardSum(
+            in_keys=[("agents", "reward")],
+            out_keys=[("agents", "reward_sum")] # It's good practice to nest the output too
+        )
+    
+    def _reward_spec(self):
+        """Return the reward spec for the environment."""
+        return self.reward_spec
         
     def supports_continuous_actions(self) -> bool:
         # Does the environment support continuous actions?
