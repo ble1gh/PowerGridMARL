@@ -17,6 +17,7 @@ from tensordict import TensorDict
 import torch
 
 from gymnasium.spaces import Box
+import warnings
 
 bus_name_mapping = {
     "634a": "634.1",
@@ -63,7 +64,11 @@ class MultiAgentEnv(EnvBase):
 
         # Likewise here, need helpful checking and errors.
         self.pf_config = pf_config
-        self.max_episode_steps = max_episode_steps if max_episode_steps is not None else np.inf
+
+        # Compute max_episode_steps based on time range and control interval
+        total_seconds = (self.end_time - self.start_time).total_seconds()
+        step_seconds = pd.Timedelta(seconds=self.control_timedelta).total_seconds()
+        self.max_episode_steps = int(total_seconds // step_seconds) + 1
         
         self.episode_step = None
         self.time = None
@@ -197,7 +202,7 @@ class MultiAgentEnv(EnvBase):
         self.info_spec = Composite({
             "agents": Composite({
                 "agent_info": Composite({
-                    "real_power_unserved": Bounded(low=float(0.0), high=float("inf"), shape=(), dtype=torch.float32),
+                    "energy_remaining": Bounded(low=float(0.0), high=float("inf"), shape=(), dtype=torch.float32),
                     "peak_reward": Bounded(low=float("-inf"), high=float(0.0), shape=(), dtype=torch.float32),
                 })
             }).expand(n_agents),
@@ -309,8 +314,10 @@ class MultiAgentEnv(EnvBase):
         
         # Create per-agent info dictionary
         per_agent_info_td = TensorDict({
-            "real_power_unserved": torch.tensor([
-                per_agent_info[agent_name].get("real_power_unserved", 0) 
+            "energy_remaining": torch.tensor([
+                sum(per_agent_info[agent_name].get("energy_remaining", {}).values()) 
+                if isinstance(per_agent_info[agent_name].get("energy_remaining", {}), dict)
+                else 0.0
                 for agent_name in self.agent_names
             ], dtype=torch.float32),
             "peak_reward": torch.tensor([
@@ -387,14 +394,18 @@ class MultiAgentEnv(EnvBase):
         """Reset the environment and return the initial observations for all agents."""
         self.episode_step = 0
         self.time = self.start_time
-        self.history = {"timestamp": [], "voltage": [], "agent_power_p": [], "base_load": [], "losses": []}
+        self.history = {
+            "timestamp": [], "voltage": [], "agent_power_p": [], 
+            "total_load": [], "losses": [], "actions": [], 
+            "reward_components": [], "per_agent_info": []
+        }
         self.episode_reward = 0
         self.obs_dict = {}
 
         # Run OpenDSS to have voltage info
         self.pf_solver.calculate_power_flow(current_time=self.time)
         self.voltages = self.pf_solver.get_bus_voltages()
-        self.base_load = self.pf_solver._obtain_base_load_info()
+        self.total_load = self.pf_solver._obtain_base_load_info()
         self.losses = self.pf_solver.get_losses()
 
         # Reset the controllable agents and collect their obs arrays
@@ -454,15 +465,8 @@ class MultiAgentEnv(EnvBase):
             q_controllable_consumed=load_q
         )
         self.voltages = self.pf_solver.get_bus_voltages()
-        self.base_load = self.pf_solver._obtain_base_load_info()
+        self.total_load = self.pf_solver._obtain_base_load_info()
         self.losses = self.pf_solver.get_losses()
-
-        # Update history dict.
-        self.history["timestamp"].append(self.time)
-        self.history["voltage"].append(self.voltages.copy())
-        self.history["agent_power_p"].append(agent_power_p)
-        self.history["base_load"].append(self.base_load)
-        self.history["losses"].append(self.losses)
 
         # Check for terminal condition.
         any_done = np.any(list(done.values()))
@@ -483,13 +487,34 @@ class MultiAgentEnv(EnvBase):
         per_agent_info = {}
         for agent_name, agent_meta in meta.items():
             if agent_name in self.agent_names:  # Ensure it's an actual agent
-                # Extract "real_power_unserved" and "peak_reward" if available
+                per_agent_info[agent_name] = {}
                 if isinstance(agent_meta, dict):
-                    per_agent_info[agent_name] = {}
-                    if "real_power_unserved" in agent_meta:
-                        per_agent_info[agent_name]["real_power_unserved"] = agent_meta["real_power_unserved"]
+                    if "energy_remaining" in agent_meta:
+                        per_agent_info[agent_name]["energy_remaining"] = agent_meta["energy_remaining"]
+                        if isinstance(agent_meta["energy_remaining"], (int, float)) and agent_meta["energy_remaining"] == 0:
+                            warnings.warn(
+                                f"[MultiAgentEnv] 'energy_remaining' for agent '{agent_name}' is 0 (default) at step {self.episode_step}.",
+                                UserWarning,
+                            )
+                    elif "energy_remaining" not in agent_meta:
+                        warnings.warn(
+                            f"[MultiAgentEnv] 'energy_remaining' missing in meta for agent '{agent_name}' at step {self.episode_step}.",
+                            UserWarning,
+                        )
                     if "peak_reward" in agent_meta:
                         per_agent_info[agent_name]["peak_reward"] = agent_meta["peak_reward"]
+                    else:
+                        warnings.warn(
+                            f"[MultiAgentEnv] 'peak_reward' missing in meta for agent '{agent_name}' at step {self.episode_step}.",
+                            UserWarning,
+                        )
+                    if "real_energy_unserved" in agent_meta:
+                        per_agent_info[agent_name]["real_energy_unserved_reward"] = agent_meta["real_energy_unserved"]
+                    else:
+                        warnings.warn(
+                            f"[MultiAgentEnv] 'real_energy_unserved' missing in meta for agent '{agent_name}' at step {self.episode_step}.",
+                            UserWarning,
+                        )
 
         # Update meta with global reward components
         if hasattr(self, '_global_reward_components'):
@@ -502,6 +527,17 @@ class MultiAgentEnv(EnvBase):
             meta[agent_name]["episode"]["l"] = self.episode_step
 
         truncated = {a.name: False for a in self.agents}
+
+        # Update history dict.
+        self.history["timestamp"].append(self.time)
+        self.history["voltage"].append(self.voltages.copy())
+        self.history["agent_power_p"].append(agent_power_p)
+        self.history["total_load"].append(self.total_load)
+        self.history["losses"].append(self.losses)
+        self.history["actions"].append(action)
+        self.history["reward_components"].append(self._global_reward_components.copy())
+        self.history["per_agent_info"].append(per_agent_info)
+
 
         return obs, rew, dones, truncated, per_agent_info
 
@@ -540,7 +576,7 @@ class MultiAgentEnv(EnvBase):
 
         # Calculate load penalty
         total_load = []
-        for item in self.history['base_load'][:]:
+        for item in self.history['total_load'][:]:
             bus_names, data_array = item
             load = data_array[:, 0].sum()
             total_load.append(load)
@@ -579,28 +615,208 @@ class MultiAgentEnv(EnvBase):
 
         return rew_dict
 
-
-    # def meta_transform(self, meta) -> dict:
-    #     """Function to augment the agent meta info based on centralized view.
-    #     Pass-through by default.
-    #     """
-    #     return meta
-
-
     @property
     def agent_dict(self) -> Dict[str, ComponentEnv]:
         return {a.name: a for a in self.agents}
     
-    # def _reset(self, *args, **kwargs):
-    #     # Implement your reset logic or call your existing reset logic
-    #     return self.reset(*args, **kwargs)
-
-    # def _step(self, *args, **kwargs):
-    #     # Implement your step logic or call your existing step logic
-    #     return self.step(*args, **kwargs)
-
     def _set_seed(self, seed: int):
         # Implement your seeding logic if needed
         self.seed = seed
         np.random.seed(seed)
         # If your agents or other components need seeding, do it here
+    
+    def render_rollout_fig(self):
+        """
+        Generates plots from the episode history and logs them to WandB.
+        This method is called from close() when an evaluation episode ends.
+        """
+        try:
+            import matplotlib.pyplot as plt
+        except ImportError:
+            logger.warning("matplotlib not installed, skipping plot generation.")
+            return
+
+        if not self.history or not self.history["timestamp"]:
+            logger.info("No history to plot, skipping render.")
+            return
+
+        # --- Data Processing ---
+        timestamps = pd.to_datetime(self.history["timestamp"])
+        
+        # Actions
+        actions_df = pd.DataFrame([{agent: a[0] for agent, a in step_action.items()} for step_action in self.history["actions"]], index=timestamps)
+        
+        # Voltages
+        voltages_df = pd.DataFrame(self.history["voltage"], index=timestamps)
+        
+        # Power Losses
+        losses_df = pd.DataFrame([{"real": l[0], "reactive": l[1]} for l in self.history["losses"]], index=timestamps)
+        
+        # Loads
+        ev_load = [sum(p) for p in self.history["agent_power_p"]]
+        # Assuming the history value is the total load.
+        # The history stores a tuple: (bus_names, load_array). We sum the real power column.
+        total_load = [l[1][:, 0].sum() for l in self.history["total_load"]]
+        load_df = pd.DataFrame({"EV Load": ev_load, "Total Load": total_load}, index=timestamps)
+
+        # Per-Agent Info with warnings if missing
+        # Build a flat list of all vehicles for legend
+        energy_remaining_records = []
+        vehicle_labels = set()
+        agent_colors = {}
+        import matplotlib.pyplot as plt
+        color_map = plt.get_cmap('tab10')
+        agent_color_list = {agent: color_map(i % 10) for i, agent in enumerate(self.agent_names)}
+
+        for t, step_info in enumerate(self.history["per_agent_info"]):
+            # For each agent, get their per-vehicle dict
+            for agent in self.agent_names:
+                info = step_info.get(agent, {})
+                er_dict = info.get("energy_remaining", None)
+                if er_dict is None:
+                    warnings.warn(
+                        f"[render_rollout_fig] 'energy_remaining' missing for agent '{agent}' at timestep {t}.",
+                        UserWarning,
+                    )
+                    continue
+                if isinstance(er_dict, dict):
+                    for veh_id, val in er_dict.items():
+                        energy_remaining_records.append({
+                            "timestamp": timestamps[t],
+                            "agent": agent,
+                            "vehicle": veh_id,
+                            "energy_remaining": val
+                        })
+                        vehicle_labels.add((agent, veh_id))
+                        # if val == 0:
+                        #     warnings.warn(
+                        #         f"[render_rollout_fig] 'energy_remaining' for agent '{agent}', vehicle '{veh_id}' is 0 at timestep {t}.",
+                        #         UserWarning,
+                        #     )
+                else:
+                    warnings.warn(
+                        f"[render_rollout_fig] 'energy_remaining' for agent '{agent}' at timestep {t} is not a dict.",
+                        UserWarning,
+                    )
+
+        # Build a DataFrame for plotting
+        energy_remaining_long = pd.DataFrame(energy_remaining_records)
+        # Pivot to have columns as (agent, vehicle)
+        energy_remaining_pivot = energy_remaining_long.pivot_table(
+            index="timestamp",
+            columns=["agent", "vehicle"],
+            values="energy_remaining"
+        )
+
+        # Peak reward and unserved reward data
+        peak_reward_data = []
+        unserved_reward_data = []
+        for t, step_info in enumerate(self.history["per_agent_info"]):
+            pr_row = {}
+            ur_row = {}
+            for agent in self.agent_names:
+                info = step_info.get(agent, {})
+                if "peak_reward" not in info:
+                    warnings.warn(
+                        f"[render_rollout_fig] 'peak_reward' missing for agent '{agent}' at timestep {t}.",
+                        UserWarning,
+                    )
+                if "real_energy_unserved_reward" not in info:
+                    warnings.warn(
+                        f"[render_rollout_fig] 'real_energy_unserved_reward' missing for agent '{agent}' at timestep {t}.",
+                        UserWarning,
+                    )
+                pr_row[agent] = info.get("peak_reward", 0)
+                ur_row[agent] = info.get("real_energy_unserved_reward", 0)
+            peak_reward_data.append(pr_row)
+            unserved_reward_data.append(ur_row)
+        peak_reward_df = pd.DataFrame(peak_reward_data, index=timestamps)
+        unserved_reward_df = pd.DataFrame(unserved_reward_data, index=timestamps)
+
+        # # debugging
+        # print(energy_remaining_df)
+        # print(energy_remaining_df.dtypes)
+
+        # Global Reward Components
+        reward_comp_df = pd.DataFrame(self.history["reward_components"], index=timestamps)
+
+        # --- Plotting ---
+        fig, axes = plt.subplots(4, 2, figsize=(20, 24), tight_layout=True)
+        fig.suptitle("Evaluation Rollout", fontsize=16)
+        
+        # Plot 1: Agent Actions
+        actions_df.plot(ax=axes[0, 0], legend=True)
+        axes[0, 0].set_title("Agent Actions")
+        axes[0, 0].set_ylabel("Action Value")
+        axes[0, 0].grid(True)
+
+        # Plot 2: Nodal Voltages
+        voltages_df.plot(ax=axes[0, 1], legend=False)
+        axes[0, 1].set_title("Nodal Voltages")
+        axes[0, 1].set_ylabel("Voltage (p.u.)")
+        axes[0, 1].grid(True)
+
+        # Plot 3: Power Losses
+        losses_df.plot(ax=axes[1, 0])
+        axes[1, 0].set_title("Power Losses")
+        axes[1, 0].set_ylabel("Power (kW/kVAR)")
+        axes[1, 0].grid(True)
+
+        # Plot 4: Total and EV Load
+        load_df.plot(ax=axes[1, 1])
+        axes[1, 1].set_title("System Load")
+        axes[1, 1].set_ylabel("Power (kW)")
+        axes[1, 1].grid(True)
+
+        # Plot 5: Energy Remaining (per Vehicle, colored by agent)
+        ax_er = axes[2, 0]
+        # Track which agents have already been added to the legend
+        legend_handles = {}
+        for (agent, vehicle) in energy_remaining_pivot.columns:
+            color = agent_color_list[agent]
+            # Only add label for the first vehicle of each agent
+            label = agent if agent not in legend_handles else None
+            # Plot with consistent line style and marker
+            line, = ax_er.plot(
+                energy_remaining_pivot.index,
+                energy_remaining_pivot[(agent, vehicle)],
+                label=label,
+                color=color,
+                linestyle='-',   # solid line for all
+                marker=None,     # or set to 'o', 's', etc. for all if you want markers
+                alpha=0.7
+            )
+            if label is not None:
+                legend_handles[agent] = line
+        ax_er.set_title("Remaining Energy Need (by Vehicle)")
+        ax_er.set_ylabel("Energy Remaining (kWh)")
+        ax_er.grid(True)
+        # Only show one legend entry per agent
+        ax_er.legend(
+            handles=[legend_handles[a] for a in self.agent_names if a in legend_handles],
+            labels=[a for a in self.agent_names if a in legend_handles],
+            loc='best',
+            fontsize='small',
+            ncol=2
+        )
+
+        # Plot 6: Peak Reward (per Agent)
+        peak_reward_df.plot(ax=axes[2, 1])
+        axes[2, 1].set_title("Peak Reward (per Agent)")
+        axes[2, 1].set_ylabel("Reward")
+        axes[2, 1].grid(True)
+
+        # Plot 7: Global Reward Components
+        reward_comp_df.plot(ax=axes[3, 0])
+        axes[3, 0].set_title("Global Reward Components")
+        axes[3, 0].set_ylabel("Reward Value")
+        axes[3, 0].grid(True)
+
+        # Plot 8: Unserved Reward (per Agent)
+        unserved_reward_df.plot(ax=axes[3, 1])
+        axes[3, 1].set_title("Unserved Reward (per Agent)")
+        axes[3, 1].set_ylabel("Reward")
+        axes[3, 1].grid(True)
+        axes[3, 1].set_visible(True)  # Make sure this subplot is visible
+
+        return fig

@@ -24,9 +24,6 @@ max_charge_rate_kw: 7.
 peak_threshold: 700.
 vehicle_multiplier: 1.
 rescale_spaces: False
-unserved_penalty: 0.0
+unserved_penalty: 1.0
 
-envcomm_path: "/Users/brookleigh/Documents/GitHub/IEEE_13_node_testbench/PowerGridworld/gridworld/envcomm.py"
-
-python_env_path: "/opt/anaconda3/envs/gridworld/bin/python"
 

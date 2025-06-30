@@ -1,0 +1,16 @@
+{"time":"2025-06-26T14:23:49.731787-06:00","level":"INFO","msg":"stream: starting","core version":"0.20.0","symlink path":"/Users/brookleigh/Documents/GitHub/PowerGridMARL/mappo_evovernight13node_mlp__b4e74538_25_06_26-14_23_48/wandb/run-20250626_142349-mappo_evovernight13node_mlp__b4e74538_25_06_26-14_23_48/logs/debug-core.log"}
+{"time":"2025-06-26T14:23:49.917881-06:00","level":"INFO","msg":"stream: created new stream","id":"mappo_evovernight13node_mlp__b4e74538_25_06_26-14_23_48"}
+{"time":"2025-06-26T14:23:49.917919-06:00","level":"INFO","msg":"stream: started","id":"mappo_evovernight13node_mlp__b4e74538_25_06_26-14_23_48"}
+{"time":"2025-06-26T14:23:49.917937-06:00","level":"INFO","msg":"sender: started","stream_id":"mappo_evovernight13node_mlp__b4e74538_25_06_26-14_23_48"}
+{"time":"2025-06-26T14:23:49.917946-06:00","level":"INFO","msg":"handler: started","stream_id":"mappo_evovernight13node_mlp__b4e74538_25_06_26-14_23_48"}
+{"time":"2025-06-26T14:23:49.917966-06:00","level":"INFO","msg":"writer: Do: started","stream_id":"mappo_evovernight13node_mlp__b4e74538_25_06_26-14_23_48"}
+{"time":"2025-06-26T14:23:50.23079-06:00","level":"INFO","msg":"Starting system monitor"}
+{"time":"2025-06-26T14:24:06.512052-06:00","level":"INFO","msg":"Stopping system monitor"}
+{"time":"2025-06-26T14:24:06.512242-06:00","level":"INFO","msg":"Stopped system monitor"}
+{"time":"2025-06-26T14:24:06.897816-06:00","level":"INFO","msg":"fileTransfer: Close: file transfer manager closed"}
+{"time":"2025-06-26T14:24:07.038383-06:00","level":"INFO","msg":"handler: operation stats","stats":{}}
+{"time":"2025-06-26T14:24:07.045655-06:00","level":"INFO","msg":"stream: closing","id":"mappo_evovernight13node_mlp__b4e74538_25_06_26-14_23_48"}
+{"time":"2025-06-26T14:24:07.045689-06:00","level":"INFO","msg":"handler: closed","stream_id":"mappo_evovernight13node_mlp__b4e74538_25_06_26-14_23_48"}
+{"time":"2025-06-26T14:24:07.045709-06:00","level":"INFO","msg":"sender: closed","stream_id":"mappo_evovernight13node_mlp__b4e74538_25_06_26-14_23_48"}
+{"time":"2025-06-26T14:24:07.046071-06:00","level":"INFO","msg":"writer: Close: closed","stream_id":"mappo_evovernight13node_mlp__b4e74538_25_06_26-14_23_48"}
+{"time":"2025-06-26T14:24:07.046121-06:00","level":"INFO","msg":"stream: closed","id":"mappo_evovernight13node_mlp__b4e74538_25_06_26-14_23_48"}

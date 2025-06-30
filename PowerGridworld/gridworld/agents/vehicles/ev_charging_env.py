@@ -31,6 +31,9 @@ class EVChargingEnv(ComponentEnv):
         vehicle_csv: str = None,
         vehicle_multiplier: int = 1,
         rescale_spaces: bool = True,
+        start_time=None,
+        end_time=None,
+        control_timedelta=None,
         **kwargs
     ):
 
@@ -51,8 +54,12 @@ class EVChargingEnv(ComponentEnv):
 
         # By default, we simulate a whole day but allow user to specify
         # fewer steps if desired.
-        self.max_episode_steps = max_episode_steps if max_episode_steps is not None else np.inf
-        self.max_episode_steps = min(self.max_episode_steps, 24*60 / minutes_per_step)
+        self.start_time = pd.Timestamp(start_time)
+        self.end_time = pd.Timestamp(end_time)
+        self.control_timedelta = control_timedelta
+        total_seconds = (self.end_time - self.start_time).total_seconds()
+        step_seconds = pd.Timedelta(seconds=self.control_timedelta).total_seconds()
+        self.max_episode_steps = int(total_seconds // step_seconds) + 1
 
         # Create an array of simulation times in minutes, in the interval
         # (0, max_episode_steps * minutes_per_step).
@@ -86,6 +93,7 @@ class EVChargingEnv(ComponentEnv):
             self.max_episode_steps * self.minutes_per_step,
             size=len(self._df)
         ).astype(int)
+        self._df["end_time_park_min"] = np.minimum(self._df["end_time_park_min"], self.simulation_times[-1])
 
         # Bounds on the observation space variables.
         obs_bounds = OrderedDict({
@@ -98,7 +106,7 @@ class EVChargingEnv(ComponentEnv):
                 0, self.num_vehicles * self._df["energy_required_kwh"].max()),
             "mean_charge_rate_deficit": (
                 0, self._df["energy_required_kwh"].max() / (self.minutes_per_step / 60.)),
-            "real_power_unserved": (
+            "real_energy_unserved": (
                 0, self._df["energy_required_kwh"].max()),
         })
 
@@ -146,13 +154,13 @@ class EVChargingEnv(ComponentEnv):
 
     def step_reward(self) -> Tuple[float, dict]:
         """Return a non-zero reward here if you want to use RL."""
-        unserved_reward = -self.unserved_penalty * self.state["real_power_unserved"]**2
+        unserved_reward = -self.unserved_penalty * self.state["real_energy_unserved"]**2
         peak_reward = -self.peak_penalty * \
             max(0, self.state["real_power_consumed"] - self.peak_threshold)**2
         reward = unserved_reward + peak_reward
         reward /= self.reward_scale
-        # print(f"EV_env Reward: {reward}, Unserved: {unserved_reward}, Peak: {peak_reward}")
-        return reward, {"real_power_unserved": unserved_reward, "peak_reward": peak_reward}
+        # print(f"EVChargingEnv Reward: {reward}, Unserved: {unserved_reward}, Peak: {peak_reward}")
+        return reward, {"real_energy_unserved": unserved_reward, "peak_reward": peak_reward}
 
 
     def reset(self, **kwargs) -> Tuple[dict, dict]:
@@ -244,16 +252,27 @@ class EVChargingEnv(ComponentEnv):
 
             logger.debug(f"{i}, {energy_required_kwh}, {action}")
             
+        # Check done
+        done = self.is_terminal()
+
         # Update time variables.
-        self.time_index += 1
-        self.time = self.simulation_times[self.time_index]
-        self.charging_vehicles = charging_vehicles
+        if not done:
+            self.time_index += 1
+            self.time = self.simulation_times[self.time_index]
+            self.charging_vehicles = charging_vehicles
 
         # Compute unmet charging demand for departed vehicles.
         unserved = 0.
         for i in self.departed_vehicles:
             unserved  += self.df["energy_required_kwh"][i]
-        self._update("real_power_unserved", unserved)
+        self._update("real_energy_unserved", unserved)
+
+        if done:
+            final_unserved = 0.
+            for i in self.charging_vehicles:
+                final_unserved += self.df["energy_required_kwh"][i]
+            # Add to real_energy_unserved
+            self.state["real_energy_unserved"] += final_unserved
 
         # Update the state dict.
         self._update("time", self.time)
@@ -270,9 +289,9 @@ class EVChargingEnv(ComponentEnv):
         # Get the return values
         obs, meta = self.get_obs()
         rew, rew_meta = self.step_reward()
-        done = self.is_terminal()
 
         meta.update(rew_meta)
+        meta["energy_remaining"] = self.df["energy_required_kwh"].to_dict()
 
         return obs, rew, done, meta
 

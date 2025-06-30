@@ -899,6 +899,8 @@ class Experiment(CallbackNotifier):
                 video_frames = None
                 callback = None
 
+            rollout_fig = None
+
             if self.test_env.batch_size == ():
                 rollouts = []
                 for eval_episode in range(self.config.evaluation_episodes):
@@ -921,6 +923,17 @@ class Experiment(CallbackNotifier):
                     # We are running vectorized evaluation we do not want it to stop when just one env is done
                 )
                 rollouts = list(rollouts.unbind(0))
+
+            # Generate the plot figure from the environment
+            if hasattr(self.test_env, "render_rollout_fig"):
+                rollout_fig = self.test_env.render_rollout_fig()
+            else:
+                warnings.warn(
+                    "The environment does not support rendering rollout figures. "
+                    "The rollout figure will not be logged.",
+                    UserWarning,
+                )
+
         evaluation_time = time.time() - evaluation_start
         self.logger.log(
             {"timers/evaluation_time": evaluation_time}, step=self.n_iters_performed
@@ -930,6 +943,7 @@ class Experiment(CallbackNotifier):
             video_frames=video_frames,
             step=self.n_iters_performed,
             total_frames=self.total_frames,
+            rollout_fig=rollout_fig,
         )
         # Callback
         self._on_evaluation_end(rollouts)

@@ -25,6 +25,11 @@ from torchrl.record.loggers.wandb import WandbLogger
 
 from benchmarl.environments import Task
 
+import io
+from PIL import Image
+import wandb
+import matplotlib.pyplot as plt
+
 
 class Logger:
     def __init__(
@@ -188,6 +193,7 @@ class Logger:
         total_frames: int,
         step: int,
         video_frames: Optional[List] = None,
+        rollout_fig=None,
     ):
         if (
             not len(self.loggers) and not self.experiment_config.create_json
@@ -245,6 +251,28 @@ class Logger:
                     logger.experiment.save(
                         json_file, base_path=os.path.dirname(json_file)
                     )
+        
+        # Add the custom plot to the log dictionary if it exists
+        if rollout_fig is not None:
+            buf = io.BytesIO()
+            rollout_fig.savefig(buf, format='png')
+            buf.seek(0)
+            img = Image.open(buf)
+            buf.seek(0)
+            # Log to each logger appropriately
+            for logger in self.loggers:
+                if isinstance(logger, WandbLogger):
+                    logger.experiment.log({"eval/rollout_plot": wandb.Image(img)}, commit=False)
+                elif hasattr(logger, "log_image"):
+                    logger.log_image("eval/rollout_plot", img, step=step)
+                    warnings.warn(
+                        "Using a logger that supports log_image, but it is not WandbLogger. "
+                        "Make sure the logger can handle images correctly."
+                    )
+                # Add more elifs for other logger types if needed
+            buf.close()
+            rollout_fig.clf()
+            plt.close(rollout_fig)
 
         self.log(to_log, step=step)
         if video_frames is not None and max_length_rollout_0 > 1:

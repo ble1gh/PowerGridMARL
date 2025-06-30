@@ -140,6 +140,8 @@ class PowerGridworldClass(TaskClass):
     def group_map(self, env: EnvBase) -> Dict[str, List[str]]:
         # The group map mapping group names to agent names
         # The data in the tensordict will havebe presented this way
+        if hasattr(env, "group_map"):
+            return env.group_map
         return {"agents": [agent.name for agent in env.agents]}
 
     def observation_spec(self, env: EnvBase) -> CompositeSpec:

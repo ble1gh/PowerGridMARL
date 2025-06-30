@@ -1,0 +1,44 @@
+{
+  "os":  "macOS-15.5-arm64-arm-64bit",
+  "python":  "CPython 3.10.16",
+  "startedAt":  "2025-06-26T20:23:49.728079Z",
+  "program":  "/Users/brookleigh/Documents/GitHub/PowerGridMARL/BenchMARL/examples/running/EV_Charging_Benchmark.py",
+  "codePath":  "BenchMARL/examples/running/EV_Charging_Benchmark.py",
+  "git":  {
+    "remote":  "git@github.com:ble1gh/PowerGridMARL.git",
+    "commit":  "1222782ce05c42aebf186e53411ad8b437bb4c92"
+  },
+  "email":  "brookpleigh@gmail.com",
+  "root":  "/Users/brookleigh/Documents/GitHub/PowerGridMARL/mappo_evovernight13node_mlp__b4e74538_25_06_26-14_23_48",
+  "host":  "Mac",
+  "executable":  "/opt/anaconda3/envs/benchmarl310/bin/python",
+  "codePathLocal":  "BenchMARL/examples/running/EV_Charging_Benchmark.py",
+  "cpu_count":  14,
+  "cpu_count_logical":  14,
+  "disk":  {
+    "/":  {
+      "total":  "494384795648",
+      "used":  "426556489728"
+    },
+    "/System/Volumes/Data":  {
+      "total":  "494384795648",
+      "used":  "426556489728"
+    }
+  },
+  "memory":  {
+    "total":  "25769803776"
+  },
+  "cpu":  {
+    "count":  14,
+    "countLogical":  14
+  },
+  "apple":  {
+    "name":  "Apple M4 Pro",
+    "ecpuCores":  4,
+    "pcpuCores":  10,
+    "gpuCores":  20,
+    "memoryGb":  24,
+    "swapTotalBytes":  "3221225472",
+    "ramTotalBytes":  "25769803776"
+  }
+}

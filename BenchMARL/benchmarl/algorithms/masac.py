@@ -180,11 +180,12 @@ class Masac(Algorithm):
                 *self.action_spec[group, "action"].shape,
                 self.action_spec[group, "action"].space.n,
             ]
-
+        print(
+            f"Creating actor module for group {group} with logits shape {logits_shape}")
         actor_input_spec = Composite(
             {group: self.observation_spec[group].clone().to(self.device)}
         )
-
+        print(f"Number of agents in group {group}: {n_agents}")
         actor_output_spec = Composite(
             {
                 group: Composite(

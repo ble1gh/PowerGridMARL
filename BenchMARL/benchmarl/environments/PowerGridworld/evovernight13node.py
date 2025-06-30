@@ -18,5 +18,3 @@ class TaskConfig:
     vehicle_multiplier: float = MISSING
     rescale_spaces: bool = MISSING
     unserved_penalty: float = MISSING
-    envcomm_path: str = MISSING
-    python_env_path: str = MISSING
