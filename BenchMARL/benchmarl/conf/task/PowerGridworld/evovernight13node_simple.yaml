@@ -3,7 +3,7 @@ defaults:
   - _self_
 
 agents: [EVChargingEnv, PVEnv, EnergyStorageEnv]  # Agent types available
-EVs_per_node: 70
+EVs_per_node: 1
 PVs_per_node: 0
 Storage_per_node: 0
 
@@ -27,7 +27,7 @@ num_vehicles: 1
 minutes_per_step: 15
 max_charge_rate_kw: 7.
 peak_threshold: 700.
-vehicle_multiplier: 1.
+vehicle_multiplier: 70.
 rescale_spaces: False
 unserved_penalty: 1000.
 reward_scale: 1

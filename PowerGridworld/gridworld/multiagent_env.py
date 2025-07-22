@@ -397,7 +397,7 @@ class MultiAgentEnv(EnvBase):
         self.history = {
             "timestamp": [], "voltage": [], "agent_power_p": [], 
             "total_load": [], "losses": [], "actions": [], 
-            "reward_components": [], "per_agent_info": []
+            "reward_components": [], "per_agent_info": [], "agent_rewards": []
         }
         self.episode_reward = 0
         self.obs_dict = {}
@@ -537,6 +537,7 @@ class MultiAgentEnv(EnvBase):
         self.history["actions"].append(action)
         self.history["reward_components"].append(self._global_reward_components.copy())
         self.history["per_agent_info"].append(per_agent_info)
+        self.history["agent_rewards"].append(rew.copy())
 
 
         return obs, rew, dones, truncated, per_agent_info
@@ -657,7 +658,7 @@ class MultiAgentEnv(EnvBase):
         # Assuming the history value is the total load.
         # The history stores a tuple: (bus_names, load_array). We sum the real power column.
         total_load = [l[1][:, 0].sum() for l in self.history["total_load"]]
-        load_df = pd.DataFrame({"EV Load": ev_load, "Total Load": total_load}, index=timestamps)
+        load_df = pd.DataFrame({"Agent Load": ev_load, "Total Load": total_load}, index=timestamps)
 
         # Per-Agent Info with warnings if missing
         # Build a flat list of all vehicles for legend
@@ -666,7 +667,14 @@ class MultiAgentEnv(EnvBase):
         agent_colors = {}
         import matplotlib.pyplot as plt
         color_map = plt.get_cmap('tab10')
-        agent_color_list = {agent: color_map(i % 10) for i, agent in enumerate(self.agent_names)}
+        
+        # Create color mapping based on bus connections
+        # Get unique buses and map them to colors
+        unique_buses = list(set(self.agent_name_bus_map.values()))
+        bus_color_map = {bus: color_map(i % 10) for i, bus in enumerate(unique_buses)}
+        
+        # Map agents to colors based on their bus
+        agent_color_list = {agent: bus_color_map[self.agent_name_bus_map[agent]] for agent in self.agent_names}
 
         for t, step_info in enumerate(self.history["per_agent_info"]):
             # For each agent, get their per-vehicle dict
@@ -708,29 +716,27 @@ class MultiAgentEnv(EnvBase):
             values="energy_remaining"
         )
 
-        # Peak reward and unserved reward data
-        peak_reward_data = []
+        # Agent rewards and unserved reward data
+        agent_reward_data = []
         unserved_reward_data = []
-        for t, step_info in enumerate(self.history["per_agent_info"]):
-            pr_row = {}
+        for t, (step_rewards, step_info) in enumerate(zip(self.history["agent_rewards"], self.history["per_agent_info"])):
+            ar_row = {}
             ur_row = {}
             for agent in self.agent_names:
+                # Get agent reward for this timestep
+                ar_row[agent] = step_rewards.get(agent, 0)
+                
+                # Get unserved reward info
                 info = step_info.get(agent, {})
-                if "peak_reward" not in info:
-                    warnings.warn(
-                        f"[render_rollout_fig] 'peak_reward' missing for agent '{agent}' at timestep {t}.",
-                        UserWarning,
-                    )
                 if "real_energy_unserved_reward" not in info:
                     warnings.warn(
                         f"[render_rollout_fig] 'real_energy_unserved_reward' missing for agent '{agent}' at timestep {t}.",
                         UserWarning,
                     )
-                pr_row[agent] = info.get("peak_reward", 0)
                 ur_row[agent] = info.get("real_energy_unserved_reward", 0)
-            peak_reward_data.append(pr_row)
+            agent_reward_data.append(ar_row)
             unserved_reward_data.append(ur_row)
-        peak_reward_df = pd.DataFrame(peak_reward_data, index=timestamps)
+        agent_reward_df = pd.DataFrame(agent_reward_data, index=timestamps)
         unserved_reward_df = pd.DataFrame(unserved_reward_data, index=timestamps)
 
         # # debugging
@@ -741,20 +747,74 @@ class MultiAgentEnv(EnvBase):
         reward_comp_df = pd.DataFrame(self.history["reward_components"], index=timestamps)
 
         # --- Plotting ---
-        fig, axes = plt.subplots(4, 2, figsize=(20, 24), tight_layout=True)
+        fig, axes = plt.subplots(4, 2, figsize=(20, 24))
         fig.suptitle("Evaluation Rollout", fontsize=16)
+        plt.subplots_adjust(left=0.08, right=0.95, top=0.93, bottom=0.05, hspace=0.3, wspace=0.25)
         
         # Plot 1: Agent Actions
-        actions_df.plot(ax=axes[0, 0], legend=True)
-        axes[0, 0].set_title("Agent Actions")
-        axes[0, 0].set_ylabel("Action Value")
-        axes[0, 0].grid(True)
+        ax_actions = axes[0, 0]
+        plotted_buses = set()
+        for agent in self.agent_names:
+            if agent in actions_df.columns:
+                bus = self.agent_name_bus_map[agent]
+                # Only add legend entry for the first agent on each bus
+                label = f"Bus {bus}" if bus not in plotted_buses else None
+                ax_actions.plot(actions_df.index, actions_df[agent], 
+                              label=label, 
+                              color=agent_color_list[agent])
+                plotted_buses.add(bus)
+        ax_actions.set_title("Agent Actions")
+        ax_actions.set_ylabel("Action Value")
+        ax_actions.grid(True)
+        ax_actions.legend(loc='best', fontsize='small')
 
         # Plot 2: Nodal Voltages
-        voltages_df.plot(ax=axes[0, 1], legend=False)
-        axes[0, 1].set_title("Nodal Voltages")
-        axes[0, 1].set_ylabel("Voltage (p.u.)")
-        axes[0, 1].grid(True)
+        ax_voltages = axes[0, 1]
+        
+        # Create a comprehensive color mapping for all buses in the voltage data
+        # First, get all bus names from the voltage data
+        all_voltage_buses = list(voltages_df.columns)
+        
+        # Create a color mapping that includes both agent buses and voltage buses
+        extended_color_map = {}
+        color_index = 0
+        
+        # First assign colors to buses with agents
+        for agent in self.agent_names:
+            agent_bus = self.agent_name_bus_map[agent]
+            if agent_bus not in extended_color_map:
+                extended_color_map[agent_bus] = color_map(color_index % 10)
+                color_index += 1
+        
+        # Then assign colors to remaining voltage buses
+        for bus in all_voltage_buses:
+            if bus not in extended_color_map:
+                # Check if this bus corresponds to an agent bus through the mapping
+                mapped_bus = None
+                for mapped_name, full_name in bus_name_mapping.items():
+                    if bus == mapped_name or bus == full_name:
+                        # Find if any agent is connected to the mapped bus
+                        for agent_bus in self.agent_name_bus_map.values():
+                            if agent_bus == full_name or agent_bus == mapped_name:
+                                mapped_bus = agent_bus
+                                break
+                        break
+                
+                if mapped_bus and mapped_bus in extended_color_map:
+                    extended_color_map[bus] = extended_color_map[mapped_bus]
+                else:
+                    extended_color_map[bus] = color_map(color_index % 10)
+                    color_index += 1
+        
+        # Plot all voltage buses with their assigned colors
+        for bus in voltages_df.columns:
+            color = extended_color_map[bus]
+            ax_voltages.plot(voltages_df.index, voltages_df[bus], 
+                           label=f"Bus {bus}", color=color)
+        ax_voltages.set_title("Nodal Voltages")
+        ax_voltages.set_ylabel("Voltage (p.u.)")
+        ax_voltages.grid(True)
+        ax_voltages.legend(loc='best', fontsize='small')
 
         # Plot 3: Power Losses
         losses_df.plot(ax=axes[1, 0])
@@ -762,49 +822,52 @@ class MultiAgentEnv(EnvBase):
         axes[1, 0].set_ylabel("Power (kW/kVAR)")
         axes[1, 0].grid(True)
 
-        # Plot 4: Total and EV Load
+        # Plot 4: Total and Agent Load
         load_df.plot(ax=axes[1, 1])
         axes[1, 1].set_title("System Load")
         axes[1, 1].set_ylabel("Power (kW)")
         axes[1, 1].grid(True)
 
-        # Plot 5: Energy Remaining (per Vehicle, colored by agent)
+        # Plot 5: Energy Remaining (per Vehicle, colored by agent's bus)
         ax_er = axes[2, 0]
-        # Track which agents have already been added to the legend
-        legend_handles = {}
+        plotted_buses = set()
+        # Since each agent now controls only one EV, simplify the plotting
         for (agent, vehicle) in energy_remaining_pivot.columns:
             color = agent_color_list[agent]
-            # Only add label for the first vehicle of each agent
-            label = agent if agent not in legend_handles else None
-            # Plot with consistent line style and marker
-            line, = ax_er.plot(
+            bus = self.agent_name_bus_map[agent]
+            # Only add legend entry for the first agent on each bus
+            label = f"Bus {bus}" if bus not in plotted_buses else None
+            ax_er.plot(
                 energy_remaining_pivot.index,
                 energy_remaining_pivot[(agent, vehicle)],
                 label=label,
                 color=color,
-                linestyle='-',   # solid line for all
-                marker=None,     # or set to 'o', 's', etc. for all if you want markers
+                linestyle='-',
+                marker=None,
                 alpha=0.7
             )
-            if label is not None:
-                legend_handles[agent] = line
+            plotted_buses.add(bus)
         ax_er.set_title("Remaining Energy Need (by Vehicle)")
         ax_er.set_ylabel("Energy Remaining (kWh)")
         ax_er.grid(True)
-        # Only show one legend entry per agent
-        ax_er.legend(
-            handles=[legend_handles[a] for a in self.agent_names if a in legend_handles],
-            labels=[a for a in self.agent_names if a in legend_handles],
-            loc='best',
-            fontsize='small',
-            ncol=2
-        )
+        ax_er.legend(loc='best', fontsize='small', ncol=2)
 
-        # Plot 6: Peak Reward (per Agent)
-        peak_reward_df.plot(ax=axes[2, 1])
-        axes[2, 1].set_title("Peak Reward (per Agent)")
-        axes[2, 1].set_ylabel("Reward")
-        axes[2, 1].grid(True)
+        # Plot 6: Agent Rewards (per Agent)
+        ax_rewards = axes[2, 1]
+        plotted_buses = set()
+        for agent in self.agent_names:
+            if agent in agent_reward_df.columns:
+                bus = self.agent_name_bus_map[agent]
+                # Only add legend entry for the first agent on each bus
+                label = f"Bus {bus}" if bus not in plotted_buses else None
+                ax_rewards.plot(agent_reward_df.index, agent_reward_df[agent], 
+                              label=label, 
+                              color=agent_color_list[agent])
+                plotted_buses.add(bus)
+        ax_rewards.set_title("Agent Rewards (per Agent)")
+        ax_rewards.set_ylabel("Reward")
+        ax_rewards.grid(True)
+        ax_rewards.legend(loc='best', fontsize='small')
 
         # Plot 7: Global Reward Components
         reward_comp_df.plot(ax=axes[3, 0])
@@ -813,10 +876,21 @@ class MultiAgentEnv(EnvBase):
         axes[3, 0].grid(True)
 
         # Plot 8: Unserved Reward (per Agent)
-        unserved_reward_df.plot(ax=axes[3, 1])
-        axes[3, 1].set_title("Unserved Reward (per Agent)")
-        axes[3, 1].set_ylabel("Reward")
-        axes[3, 1].grid(True)
-        axes[3, 1].set_visible(True)  # Make sure this subplot is visible
+        ax_unserved = axes[3, 1]
+        plotted_buses = set()
+        for agent in self.agent_names:
+            if agent in unserved_reward_df.columns:
+                bus = self.agent_name_bus_map[agent]
+                # Only add legend entry for the first agent on each bus
+                label = f"Bus {bus}" if bus not in plotted_buses else None
+                ax_unserved.plot(unserved_reward_df.index, unserved_reward_df[agent], 
+                               label=label, 
+                               color=agent_color_list[agent])
+                plotted_buses.add(bus)
+        ax_unserved.set_title("Unserved Reward (per Agent)")
+        ax_unserved.set_ylabel("Reward")
+        ax_unserved.grid(True)
+        ax_unserved.legend(loc='best', fontsize='small')
+        ax_unserved.set_visible(True)  # Make sure this subplot is visible
 
         return fig

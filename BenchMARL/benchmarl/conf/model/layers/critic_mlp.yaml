@@ -1,7 +1,7 @@
 
-name: mlp
+name: critic_mlp
 
-num_cells: [1024, 512]
+num_cells: [1024,512,256]
 layer_class: torch.nn.Linear
 
 activation_class: torch.nn.ReLU
