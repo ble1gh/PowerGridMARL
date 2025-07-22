@@ -23,11 +23,14 @@ from gridworld import ComponentEnv
 from gridworld import MultiAgentEnv
 from gridworld.distribution_system import OpenDSSSolver
 from gridworld.agents.vehicles import EVChargingEnv
+from gridworld.agents.pv import PVEnv
+from gridworld.agents.energy_storage import EnergyStorageEnv
 from mpl_toolkits.mplot3d import Axes3D
 
 AGENT_CLASS_MAP = {
     "EVChargingEnv": EVChargingEnv,
-    # Add other agent types here as needed
+    "PVEnv": PVEnv,
+    "EnergyStorageEnv": EnergyStorageEnv,
 }
 
 class PowerGridworldTask(Task):
@@ -35,6 +38,7 @@ class PowerGridworldTask(Task):
     # Their config will be loaded from conf/task/PowerGridworld
 
     EVOVERNIGHT13NODE = None  # Loaded automatically from conf/task/PowerGridworld/evovernight13node
+    EVOVERNIGHT13NODE_SIMPLE = None  # Loaded automatically from conf/task/PowerGridworld/evovernight13node_simple
 
     @staticmethod
     def associated_class():
@@ -50,35 +54,81 @@ class PowerGridworldClass(TaskClass):
         device: DEVICE_TYPING,
     ) -> Callable[[], EnvBase]:
         config = copy.deepcopy(self.config)
-        # Extract agent types and busses from config
-        agent_types = config.get("agents", [])
-        busses = config.get("busses", [])
-        n_agents = len(agent_types)
-        if not busses or len(busses) != n_agents:
-            # Default to 13 busses if not specified or mismatch
-            busses = ['634a', '634b', '634c', '645', '675a', '675b', '675c', '670a', '670b', '670c', '684c'][:n_agents]
-            print(f"Using default busses: {busses} for {n_agents} agents.")
-
-        # Build agent configs
+        
+        # Get agent counts per node
+        EVs_per_node = config.get("EVs_per_node", 0)
+        PVs_per_node = config.get("PVs_per_node", 0)
+        Storage_per_node = config.get("Storage_per_node", 0)
+        
+        # Get buses for each agent type
+        EV_busses = config.get("EV_busses", [])
+        PV_busses = config.get("PV_busses", [])
+        Storage_busses = config.get("Storage_busses", [])
+        
+        # Build agent configs for each type
         agents = []
-        for i, (agent_type, bus) in enumerate(zip(agent_types, busses)):
-            agent_cls = AGENT_CLASS_MAP.get(agent_type)
-            if agent_cls is None:
-                raise ValueError(f"Unknown agent type: {agent_type}")
-            agents.append({
-                "name": f"ev-charging-{i}",
-                "bus": bus,
-                "cls": agent_cls,  # You can map agent_type to class if needed
-                "config": {
-                    "num_vehicles": config.get("num_vehicles", 70),
-                    "minutes_per_step": config.get("minutes_per_step", 15),
-                    "max_charge_rate_kw": config.get("max_charge_rate_kw", 7.0),
-                    "peak_threshold": config.get("peak_threshold", 700.0),
-                    "vehicle_multiplier": config.get("vehicle_multiplier", 1.0),
-                    "rescale_spaces": config.get("rescale_spaces", False),
-                    "unserved_penalty": config.get("unserved_penalty", 0.0),
-                }
-            })
+        
+        # Create EV agents
+        if EVs_per_node > 0 and EV_busses:
+            for bus in EV_busses:
+                for copy_num in range(1, EVs_per_node + 1):
+                    agent_name = f"EV-{bus}-{copy_num}"
+                    agents.append({
+                        "name": agent_name,
+                        "bus": bus,
+                        "cls": EVChargingEnv,
+                        "config": {
+                            "num_vehicles": config.get("num_vehicles", 1),
+                            "minutes_per_step": config.get("minutes_per_step", 15),
+                            "max_charge_rate_kw": config.get("max_charge_rate_kw", 7.0),
+                            "peak_threshold": config.get("peak_threshold", 700.0),
+                            "vehicle_multiplier": config.get("vehicle_multiplier", 1.0),
+                            "rescale_spaces": config.get("rescale_spaces", False),
+                            "unserved_penalty": config.get("unserved_penalty", 0.0),
+                        }
+                    })
+        
+        # Create PV agents
+        if PVs_per_node > 0 and PV_busses:
+            for bus in PV_busses:
+                for copy_num in range(1, PVs_per_node + 1):
+                    agent_name = f"PV-{bus}-{copy_num}"
+                    agents.append({
+                        "name": agent_name,
+                        "bus": bus,
+                        "cls": PVEnv,
+                        "config": {
+                            "profile_csv": config.get("pv_profile_csv", "pv_profile.csv"),
+                            "scaling_factor": config.get("pv_scaling_factor", 1.0),
+                            "rescale_spaces": config.get("rescale_spaces", False),
+                            "grid_aware": config.get("pv_grid_aware", False),
+                        }
+                    })
+        
+        # Create Energy Storage agents
+        if Storage_per_node > 0 and Storage_busses:
+            for bus in Storage_busses:
+                for copy_num in range(1, Storage_per_node + 1):
+                    agent_name = f"Storage-{bus}-{copy_num}"
+                    agents.append({
+                        "name": agent_name,
+                        "bus": bus,
+                        "cls": EnergyStorageEnv,
+                        "config": {
+                            "storage_range": (config.get("storage_range_min", 3.0), config.get("storage_range_max", 50.0)),
+                            "initial_storage_mean": config.get("initial_storage_mean", 30.0),
+                            "initial_storage_std": config.get("initial_storage_std", 5.0),
+                            "charge_efficiency": config.get("charge_efficiency", 0.95),
+                            "discharge_efficiency": config.get("discharge_efficiency", 0.9),
+                            "max_power": config.get("max_power", 15.0),
+                            "rescale_spaces": config.get("rescale_spaces", False),
+                        }
+                    })
+
+        print(f"Created {len(agents)} agents:")
+        print(f"  - {len(EV_busses) * EVs_per_node} EV agents ({EVs_per_node} per node)")
+        print(f"  - {len(PV_busses) * PVs_per_node} PV agents ({PVs_per_node} per node)")
+        print(f"  - {len(Storage_busses) * Storage_per_node} Storage agents ({Storage_per_node} per node)")
 
         # Common config
         common_config = {

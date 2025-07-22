@@ -18,7 +18,7 @@ prefer_continuous_actions: True
 collect_with_grad: False
 # In case of non-vectorized environments, whether to run collection of multiple processes
 # If this is used, there will be n_envs_per_worker processes, collecting frames_per_batch/n_envs_per_worker frames each
-parallel_collection: False
+parallel_collection: True
 
 # Discount factor
 gamma: 0.99
@@ -49,14 +49,14 @@ exploration_anneal_frames: null
 # The maximum number of experiment iterations before the experiment terminates, exclusive with max_n_frames
 max_n_iters: null
 # Number of collected frames before ending, exclusive with max_n_iters
-max_n_frames: 3_000_000
+max_n_frames: 1_500_000
 
 # Number of frames collected and each experiment iteration
 on_policy_collected_frames_per_batch: 6000
 # Number of environments used for collection
 # If the environment is vectorized, this will be the number of batched environments.
 # Otherwise batching will be simulated and each env will be run sequentially or parallelly depending on parallel_collection.
-on_policy_n_envs_per_worker: 10
+on_policy_n_envs_per_worker: 16
 # This is the number of times collected_frames_per_batch will be split into minibatches and trained
 on_policy_n_minibatch_iters: 45
 # In on-policy algorithms the train_batch_size will be equal to the on_policy_collected_frames_per_batch
@@ -68,7 +68,7 @@ off_policy_collected_frames_per_batch: 6000
 # Number of environments used for collection
 # If the environment is vectorized, this will be the number of batched environments.
 # Otherwise batching will be simulated and each env will be run sequentially or parallelly depending on parallel_collection.
-off_policy_n_envs_per_worker: 10
+off_policy_n_envs_per_worker: 16
 # This is the number of times off_policy_train_batch_size will be sampled from the buffer and trained over.
 off_policy_n_optimizer_steps: 1000
 # Number of frames used for each off_policy_n_optimizer_steps when training off-policy algorithms

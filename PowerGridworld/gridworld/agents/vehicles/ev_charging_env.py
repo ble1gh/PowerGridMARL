@@ -159,8 +159,13 @@ class EVChargingEnv(ComponentEnv):
             max(0, self.state["real_power_consumed"] - self.peak_threshold)**2
         reward = unserved_reward + peak_reward
         reward /= self.reward_scale
-        # print(f"EVChargingEnv Reward: {reward}, Unserved: {unserved_reward}, Peak: {peak_reward}")
-        return reward, {"real_energy_unserved": unserved_reward, "peak_reward": peak_reward}
+        
+        # Scale the reward components to match the actual contribution to the agent reward
+        scaled_unserved_reward = unserved_reward / self.reward_scale
+        scaled_peak_reward = peak_reward / self.reward_scale
+        
+        # print(f"EVChargingEnv Reward: {reward}, Unserved: {scaled_unserved_reward}, Peak: {scaled_peak_reward}")
+        return reward, {"real_energy_unserved": scaled_unserved_reward, "peak_reward": scaled_peak_reward}
 
 
     def reset(self, **kwargs) -> Tuple[dict, dict]:
