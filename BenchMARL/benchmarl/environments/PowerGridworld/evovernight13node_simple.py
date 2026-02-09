@@ -27,6 +27,12 @@ class TaskConfig:
     unserved_penalty: float = MISSING
     reward_scale: float = MISSING
     
+    # Global reward penalty scaling parameters
+    power_loss_penalty: float = MISSING
+    voltage_penalty: float = MISSING
+    load_2norm_penalty: float = MISSING
+    tracking_reward_penalty: float = MISSING
+
     # PV agent parameters
     pv_profile_csv: str = MISSING
     pv_scaling_factor: float = MISSING
@@ -40,3 +46,8 @@ class TaskConfig:
     charge_efficiency: float = MISSING
     discharge_efficiency: float = MISSING
     max_power: float = MISSING
+
+    # Signal tracking parameters
+    signal_tracking: bool = MISSING
+    track_total_load: bool = MISSING
+    setpoint: float = MISSING

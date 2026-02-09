@@ -1,0 +1,82 @@
+defaults:
+  - PowerGridworldVariable_evovernight13node_simple_config
+  - _self_
+
+agents: [EVChargingEnv, PVEnv, EnergyStorageEnv]  # Agent types available
+
+start_time: "08-12-2020 20:00:00"
+end_time: "08-13-2020 08:00:00"
+control_timedelta: 900 #seconds
+
+# Variable agent configuration
+# Min/max number of each agent type (sampled uniformly at each episode reset)
+min_EVs: 11
+max_EVs: 18
+min_PVs: 0
+max_PVs: 0
+min_Storage: 0
+max_Storage: 0
+
+# Possible buses where each agent type can be located
+EV_busses: ['634a', '634b', '634c', '645', '675a', '675b', '675c', '670a', '670b', '670c', '684c']
+PV_busses: []
+Storage_busses: []
+
+# Whether multiple agents of same type can be at the same node
+allow_multiple_agents_per_node: True
+
+# Grid Model Parameters
+cls: "OpenDSSSolver"
+feeder_file: "ieee_13_dss/IEEE13Nodeckt.dss"
+loadshape_file: "ieee_13_dss/annual_hourly_load_profile.csv"
+system_load_rescale_factor: 0.9
+load_noise_std: 0.0  # DEPRECATED legacy param (kept for backward compat, set to 0 when using new params)
+load_forecast_noise_std: 0.03  # Per-node noise on load coefficient that agents/GNN observe
+load_actual_noise_std: 0.03   # Per-node noise on top of forecast used in power flow
+include_load_in_agent_obs: False  # If True, append normalized load coefficient to each agent's observation
+
+# EV agent parameters
+num_vehicles: 1
+minutes_per_step: 15
+max_charge_rate_kw: 7.
+peak_threshold: 700.
+vehicle_multiplier: 140.
+rescale_spaces: False
+unserved_penalty: 10.
+reward_scale: 1
+
+# Global reward penalty scaling parameters
+power_loss_penalty: 0   # Scaling factor for power loss reward (higher = more penalty)
+voltage_penalty: 1e3     # Scaling factor for voltage violation reward (higher = more penalty)
+cooperative_voltage: True # If True, voltage penalty is applied to all agents. If False, only to agents at violating node.
+load_2norm_penalty: 0         # Scaling factor for load penalty (higher = more penalty)
+tracking_reward_penalty: 1e2  # Scaling factor for tracking reward (higher = more penalty)
+
+# PV agent parameters
+pv_profile_csv: "pv_profile.csv"
+pv_scaling_factor: 1.0  # Used when min/max are equal or not specified
+min_pv_scaling_factor: 5.0  # Minimum PV capacity (kW) when sampling
+max_pv_scaling_factor: 10.0  # Maximum PV capacity (kW) when sampling
+pv_profile_noise_std: 0.0  # Std dev of Gaussian noise on normalized PV profile (0 = no noise)
+pv_grid_aware: False
+
+# Energy Storage agent parameters
+storage_range_min: 3.0
+storage_range_max: 50.0
+initial_storage_mean: 30.0
+initial_storage_std: 5.0
+charge_efficiency: 0.95
+discharge_efficiency: 0.9
+max_power: 15.0
+
+# Signal tracking parameters
+signal_tracking: True
+track_total_load: False  # If True, compare (agent_load + base_load) vs setpoint. If False, compare agent_load vs setpoint.
+setpoint: 1000.
+
+# VPP (Virtual Power Plant) reward parameters
+# When enabled, agents are rewarded for collectively hitting a power production setpoint.
+# PV/Storage contribution = net injection (-real_power). EV contribution = demand response (max_draw - actual_draw).
+vpp_reward: False
+vpp_setpoint: 0.0    # Target VPP production (same units as agent real_power)
+vpp_reward_penalty: 1.0  # Scaling factor for quadratic VPP tracking penalty

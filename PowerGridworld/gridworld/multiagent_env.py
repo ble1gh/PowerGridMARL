@@ -19,23 +19,6 @@ import torch
 from gymnasium.spaces import Box
 import warnings
 
-bus_name_mapping = {
-    "634a": "634.1",
-    "634b": "634.2",
-    "634c": "634.3",
-    "645": "645.2",
-    "675a": "675.1",
-    "675b": "675.2",
-    "675c": "675.3",
-    "670a": "670.1",
-    "670b": "670.2",
-    "670c": "670.3",
-    "684c": "684.3",
-    "611": "611.3",
-    "652": "652.1",
-    "671": "671.1.2.3",  # Example for a 3-phase bus
-}
-
 
 class MultiAgentEnv(EnvBase):
     """This class implements the multi-agent environment created from a list
@@ -55,6 +38,55 @@ class MultiAgentEnv(EnvBase):
         self.common_config = common_config
         self.rescale_spaces = rescale_spaces
         assert len(agents) > 0, "need at least one agent!"
+
+        # Get global reward configs
+        self.power_loss_penalty = float(common_config.get("power_loss_penalty", 1e-5))
+        if "power_loss_penalty" not in common_config:
+            logger.info(f"Using default power_loss_penalty: {self.power_loss_penalty}")
+
+        self.voltage_penalty = float(common_config.get("voltage_penalty", 1e3))
+        if "voltage_penalty" not in common_config:
+            logger.info(f"Using default voltage_penalty: {self.voltage_penalty}")
+
+        self.load_2norm_penalty = float(common_config.get("load_2norm_penalty", 0.0))
+        if "load_2norm_penalty" not in common_config:
+            logger.info(f"Using default load_2norm_penalty: {self.load_2norm_penalty}")
+        
+        self.tracking_reward_penalty = float(common_config.get("tracking_reward_penalty", 1.0))
+        if "tracking_reward_penalty" not in common_config:
+            logger.info(f"Using default tracking_reward_penalty: {self.tracking_reward_penalty}")
+
+        self.signal_tracking = common_config.get("signal_tracking", False)
+        if "signal_tracking" not in common_config:
+            logger.info(f"Using default signal_tracking: {self.signal_tracking}")
+        
+        self.track_total_load = common_config.get("track_total_load", False)
+        if "track_total_load" not in common_config:
+            logger.info(f"Using default track_total_load: {self.track_total_load}")
+        
+        self.setpoint = float(common_config.get("setpoint", 200.0))
+        if "setpoint" not in common_config:
+            logger.info(f"Using default setpoint: {self.setpoint}")
+
+        self.vpp_reward = common_config.get("vpp_reward", False)
+        if "vpp_reward" not in common_config:
+            logger.info(f"Using default vpp_reward: {self.vpp_reward}")
+        
+        self.vpp_setpoint = float(common_config.get("vpp_setpoint", 0.0))
+        if "vpp_setpoint" not in common_config:
+            logger.info(f"Using default vpp_setpoint: {self.vpp_setpoint}")
+        
+        self.vpp_reward_penalty = float(common_config.get("vpp_reward_penalty", 1.0))
+        if "vpp_reward_penalty" not in common_config:
+            logger.info(f"Using default vpp_reward_penalty: {self.vpp_reward_penalty}")
+            
+        self.cooperative_voltage = common_config.get("cooperative_voltage", True)
+        if "cooperative_voltage" not in common_config:
+            logger.info(f"Using default cooperative_voltage: {self.cooperative_voltage}")
+            
+        self.include_load_in_agent_obs = common_config.get("include_load_in_agent_obs", True)
+        if "include_load_in_agent_obs" not in common_config:
+            logger.info(f"Using default include_load_in_agent_obs: {self.include_load_in_agent_obs}")
 
         # TODO:  If we required certain keys in this config dict, we need
         # to do some simple checking and raise a helpful error.
@@ -123,7 +155,10 @@ class MultiAgentEnv(EnvBase):
             agent.name: agent.action_space for agent in self.agents}
         
         n_agents = len(self.agents)
-        obs_dim = self.agents[0].observation_space.shape[0]+1  # +1 for voltage
+        # Observation dimension: base + voltage + setpoint + (optionally) base load
+        obs_dim = self.agents[0].observation_space.shape[0] + 2  # +1 for voltage, +1 for setpoint
+        if self.include_load_in_agent_obs:
+            obs_dim += 1  # +1 for base load
         act_dim = self.agents[0].action_space.shape[0]
 
         # Get bounds from any agent (they are all the same)
@@ -132,6 +167,13 @@ class MultiAgentEnv(EnvBase):
         # Append 0 to obs_low and inf to obs_high for the voltage dimension
         obs_low = torch.cat([obs_low, torch.tensor([0.0], dtype=torch.float32)])
         obs_high = torch.cat([obs_high, torch.tensor([float('inf')], dtype=torch.float32)])
+        # Append bounds for the setpoint dimension (can be any positive value)
+        obs_low = torch.cat([obs_low, torch.tensor([0.0], dtype=torch.float32)])
+        obs_high = torch.cat([obs_high, torch.tensor([float('inf')], dtype=torch.float32)])
+        # Optionally append bounds for the normalized base load dimension
+        if self.include_load_in_agent_obs:
+            obs_low = torch.cat([obs_low, torch.tensor([0.0], dtype=torch.float32)])
+            obs_high = torch.cat([obs_high, torch.tensor([1.0], dtype=torch.float32)])
         # print("obs_low shape:", obs_low.shape)
         # print("obs_high shape:", obs_high.shape)
         act_high = torch.as_tensor(self.agents[0].action_space.high, dtype=torch.float32)
@@ -209,7 +251,7 @@ class MultiAgentEnv(EnvBase):
             "info": Composite({
                 "power_loss_reward": Bounded(low=float("-inf"), high=float(0.0), shape=(), dtype=torch.float32),
                 "voltage_reward": Bounded(low=float("-inf"), high=float(0.0), shape=(), dtype=torch.float32),
-                "load_penalty": Bounded(low=float("-inf"), high=float(0.0), shape=(), dtype=torch.float32),
+                "load_2norm_penalty": Bounded(low=float("-inf"), high=float(0.0), shape=(), dtype=torch.float32),
             })
         })
 
@@ -246,7 +288,7 @@ class MultiAgentEnv(EnvBase):
         self._closed = True
         
         # Log that the environment has been closed
-        logger.info("MultiAgentEnv has been closed.")
+        # logger.info("MultiAgentEnv has been closed.")
     
     # Remove the '*' from the signature to allow positional arguments
     def _reset(self, tensordict=None, **kwargs):
@@ -366,6 +408,10 @@ class MultiAgentEnv(EnvBase):
         TODO: Design an interface for a user to customize this."""
 
         kwargs = {}
+
+        # Pass the current simulation timestamp so time-of-day-aware agents
+        # (e.g. PVEnv) can look up the correct profile value.
+        kwargs["current_time"] = self.time
 
         # Get the bus voltage at the agent's bus.
         if "bus_voltage" in agent.obs_labels:
@@ -489,6 +535,7 @@ class MultiAgentEnv(EnvBase):
             if agent_name in self.agent_names:  # Ensure it's an actual agent
                 per_agent_info[agent_name] = {}
                 if isinstance(agent_meta, dict):
+                    # EV-specific fields
                     if "energy_remaining" in agent_meta:
                         per_agent_info[agent_name]["energy_remaining"] = agent_meta["energy_remaining"]
                         if isinstance(agent_meta["energy_remaining"], (int, float)) and agent_meta["energy_remaining"] == 0:
@@ -496,25 +543,23 @@ class MultiAgentEnv(EnvBase):
                                 f"[MultiAgentEnv] 'energy_remaining' for agent '{agent_name}' is 0 (default) at step {self.episode_step}.",
                                 UserWarning,
                             )
-                    elif "energy_remaining" not in agent_meta:
-                        warnings.warn(
-                            f"[MultiAgentEnv] 'energy_remaining' missing in meta for agent '{agent_name}' at step {self.episode_step}.",
-                            UserWarning,
-                        )
                     if "peak_reward" in agent_meta:
                         per_agent_info[agent_name]["peak_reward"] = agent_meta["peak_reward"]
-                    else:
-                        warnings.warn(
-                            f"[MultiAgentEnv] 'peak_reward' missing in meta for agent '{agent_name}' at step {self.episode_step}.",
-                            UserWarning,
-                        )
                     if "real_energy_unserved" in agent_meta:
                         per_agent_info[agent_name]["real_energy_unserved_reward"] = agent_meta["real_energy_unserved"]
-                    else:
-                        warnings.warn(
-                            f"[MultiAgentEnv] 'real_energy_unserved' missing in meta for agent '{agent_name}' at step {self.episode_step}.",
-                            UserWarning,
-                        )
+                    # Storage-specific fields
+                    if "state_of_charge" in agent_meta:
+                        per_agent_info[agent_name]["state_of_charge"] = float(agent_meta["state_of_charge"])
+                    # PV-specific fields
+                    if "real_power" in agent_meta:
+                        per_agent_info[agent_name]["pv_real_power"] = float(agent_meta["real_power"])
+        # Also record each agent's real_power (for VPP / load plots)
+        for agent in self.agents:
+            if agent.name in per_agent_info:
+                per_agent_info[agent.name]["real_power"] = float(agent.real_power)
+                # EV agents expose max_real_power (needed for VPP curtailment calc)
+                if hasattr(agent, 'max_real_power'):
+                    per_agent_info[agent.name]["max_real_power"] = float(agent.max_real_power)
 
         # Update meta with global reward components
         if hasattr(self, '_global_reward_components'):
@@ -544,37 +589,107 @@ class MultiAgentEnv(EnvBase):
 
     def obs_transform(self, obs_dict) -> dict:
         """Function to transform the agent observations based on centralized view."""
+        # Get the current total base load (this is system-wide information)
+        # Use the sum of real power from base load only (excluding controllable agents)
+        total_base_load = float(self.pf_solver.normalized_load_coefficient)  # normalized load coefficient
+        
         for agent_name in obs_dict:
             # Ensure the observation array is of type float32
             obs_dict[agent_name] = obs_dict[agent_name].astype(np.float32)
 
-            # Get the bus name in numeric form
+            # Get the bus name and get voltage using the power flow solver's built-in method
             bus_name = self.agent_name_bus_map[agent_name]
-            numeric_bus_name = bus_name_mapping.get(bus_name, bus_name)  # Default to original if not found
-
-            # Get the voltage for the agent's bus and ensure it is a float32
-            voltage = float(self.voltages[numeric_bus_name])
+            voltage = self.pf_solver.get_bus_voltage_by_name(bus_name)
+            
+            # Handle both single-phase (float) and three-phase (list) voltages
+            if isinstance(voltage, list):
+                # For three-phase buses, use the average voltage
+                voltage = float(np.mean(voltage))
+            else:
+                voltage = float(voltage)
 
             # Append the voltage to the observation
             obs_dict[agent_name] = np.append(obs_dict[agent_name], voltage).astype(np.float32)
+            
+            # Append the setpoint to the observation
+            obs_dict[agent_name] = np.append(obs_dict[agent_name], self.setpoint).astype(np.float32)
+            
+            # Optionally append the total base load to the observation
+            if self.include_load_in_agent_obs:
+                obs_dict[agent_name] = np.append(obs_dict[agent_name], total_base_load).astype(np.float32)
+
 
         return obs_dict
 
     def reward_transform(self, rew_dict) -> dict:
         """Function to transform the agent rewards based on centralized view."""
+        
+        # Calculate total agent load (sum of all agent real power at current timestep)
+        total_agent_load = float(sum([agent.real_power for agent in self.agents]))
+        
+        # Calculate base load (sum of all base load real power at current timestep)
+        # Use per-node forecast coefficients if available, else fall back to scalar
+        if hasattr(self.pf_solver, 'forecast_load_coefficients') and self.pf_solver.forecast_load_coefficients is not None:
+            current_step_load = self.pf_solver.forecast_load_coefficients[:, np.newaxis] * \
+                self.pf_solver.base_load * self.pf_solver.system_load_rescale_factor
+        else:
+            current_step_load = self.pf_solver.normalized_load_coefficient * self.pf_solver.base_load * \
+                self.pf_solver.system_load_rescale_factor
+        base_load = float(current_step_load[:, 0].sum())  # Sum of real power column
+
+        # Tracking reward (quadratic penalty on normalized error)
+        tracking_reward = 0.0
+        tracking_error = 0.0
+        tracking_error_norm = 0.0
+        if self.signal_tracking:
+            if self.track_total_load:
+                tracking_error = (total_agent_load + base_load) - self.setpoint
+            else:
+                tracking_error = total_agent_load - self.setpoint
+            # Normalize by setpoint magnitude (avoid div by zero)
+            denom = max(abs(self.setpoint), 1.0)
+            tracking_error_norm = tracking_error / denom
+            # Quadratic (L2) penalty encourages matching setpoint while giving smooth gradient
+            tracking_reward = -(tracking_error_norm ** 2) * self.tracking_reward_penalty
+
+        # VPP (Virtual Power Plant) reward
+        # Measures how well agents collectively hit a power production setpoint.
+        # - PV / Energy Storage: VPP contribution = -real_power (net injection to grid)
+        # - EV: VPP contribution = max_real_power - real_power (demand response)
+        vpp_reward_value = 0.0
+        total_vpp_production = 0.0
+        if self.vpp_reward:
+            for i, agent in enumerate(self.agents):
+                # Skip inactive agents if using variable agent counts
+                if hasattr(self, 'active_mask') and not self.active_mask[i]:
+                    continue
+                
+                if hasattr(agent, 'max_real_power'):
+                    # EV-type agent: demand response = max possible draw - actual draw
+                    total_vpp_production += (agent.max_real_power - agent.real_power)
+                else:
+                    # PV / Storage: net power injection = -real_power
+                    total_vpp_production += (-agent.real_power)
+            
+            # Quadratic penalty on normalized error from VPP setpoint
+            vpp_error = total_vpp_production - self.vpp_setpoint
+            vpp_denom = max(abs(self.vpp_setpoint), 1.0)
+            vpp_error_norm = vpp_error / vpp_denom
+            vpp_reward_value = -(vpp_error_norm ** 2) * self.vpp_reward_penalty
     
-        # Calculate the power loss reward
-        power_loss_reward = -self.losses[0] / 1e5
+        # Calculate the power loss reward using instance variable
+        power_loss_reward = -self.losses[0] * self.power_loss_penalty
 
         # Calculate voltage violation reward
         voltage_reward = 0
+        violating_buses = {}
         # Check if any voltage is below 0.95 p.u.
         # If so, calculate the total voltage difference from 0.95 p.u.
         if np.any(np.array(list(self.voltages.values())) < 0.95):
-            voltage_differences = [0.95 - v for v in self.voltages.values() if v < 0.95]
-            total_voltage_difference = sum(voltage_differences)
-            voltage_reward = -total_voltage_difference * 1e3
-
+            violating_buses = {b: 0.95 - v for b, v in self.voltages.items() if v < 0.95}
+            total_voltage_difference = sum(violating_buses.values())
+            voltage_reward = -total_voltage_difference * self.voltage_penalty
+        
         # Calculate load penalty
         total_load = []
         for item in self.history['total_load'][:]:
@@ -584,25 +699,52 @@ class MultiAgentEnv(EnvBase):
 
         # Convert the list of arrays to a 2D numpy array
         total_load_array = np.array(total_load)
-        
+
         # Load stability reward
         # print(f"base_load: {self.history['base_load'][:]}")
-        load_penalty = -np.linalg.norm(total_load_array)/1e5
-        # print(f"Load penalty: {load_penalty}")
-        
-        # print(f"Voltage reward: {voltage_reward}")
+        load_2norm_penalty = -np.linalg.norm(total_load_array) * self.load_2norm_penalty
 
         # Store global reward components for group-level logging
         self._global_reward_components = {
             "power_loss_reward": float(power_loss_reward),
             "voltage_reward": float(voltage_reward),
-            "load_penalty": float(load_penalty),
+            "load_2norm_penalty": float(load_2norm_penalty),
+            "tracking_reward": float(tracking_reward),
+            "vpp_reward": float(vpp_reward_value),
+            "vpp_production": float(total_vpp_production),
         }
 
         # Add global rewards to each agent's reward individually
         for agent_name in rew_dict:
             if isinstance(rew_dict[agent_name], (int, float)):
-                rew_dict[agent_name] += power_loss_reward + voltage_reward
+                # Base global rewards (loss, load stability, tracking, VPP)
+                rew_dict[agent_name] += 100 + power_loss_reward + load_2norm_penalty + tracking_reward + vpp_reward_value
+                
+                # Voltage Reward Logic
+                if self.cooperative_voltage:
+                    # Apply total system voltage penalty to everyone
+                    rew_dict[agent_name] += voltage_reward
+                else:
+                    # Apply local voltage penalty only
+                    # Use the map we created in __init__
+                    bus_name = self.agent_name_bus_map.get(agent_name)
+                    
+                    if bus_name:
+                         try:
+                             v = self.pf_solver.get_bus_voltage_by_name(bus_name)
+                             # Handle list (e.g. 3-phase bus)
+                             if isinstance(v, (list, np.ndarray)):
+                                 v = float(np.mean(v))
+                             else:
+                                 v = float(v)
+                                 
+                             if v < 0.95:
+                                 local_penalty = -(0.95 - v) * self.voltage_penalty
+                                 rew_dict[agent_name] += local_penalty
+                         except Exception as e:
+                             # Fallback or silent ignore if bus not found in solver
+                             pass
+                    # If bus has no violation, or bus unknown, 0 penalty added
             else:
                 logger.warning(f"Reward for agent {agent_name} is not a number: {rew_dict[agent_name]}")
 
@@ -630,7 +772,12 @@ class MultiAgentEnv(EnvBase):
         """
         Generates plots from the episode history and logs them to WandB.
         This method is called from close() when an evaluation episode ends.
+        Dispatches to render_rollout_fig_vpp() when VPP reward is active.
         """
+        # VPP dispatch — returns a list of figures instead of a single figure
+        if getattr(self, "vpp_reward", False):
+            return self.render_rollout_fig_vpp()
+
         try:
             import matplotlib.pyplot as plt
         except ImportError:
@@ -640,6 +787,17 @@ class MultiAgentEnv(EnvBase):
         if not self.history or not self.history["timestamp"]:
             logger.info("No history to plot, skipping render.")
             return
+
+        # Determine active agents
+        active_agents = self.agent_names
+        if hasattr(self, "active_mask") and self.active_mask is not None:
+             try:
+                 mask = self.active_mask.cpu().numpy() if hasattr(self.active_mask, "cpu") else self.active_mask
+                 mask = mask.astype(bool)
+                 if len(mask) == len(self.agent_names):
+                     active_agents = [name for i, name in enumerate(self.agent_names) if mask[i]]
+             except Exception as e:
+                 logger.warning(f"Could not filter active agents in render_rollout_fig: {e}")
 
         # --- Data Processing ---
         timestamps = pd.to_datetime(self.history["timestamp"])
@@ -678,7 +836,7 @@ class MultiAgentEnv(EnvBase):
 
         for t, step_info in enumerate(self.history["per_agent_info"]):
             # For each agent, get their per-vehicle dict
-            for agent in self.agent_names:
+            for agent in active_agents:
                 info = step_info.get(agent, {})
                 er_dict = info.get("energy_remaining", None)
                 if er_dict is None:
@@ -722,7 +880,7 @@ class MultiAgentEnv(EnvBase):
         for t, (step_rewards, step_info) in enumerate(zip(self.history["agent_rewards"], self.history["per_agent_info"])):
             ar_row = {}
             ur_row = {}
-            for agent in self.agent_names:
+            for agent in active_agents:
                 # Get agent reward for this timestep
                 ar_row[agent] = step_rewards.get(agent, 0)
                 
@@ -747,14 +905,13 @@ class MultiAgentEnv(EnvBase):
         reward_comp_df = pd.DataFrame(self.history["reward_components"], index=timestamps)
 
         # --- Plotting ---
-        fig, axes = plt.subplots(4, 2, figsize=(20, 24))
-        fig.suptitle("Evaluation Rollout", fontsize=16)
-        plt.subplots_adjust(left=0.08, right=0.95, top=0.93, bottom=0.05, hspace=0.3, wspace=0.25)
+        fig, axes = plt.subplots(4, 2, figsize=(20, 24), tight_layout=True)
+        fig.suptitle(f"Evaluation Rollout (N_agents={len(active_agents)})", fontsize=16)
         
         # Plot 1: Agent Actions
         ax_actions = axes[0, 0]
         plotted_buses = set()
-        for agent in self.agent_names:
+        for agent in active_agents:
             if agent in actions_df.columns:
                 bus = self.agent_name_bus_map[agent]
                 # Only add legend entry for the first agent on each bus
@@ -765,52 +922,67 @@ class MultiAgentEnv(EnvBase):
                 plotted_buses.add(bus)
         ax_actions.set_title("Agent Actions")
         ax_actions.set_ylabel("Action Value")
+        ax_actions.set_ylim(0, 1)  # Fixed y-axis scale for actions
         ax_actions.grid(True)
         ax_actions.legend(loc='best', fontsize='small')
 
         # Plot 2: Nodal Voltages
         ax_voltages = axes[0, 1]
         
-        # Create a comprehensive color mapping for all buses in the voltage data
-        # First, get all bus names from the voltage data
-        all_voltage_buses = list(voltages_df.columns)
+        # Create a mapping from voltage bus names to agent buses using the same logic as get_bus_voltage_by_name
+        agent_voltage_bus_map = {}
+        for agent_name in active_agents:
+            agent_bus = self.agent_name_bus_map[agent_name]
+            try:
+                # Use the same conversion logic as get_bus_voltage_by_name
+                PHASE_MAP = {'a': '.1', 'b': '.2', 'c': '.3'}
+                
+                # Handle single-phase with letter notation (e.g., "634a")
+                if agent_bus[-1] in PHASE_MAP.keys():
+                    converted_bus_name = agent_bus.replace(agent_bus[-1], PHASE_MAP[agent_bus[-1]])
+                    if converted_bus_name in voltages_df.columns:
+                        agent_voltage_bus_map[converted_bus_name] = agent_bus
+                else:
+                    # Check for all possible phases and collect them
+                    for phase_ext in ['.1', '.2', '.3']:
+                        test_name = agent_bus + phase_ext
+                        if test_name in voltages_df.columns:
+                            agent_voltage_bus_map[test_name] = agent_bus
+                            break  # Only map the first matching phase for this agent
+            except:
+                # If there's an error, skip this agent
+                continue
         
-        # Create a color mapping that includes both agent buses and voltage buses
-        extended_color_map = {}
-        color_index = 0
-        
-        # First assign colors to buses with agents
-        for agent in self.agent_names:
-            agent_bus = self.agent_name_bus_map[agent]
-            if agent_bus not in extended_color_map:
-                extended_color_map[agent_bus] = color_map(color_index % 10)
-                color_index += 1
-        
-        # Then assign colors to remaining voltage buses
-        for bus in all_voltage_buses:
-            if bus not in extended_color_map:
-                # Check if this bus corresponds to an agent bus through the mapping
-                mapped_bus = None
-                for mapped_name, full_name in bus_name_mapping.items():
-                    if bus == mapped_name or bus == full_name:
-                        # Find if any agent is connected to the mapped bus
-                        for agent_bus in self.agent_name_bus_map.values():
-                            if agent_bus == full_name or agent_bus == mapped_name:
-                                mapped_bus = agent_bus
-                                break
+        # Plot buses with agents (colored and labeled)
+        plotted_agent_buses = set()
+        for bus in voltages_df.columns:
+            if bus in agent_voltage_bus_map:
+                # This bus has agents connected - use color and add to legend
+                agent_bus = agent_voltage_bus_map[bus]
+                
+                # Find the agent and get its color
+                agent_name = None
+                for name, mapped_bus in self.agent_name_bus_map.items():
+                    if mapped_bus == agent_bus:
+                        agent_name = name
                         break
                 
-                if mapped_bus and mapped_bus in extended_color_map:
-                    extended_color_map[bus] = extended_color_map[mapped_bus]
+                if agent_name:
+                    color = agent_color_list[agent_name]
+                    # Only add legend entry once per agent bus
+                    label = f"Bus {agent_bus}" if agent_bus not in plotted_agent_buses else None
+                    ax_voltages.plot(voltages_df.index, voltages_df[bus], 
+                                   label=label, color=color, linewidth=2)
+                    plotted_agent_buses.add(agent_bus)
                 else:
-                    extended_color_map[bus] = color_map(color_index % 10)
-                    color_index += 1
+                    # Fallback to gray if we can't find the agent
+                    ax_voltages.plot(voltages_df.index, voltages_df[bus], 
+                                   color='lightgray', alpha=0.6, linewidth=1)
+            else:
+                # This bus has no agents - make it gray with no legend
+                ax_voltages.plot(voltages_df.index, voltages_df[bus], 
+                               color='lightgray', alpha=0.6, linewidth=1)
         
-        # Plot all voltage buses with their assigned colors
-        for bus in voltages_df.columns:
-            color = extended_color_map[bus]
-            ax_voltages.plot(voltages_df.index, voltages_df[bus], 
-                           label=f"Bus {bus}", color=color)
         ax_voltages.set_title("Nodal Voltages")
         ax_voltages.set_ylabel("Voltage (p.u.)")
         ax_voltages.grid(True)
@@ -855,7 +1027,7 @@ class MultiAgentEnv(EnvBase):
         # Plot 6: Agent Rewards (per Agent)
         ax_rewards = axes[2, 1]
         plotted_buses = set()
-        for agent in self.agent_names:
+        for agent in active_agents:
             if agent in agent_reward_df.columns:
                 bus = self.agent_name_bus_map[agent]
                 # Only add legend entry for the first agent on each bus
@@ -878,7 +1050,7 @@ class MultiAgentEnv(EnvBase):
         # Plot 8: Unserved Reward (per Agent)
         ax_unserved = axes[3, 1]
         plotted_buses = set()
-        for agent in self.agent_names:
+        for agent in active_agents:
             if agent in unserved_reward_df.columns:
                 bus = self.agent_name_bus_map[agent]
                 # Only add legend entry for the first agent on each bus
@@ -894,3 +1066,266 @@ class MultiAgentEnv(EnvBase):
         ax_unserved.set_visible(True)  # Make sure this subplot is visible
 
         return fig
+
+    def render_rollout_fig_vpp(self):
+        """
+        VPP-specific evaluation plots.  Returns a list of two figures:
+
+        Figure 1 (3×2 grid):
+          Row 0: Nodal Voltages | EV Actions
+          Row 1: PV Actions     | Storage Actions
+          Row 2: System Load + VPP Tracking | Rewards per Agent
+
+        Figure 2 (2×2 grid):
+          Row 0: Remaining Energy Need per EV | Storage State of Charge
+          Row 1: PV Real Power Output          | EV Curtailment (VPP Contribution)
+        """
+        import matplotlib.pyplot as plt
+
+        if not self.history or not self.history["timestamp"]:
+            logger.info("No history to plot, skipping VPP render.")
+            return []
+
+        # ---- Active agents ----
+        active_agents = self.agent_names
+        if hasattr(self, "active_mask") and self.active_mask is not None:
+            try:
+                mask = self.active_mask.cpu().numpy() if hasattr(self.active_mask, "cpu") else self.active_mask
+                mask = mask.astype(bool)
+                if len(mask) == len(self.agent_names):
+                    active_agents = [name for i, name in enumerate(self.agent_names) if mask[i]]
+            except Exception as e:
+                logger.warning(f"Could not filter active agents in render_rollout_fig_vpp: {e}")
+
+        # Partition agents by type
+        ev_agents = [a for a in active_agents if a.startswith("EV-")]
+        pv_agents = [a for a in active_agents if a.startswith("PV-")]
+        storage_agents = [a for a in active_agents if a.startswith("Storage-")]
+
+        # ---- Timestamps ----
+        timestamps = pd.to_datetime(self.history["timestamp"])
+
+        # ---- Color mapping (one color per bus) ----
+        color_map = plt.get_cmap('tab10')
+        unique_buses = list(set(self.agent_name_bus_map.values()))
+        bus_color_map = {bus: color_map(i % 10) for i, bus in enumerate(unique_buses)}
+        agent_color = {agent: bus_color_map[self.agent_name_bus_map[agent]] for agent in self.agent_names}
+
+        # ---- Data extraction ----
+        # Actions (scalar per agent per step)
+        actions_df = pd.DataFrame(
+            [{agent: a[0] for agent, a in step.items()} for step in self.history["actions"]],
+            index=timestamps)
+
+        # Voltages
+        voltages_df = pd.DataFrame(self.history["voltage"], index=timestamps)
+
+        # Per-agent real_power time series
+        agent_real_power = {a: [] for a in active_agents}
+        # EV energy remaining, Storage SoC, PV real power, EV curtailment
+        ev_energy_records = []
+        ev_curtailment = {a: [] for a in ev_agents}  # max_real_power - real_power
+        storage_soc = {a: [] for a in storage_agents}
+        pv_power = {a: [] for a in pv_agents}
+
+        for t, step_info in enumerate(self.history["per_agent_info"]):
+            for agent in active_agents:
+                info = step_info.get(agent, {})
+                agent_real_power[agent].append(info.get("real_power", 0.0))
+            for agent in ev_agents:
+                info = step_info.get(agent, {})
+                er = info.get("energy_remaining", {})
+                if isinstance(er, dict):
+                    for veh_id, val in er.items():
+                        ev_energy_records.append({
+                            "timestamp": timestamps[t], "agent": agent,
+                            "vehicle": veh_id, "energy_remaining": val})
+                # EV VPP curtailment = max possible draw − actual draw
+                max_rp = info.get("max_real_power", 0.0)
+                rp = info.get("real_power", 0.0)
+                ev_curtailment[agent].append(max_rp - rp)
+            for agent in storage_agents:
+                info = step_info.get(agent, {})
+                storage_soc[agent].append(info.get("state_of_charge", np.nan))
+            for agent in pv_agents:
+                info = step_info.get(agent, {})
+                pv_power[agent].append(info.get("pv_real_power", 0.0))
+
+        # Total load & aggregate agent impact (VPP production)
+        total_load = [l[1][:, 0].sum() for l in self.history["total_load"]]
+        vpp_production = [rc.get("vpp_production", 0.0) for rc in self.history["reward_components"]]
+        vpp_setpoint_val = getattr(self, "vpp_setpoint", 0.0)
+
+        # Agent rewards
+        agent_reward_data = []
+        for step_rewards in self.history["agent_rewards"]:
+            agent_reward_data.append({a: step_rewards.get(a, 0) for a in active_agents})
+        agent_reward_df = pd.DataFrame(agent_reward_data, index=timestamps)
+
+        # Reward components
+        reward_comp_df = pd.DataFrame(self.history["reward_components"], index=timestamps)
+
+        # ---- Helper: voltage bus mapping ----
+        PHASE_MAP = {'a': '.1', 'b': '.2', 'c': '.3'}
+        agent_voltage_bus_map = {}
+        for agent_name in active_agents:
+            agent_bus = self.agent_name_bus_map[agent_name]
+            try:
+                if agent_bus[-1] in PHASE_MAP:
+                    converted = agent_bus[:-1] + PHASE_MAP[agent_bus[-1]]
+                    if converted in voltages_df.columns:
+                        agent_voltage_bus_map[converted] = agent_bus
+                else:
+                    for ext in ['.1', '.2', '.3']:
+                        if agent_bus + ext in voltages_df.columns:
+                            agent_voltage_bus_map[agent_bus + ext] = agent_bus
+                            break
+            except Exception:
+                continue
+
+        # ==================================================================
+        # FIGURE 1: System-level view  (3 rows × 2 cols)
+        # ==================================================================
+        fig1, axes1 = plt.subplots(3, 2, figsize=(20, 18), tight_layout=True)
+        fig1.suptitle(f"VPP Evaluation – System View (N_agents={len(active_agents)})", fontsize=16)
+
+        # (0,0) Nodal Voltages
+        ax = axes1[0, 0]
+        plotted = set()
+        for bus in voltages_df.columns:
+            if bus in agent_voltage_bus_map:
+                ab = agent_voltage_bus_map[bus]
+                name = next((n for n, b in self.agent_name_bus_map.items() if b == ab), None)
+                if name:
+                    label = f"Bus {ab}" if ab not in plotted else None
+                    ax.plot(voltages_df.index, voltages_df[bus], label=label,
+                            color=agent_color.get(name, 'gray'), linewidth=2)
+                    plotted.add(ab)
+                else:
+                    ax.plot(voltages_df.index, voltages_df[bus], color='lightgray', alpha=0.5, linewidth=1)
+            else:
+                ax.plot(voltages_df.index, voltages_df[bus], color='lightgray', alpha=0.5, linewidth=1)
+        ax.set_title("Nodal Voltages")
+        ax.set_ylabel("Voltage (p.u.)")
+        ax.axhline(0.95, color='red', linestyle='--', alpha=0.5, label='0.95 p.u.')
+        ax.grid(True); ax.legend(loc='best', fontsize='small')
+
+        # (0,1) EV Actions
+        ax = axes1[0, 1]
+        plotted = set()
+        for agent in ev_agents:
+            if agent in actions_df.columns:
+                bus = self.agent_name_bus_map[agent]
+                label = f"{agent} ({bus})" if agent not in plotted else None
+                ax.plot(actions_df.index, actions_df[agent], label=label, color=agent_color[agent])
+                plotted.add(agent)
+        ax.set_title("EV Charging Actions")
+        ax.set_ylabel("Action [0-1]"); ax.set_ylim(-0.05, 1.05)
+        ax.grid(True); ax.legend(loc='best', fontsize='small')
+
+        # (1,0) PV Actions
+        ax = axes1[1, 0]
+        plotted = set()
+        for agent in pv_agents:
+            if agent in actions_df.columns:
+                bus = self.agent_name_bus_map[agent]
+                label = f"{agent} ({bus})" if agent not in plotted else None
+                ax.plot(actions_df.index, actions_df[agent], label=label, color=agent_color[agent])
+                plotted.add(agent)
+        ax.set_title("PV Curtailment Actions")
+        ax.set_ylabel("Action [0-1]"); ax.set_ylim(-0.05, 1.05)
+        ax.grid(True); ax.legend(loc='best', fontsize='small')
+
+        # (1,1) Storage Actions
+        ax = axes1[1, 1]
+        plotted = set()
+        for agent in storage_agents:
+            if agent in actions_df.columns:
+                bus = self.agent_name_bus_map[agent]
+                label = f"{agent} ({bus})" if agent not in plotted else None
+                ax.plot(actions_df.index, actions_df[agent], label=label, color=agent_color[agent])
+                plotted.add(agent)
+        ax.set_title("Storage Actions")
+        ax.set_ylabel("Action [-1, 1]"); ax.set_ylim(-1.05, 1.05)
+        ax.grid(True); ax.legend(loc='best', fontsize='small')
+
+        # (2,0) System Load + VPP tracking
+        ax = axes1[2, 0]
+        ax.plot(timestamps, total_load, label="Total Load (kW)", color='black')
+        ax.plot(timestamps, vpp_production, label="VPP Production (kW)", color='tab:green', linewidth=2)
+        ax.axhline(vpp_setpoint_val, color='tab:green', linestyle='--', alpha=0.7,
+                    label=f"VPP Setpoint ({vpp_setpoint_val:.0f} kW)")
+        ax.set_title("System Load & VPP Tracking")
+        ax.set_ylabel("Power (kW)")
+        ax.grid(True); ax.legend(loc='best', fontsize='small')
+
+        # (2,1) Rewards per Agent
+        ax = axes1[2, 1]
+        plotted = set()
+        for agent in active_agents:
+            if agent in agent_reward_df.columns:
+                bus = self.agent_name_bus_map[agent]
+                label = f"{agent} ({bus})" if agent not in plotted else None
+                ax.plot(agent_reward_df.index, agent_reward_df[agent],
+                        label=label, color=agent_color[agent])
+                plotted.add(agent)
+        ax.set_title("Agent Rewards")
+        ax.set_ylabel("Reward")
+        ax.grid(True); ax.legend(loc='best', fontsize='small')
+
+        # ==================================================================
+        # FIGURE 2: Agent-detail view  (2 rows × 2 cols)
+        # ==================================================================
+        fig2, axes2 = plt.subplots(2, 2, figsize=(20, 12), tight_layout=True)
+        fig2.suptitle("VPP Evaluation – Agent Detail", fontsize=16)
+
+        # (0,0) Remaining Energy Need per EV
+        ax = axes2[0, 0]
+        if ev_energy_records:
+            er_long = pd.DataFrame(ev_energy_records)
+            er_pivot = er_long.pivot_table(index="timestamp", columns=["agent", "vehicle"],
+                                           values="energy_remaining")
+            plotted = set()
+            for (agent, vehicle) in er_pivot.columns:
+                bus = self.agent_name_bus_map[agent]
+                label = f"{agent} ({bus})" if agent not in plotted else None
+                ax.plot(er_pivot.index, er_pivot[(agent, vehicle)],
+                        label=label, color=agent_color[agent], alpha=0.7)
+                plotted.add(agent)
+        ax.set_title("Remaining Energy Need per EV")
+        ax.set_ylabel("Energy (kWh)")
+        ax.grid(True); ax.legend(loc='best', fontsize='small')
+
+        # (0,1) Storage State of Charge
+        ax = axes2[0, 1]
+        for agent in storage_agents:
+            bus = self.agent_name_bus_map[agent]
+            ax.plot(timestamps, storage_soc[agent],
+                    label=f"{agent} ({bus})", color=agent_color[agent])
+        ax.set_title("Energy Storage – State of Charge")
+        ax.set_ylabel("SoC (kWh)")
+        ax.grid(True); ax.legend(loc='best', fontsize='small')
+
+        # (1,0) PV Real Power Output
+        ax = axes2[1, 0]
+        for agent in pv_agents:
+            bus = self.agent_name_bus_map[agent]
+            # PV real_power is ≤0 (generation). Plot magnitude for clarity.
+            vals = [-v for v in pv_power[agent]]
+            ax.plot(timestamps, vals,
+                    label=f"{agent} ({bus})", color=agent_color[agent])
+        ax.set_title("PV Real Power Output")
+        ax.set_ylabel("Generation (kW)")
+        ax.grid(True); ax.legend(loc='best', fontsize='small')
+
+        # (1,1) EV Curtailment (VPP contribution = max_draw − actual_draw)
+        ax = axes2[1, 1]
+        for agent in ev_agents:
+            bus = self.agent_name_bus_map[agent]
+            ax.plot(timestamps, ev_curtailment[agent],
+                    label=f"{agent} ({bus})", color=agent_color[agent])
+        ax.set_title("EV Curtailment (VPP Contribution)")
+        ax.set_ylabel("Power (kW)")
+        ax.grid(True); ax.legend(loc='best', fontsize='small')
+
+        return [fig1, fig2]

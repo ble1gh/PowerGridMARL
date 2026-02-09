@@ -1,0 +1,36 @@
+defaults:
+  - hgteam_config
+  - _self_
+
+# PPO base parameters
+share_param_critic: True
+clip_epsilon: 0.2
+entropy_coef: 0.01
+critic_coef: 1.0
+loss_critic_type: "l2"
+lmbda: 0.95
+scale_mapping: "biased_softplus_1.0"
+use_tanh_normal: False
+minibatch_advantage: True
+use_beta: True
+beta_min_param: 1.0
+
+# HGTeam-specific parameters
+share_critic_across_groups: True
+centralised_value_per_agent: True
+gnn_mode: "hypernetwork"  # Options: "none", "concat", "hypernetwork"
+hypernet_hidden_dim: 8
+hypernet_feature_dim: 64
+stochastic_hypernet: True
+embedding_entropy_coef: 0.0
+embedding_diversity_coef: 0.0
+
+# GNN configuration parameters
+gnn_num_layers: 4
+gnn_heads: 2
+gnn_concat_heads: True
+gnn_use_beta: True
+gnn_self_loops: True
+gnn_agent_node_feature_key: "participation_score"
+gnn_agent_node_feature_dim: 1
+gnn_norm_class: null  # Options: null, "LayerNorm", "BatchNorm1d", "InstanceNorm1d", "GroupNorm"

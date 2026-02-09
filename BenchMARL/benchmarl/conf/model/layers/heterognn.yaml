@@ -1,0 +1,45 @@
+name: heterognn
+
+topology: adjacency
+self_loops: False
+
+# GNN Layer Class
+# TransformerConv supports edge_dim and is suitable for detailed physical graphs
+gnn_class: torch_geometric.nn.TransformerConv
+gnn_kwargs:
+  edge_dim: null # Will be inferred per edge type from edge_features_dims
+  heads: 2
+  concat: False # Output same dimension as input
+  beta: True # Gated residual connection
+
+# Mapping from Relation Name -> TensorDict Key
+# These keys align with PaddedMultiAgentEnv._reset injection
+grid_edge_keys:
+  line_adjacency: line_adjacency
+  transformer_adjacency: transformer_adjacency
+  switch_adjacency: switch_adjacency
+
+# Dimensions of the edge features (F) for each relation
+edge_features_dims:
+  line_adjacency: 3         # [R, X, Length]
+  transformer_adjacency: 3  # [R, X, Tap]
+  switch_adjacency: 1       # [Status]
+  interaction: 0            # Default agent-agent interaction (if any)
+  mapping: 0                # Agent -> Grid
+  mapping_rev: 0            # Grid -> Agent
+
+# Key for the Agent Index -> Grid Node Index mapping (2, M)
+agent_node_index_key: agent_grid_edge_index
+
+# Misc settings
+exclude_observations_from_node_features: False
+cat_observations_to_output: True
+num_layers: 2
+
+# Position/Velocity (Not used for Adjacency topology but required by config schema)
+position_key: null
+pos_features: 0
+velocity_key: null
+vel_features: 0
+edge_radius: null
+exclude_pos_from_node_features: null

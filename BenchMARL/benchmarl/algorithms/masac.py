@@ -12,7 +12,7 @@ import torch.nn.functional
 from tensordict import TensorDictBase
 from tensordict.nn import NormalParamExtractor, TensorDictModule, TensorDictSequential
 from tensordict.utils import _unravel_key_to_tuple, unravel_key
-from torch.distributions import Categorical
+from torch.distributions import Categorical, Beta, Independent
 from torchrl.data import Composite, Unbounded
 from torchrl.modules import (
     IndependentNormal,
@@ -24,6 +24,8 @@ from torchrl.objectives import DiscreteSACLoss, LossModule, SACLoss, ValueEstima
 
 from benchmarl.algorithms.common import Algorithm, AlgorithmConfig
 from benchmarl.models.common import ModelConfig
+from benchmarl.beta_param_extractor import BetaParamExtractor
+from benchmarl.independent_beta import IndependentBeta
 
 
 class Masac(Algorithm):
@@ -50,6 +52,8 @@ class Masac(Algorithm):
             choices: "softplus", "exp", "relu", "biased_softplus_1";
         use_tanh_normal (bool): if ``True``, use TanhNormal as the continuyous action distribution with support bound
             to the action domain. Otherwise, an IndependentNormal is used.
+        use_beta (bool): if ``True``, use Beta distribution for bounded [0,1] actions. Takes precedence over use_tanh_normal.
+        beta_min_param (float): minimum parameter value for Beta distribution to ensure numerical stability.
         coupled_discrete_values (bool): only relevant for discrete action spaces. if ``True``, the critic will predict
             n_agents x n_actions action values given the global state (or concatenation of agents' observations). if ``False``,
             the critic will predict n_actions values given the global state and the actions of the other agents. This
@@ -71,6 +75,8 @@ class Masac(Algorithm):
         fixed_alpha: bool,
         scale_mapping: str,
         use_tanh_normal: bool,
+        use_beta: bool,
+        beta_min_param: float,
         coupled_discrete_values: bool,
         **kwargs,
     ):
@@ -88,6 +94,8 @@ class Masac(Algorithm):
         self.fixed_alpha = fixed_alpha
         self.scale_mapping = scale_mapping
         self.use_tanh_normal = use_tanh_normal
+        self.use_beta = use_beta
+        self.beta_min_param = beta_min_param
         self.coupled_discrete_values = coupled_discrete_values
 
     #############################
@@ -207,30 +215,48 @@ class Masac(Algorithm):
         )
 
         if continuous:
-            extractor_module = TensorDictModule(
-                NormalParamExtractor(scale_mapping=self.scale_mapping),
-                in_keys=[(group, "logits")],
-                out_keys=[(group, "loc"), (group, "scale")],
-            )
-            policy = ProbabilisticActor(
-                module=TensorDictSequential(actor_module, extractor_module),
-                spec=self.action_spec[group, "action"],
-                in_keys=[(group, "loc"), (group, "scale")],
-                out_keys=[(group, "action")],
-                distribution_class=(
-                    IndependentNormal if not self.use_tanh_normal else TanhNormal
-                ),
-                distribution_kwargs=(
-                    {
-                        "low": self.action_spec[(group, "action")].space.low,
-                        "high": self.action_spec[(group, "action")].space.high,
-                    }
-                    if self.use_tanh_normal
-                    else {}
-                ),
-                return_log_prob=True,
-                log_prob_key=(group, "log_prob"),
-            )
+            if self.use_beta:
+                # Use Beta distribution for bounded [0,1] actions
+                extractor_module = TensorDictModule(
+                    BetaParamExtractor(min_param=self.beta_min_param),
+                    in_keys=[(group, "logits")],
+                    out_keys=[(group, "alpha"), (group, "beta")],
+                )
+                policy = ProbabilisticActor(
+                    module=TensorDictSequential(actor_module, extractor_module),
+                    spec=self.action_spec[group, "action"],
+                    in_keys=[(group, "alpha"), (group, "beta")],
+                    out_keys=[(group, "action")],
+                    distribution_class=IndependentBeta,
+                    return_log_prob=True,
+                    log_prob_key=(group, "log_prob"),
+                )
+            else:
+                # Use Normal-based distributions (existing logic)
+                extractor_module = TensorDictModule(
+                    NormalParamExtractor(scale_mapping=self.scale_mapping),
+                    in_keys=[(group, "logits")],
+                    out_keys=[(group, "loc"), (group, "scale")],
+                )
+                policy = ProbabilisticActor(
+                    module=TensorDictSequential(actor_module, extractor_module),
+                    spec=self.action_spec[group, "action"],
+                    in_keys=[(group, "loc"), (group, "scale")],
+                    out_keys=[(group, "action")],
+                    distribution_class=(
+                        IndependentNormal if not self.use_tanh_normal else TanhNormal
+                    ),
+                    distribution_kwargs=(
+                        {
+                            "low": self.action_spec[(group, "action")].space.low,
+                            "high": self.action_spec[(group, "action")].space.high,
+                        }
+                        if self.use_tanh_normal
+                        else {}
+                    ),
+                    return_log_prob=True,
+                    log_prob_key=(group, "log_prob"),
+                )
 
         else:
             if self.action_mask_spec is None:
@@ -601,6 +627,8 @@ class MasacConfig(AlgorithmConfig):
     fixed_alpha: bool = MISSING
     scale_mapping: str = MISSING
     use_tanh_normal: bool = MISSING
+    use_beta: bool = MISSING
+    beta_min_param: float = MISSING
     coupled_discrete_values: bool = MISSING
 
     @staticmethod

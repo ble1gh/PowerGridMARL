@@ -72,6 +72,11 @@ class EVChargingEnv(ComponentEnv):
         self.df = None    # episode vehicle dataframe
         self.charging_vehicles = None  # charging vehicle list
         self.departed_vehicles = None  # vehicle list departed in last time step
+        
+        # Participation score: total remaining energy for all currently connected vehicles
+        # Updates whenever the number of charging vehicles changes (connect or disconnect)
+        self._participation_score = 0.0
+        self._prev_num_charging = 0  # Track previous number of charging vehicles to detect changes
 
         # Read the source dataframe.
         vehicle_csv = vehicle_csv if vehicle_csv else os.path.join(THIS_DIR, "vehicles.csv")
@@ -82,30 +87,36 @@ class EVChargingEnv(ComponentEnv):
         self._df["start_time_min"] = self._round(self._df["start_time_min"])
         self._df["end_time_park_min"] = self._round(self._df["end_time_park_min"])
 
-        # Adjust "start_time_min" to be uniformly distributed in the first 2 hours.
-        self._df["start_time_min"] = np.random.uniform(
-            0, 2 * 60, size=len(self._df)
-        ).astype(int)
+        # Comment out random arrival/departure times - use for original behavior
+        # # Adjust "start_time_min" to be uniformly distributed in the first 2 hours.
+        # self._df["start_time_min"] = np.random.uniform(
+        #     0, 2 * 60, size=len(self._df)
+        # ).astype(int)
 
-        # Adjust "end_time_park_min" to be randomly distributed in the last 2 hours.
-        self._df["end_time_park_min"] = np.random.uniform(
-            (self.max_episode_steps * self.minutes_per_step) - (2 * 60),
-            self.max_episode_steps * self.minutes_per_step,
-            size=len(self._df)
-        ).astype(int)
-        self._df["end_time_park_min"] = np.minimum(self._df["end_time_park_min"], self.simulation_times[-1])
+        # # Adjust "end_time_park_min" to be randomly distributed in the last 2 hours.
+        # self._df["end_time_park_min"] = np.random.uniform(
+        #     (self.max_episode_steps * self.minutes_per_step) - (2 * 60),
+        #     self.max_episode_steps * self.minutes_per_step,
+        #     size=len(self._df)
+        # ).astype(int)
+        # self._df["end_time_park_min"] = np.minimum(self._df["end_time_park_min"], self.simulation_times[-1])
+
+        # Set all vehicles to arrive at first time step and depart at last time step
+        # self._df["start_time_min"] = self.simulation_times[0]  # First time step
+        # self._df["end_time_park_min"] = self.simulation_times[-1]  # Last time step
 
         # Bounds on the observation space variables.
         obs_bounds = OrderedDict({
             "time": (0, self.simulation_times[-1]),
-            "num_active_vehicles": (
-                0, self.num_vehicles),
+            "time_remaining": (0, self.simulation_times[-1]),
             "real_power_consumed": (
-                0, self.num_vehicles * self.max_charge_rate_kw),
+                0, self.num_vehicles * self.max_charge_rate_kw * self.vehicle_multiplier),
             "real_power_demand": (
                 0, self.num_vehicles * self._df["energy_required_kwh"].max()),
-            "mean_charge_rate_deficit": (
-                0, self._df["energy_required_kwh"].max() / (self.minutes_per_step / 60.)),
+            # "num_active_vehicles": (
+            #     0, self.num_vehicles * self.vehicle_multiplier),
+            # "mean_charge_rate_deficit": (
+            #     0, self._df["energy_required_kwh"].max() / (self.minutes_per_step / 60.)),
             "real_energy_unserved": (
                 0, self._df["energy_required_kwh"].max()),
         })
@@ -135,6 +146,27 @@ class EVChargingEnv(ComponentEnv):
 
         # Use the state dict to create the observation labels.
         self._obs_labels = list(self.state.keys())
+
+    @property
+    def participation_score(self) -> float:
+        """Returns the participation score (total remaining energy for connected vehicles).
+        
+        This value is recalculated whenever the number of charging vehicles changes
+        (vehicle connects or disconnects). It represents the current 'task difficulty' 
+        for this agent and is used as a node feature in the hypernetwork GNN.
+        """
+        return self._participation_score
+
+    @property
+    def max_real_power(self) -> float:
+        """Returns the maximum possible power draw if action were 1.0 (no curtailment).
+        
+        This is the sum of min(max_charge_per_step, energy_required) across all
+        currently connected vehicles. Computed during each step before the
+        charging loop modifies energy_required. Used for VPP reward calculation
+        where the EV demand response contribution = max_real_power - real_power.
+        """
+        return self._max_real_power
 
 
     def get_obs(self, **kwargs) -> Tuple[dict, dict]:
@@ -184,6 +216,11 @@ class EVChargingEnv(ComponentEnv):
 
         # Initialize real power.
         self._real_power = 0.
+        self._max_real_power = 0.
+        
+        # Reset participation score tracking
+        self._participation_score = 0.0
+        self._prev_num_charging = 0
         
         # Step the simulator one time without a control action.
         self.step()
@@ -205,7 +242,7 @@ class EVChargingEnv(ComponentEnv):
         if self.rescale_spaces:
             action = to_raw(action, self._action_space.low, self._action_space.high)
 
-        action_kw = action[0] * self.max_charge_rate_kw
+        action_kw = action[0] * self.max_charge_rate_kw * self.vehicle_multiplier
         action_kwh = action_kw * (self.minutes_per_step / 60.)
 
         # Get indexes of vehicles arriving and departing.
@@ -218,40 +255,66 @@ class EVChargingEnv(ComponentEnv):
 
         # Get vehicles that have left the station in the last time step.
         self.departed_vehicles = list(set(self.charging_vehicles) - set(charging_vehicles))
+        
+        # Participation score logic:
+        # - Recalculate total remaining energy whenever the number of charging vehicles changes
+        # - This captures both connection and disconnection events
+        current_num_charging = len(charging_vehicles)
+        if current_num_charging != self._prev_num_charging:
+            # Number of vehicles changed - recalculate participation score
+            if current_num_charging > 0:
+                self._participation_score = sum(
+                    self.df.at[i, "energy_required_kwh"] for i in charging_vehicles
+                )
+            else:
+                self._participation_score = 0.0
+            self._prev_num_charging = current_num_charging
 
         logger.debug(f"STEP, {self.time}, {self.time_index}, {charging_vehicles}, {self.departed_vehicles}")
 
         # Aggregate quantities that are needed for obs space.
         real_power_consumed = 0.
         real_power_demand = 0.
-        min_energy_required = 0.
-        charge_rate_deficit = []  # charge rate missing to reach full charge
+        # min_energy_required = 0.
+        # charge_rate_deficit = []  # charge rate missing to reach full charge
+
+        # Compute max possible power draw at action=1.0 (before charging loop
+        # modifies energy_required). Used for VPP reward calculation.
+        max_action_kwh = self.max_charge_rate_kw * self.vehicle_multiplier * (self.minutes_per_step / 60.)
+        self._max_real_power = 0.
+        for i in charging_vehicles:
+            er = self.df["energy_required_kwh"][i]
+            if er > 0.:
+                self._max_real_power += min(max_action_kwh, er)
 
         for i in charging_vehicles:
 
             # Compute energy required to fully charge.
             energy_required_kwh = self.df["energy_required_kwh"][i]
 
-            # Update the aggregate variables
-            real_power_demand += energy_required_kwh
-            min_energy_required = max(min_energy_required, energy_required_kwh)
-
             # If the vehicle does not require any more charging then skip it.
             if energy_required_kwh <= 0.:
                 continue
-
-            # What is the min energy this vehicle needs to reach full charge?
-            time_left_h = (self.df["end_time_park_min"][i] - self.time) / 60.
-            if time_left_h <= 0:
-                continue
-            deficit = max(
-                0, self.max_charge_rate_kw - energy_required_kwh / time_left_h)
-            charge_rate_deficit.append(deficit)
-
+            
             # Apply action and update the vehicle data.
             charge_energy_kwh = min(action_kwh, energy_required_kwh)
             self.df.at[i, "energy_required_kwh"] -= charge_energy_kwh
             real_power_consumed += charge_energy_kwh
+
+            # Update energy required to fully charge.
+            energy_required_kwh = self.df["energy_required_kwh"][i]
+            
+            # Update the aggregate variables
+            real_power_demand += energy_required_kwh
+            # min_energy_required = max(min_energy_required, energy_required_kwh)
+
+            # What is the min energy this vehicle needs to reach full charge?
+            # time_left_h = (self.df["end_time_park_min"][i] - self.time) / 60.
+            # if time_left_h <= 0:
+            #     continue
+            # deficit = max(
+            #     0, energy_required_kwh / time_left_h - self.max_charge_rate_kw)
+            # charge_rate_deficit.append(deficit)
 
             # print(action_kwh, energy_required_kwh, real_power_consumed)
 
@@ -281,15 +344,23 @@ class EVChargingEnv(ComponentEnv):
 
         # Update the state dict.
         self._update("time", self.time)
-        self._update("num_active_vehicles", self.vehicle_multiplier * len(charging_vehicles))
-        self._update("real_power_consumed", self.vehicle_multiplier * real_power_consumed)
-        self._update("real_power_demand", self.vehicle_multiplier * real_power_demand)
-        self._update(
-            "mean_charge_rate_deficit",
-            0 if len(charge_rate_deficit) == 0 else np.mean(charge_rate_deficit))
+        # Time remaining until the soonest-departing connected vehicle leaves (minutes).
+        # If no vehicles are connected, default to 0.
+        if charging_vehicles:
+            soonest_departure = min(self.df.at[i, "end_time_park_min"] for i in charging_vehicles)
+            time_remaining = max(0., soonest_departure - self.time)
+        else:
+            time_remaining = 0.
+        self._update("time_remaining", time_remaining)
+        self._update("real_power_consumed", real_power_consumed)     # Already includes vehicle_multiplier from action
+        self._update("real_power_demand", real_power_demand)         # Already includes vehicle_multiplier from energy
+        # self._update("num_active_vehicles", self.vehicle_multiplier * len(charging_vehicles))
+        # self._update(
+        #     "mean_charge_rate_deficit",
+        #     0 if len(charge_rate_deficit) == 0 else np.mean(charge_rate_deficit))
 
         # Update the real power attribute needed for component envs.
-        self._real_power = self.vehicle_multiplier * real_power_consumed
+        self._real_power = real_power_consumed  # Already includes vehicle_multiplier
        
         # Get the return values
         obs, meta = self.get_obs()
@@ -297,6 +368,7 @@ class EVChargingEnv(ComponentEnv):
 
         meta.update(rew_meta)
         meta["energy_remaining"] = self.df["energy_required_kwh"].to_dict()
+        meta["participation_score"] = self._participation_score
 
         return obs, rew, done, meta
 

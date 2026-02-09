@@ -1,0 +1,54 @@
+defaults:
+  - PowerGridworldGraph_evovernight13node_variable_config
+  - _self_
+
+agents: [EVChargingEnv]
+
+EVs_per_node: 1
+PVs_per_node: 0
+Storage_per_node: 0
+
+start_time: "08-12-2020 20:00:00"
+end_time: "08-13-2020 08:00:00"
+control_timedelta: 900
+
+# The buses with different agent types
+EV_busses: 
+  - "675"
+  - "633"
+  - "680"
+  - "671"
+  - "684"
+  - "652"
+  - "692"
+  - "611"
+  - "645"
+  - "646"
+PV_busses: []
+Storage_busses: []
+
+# Grid Model Parameters
+cls: "OpenDSSSolver"
+feeder_file: "ieee_13_dss/IEEE13Nodeckt.dss"
+loadshape_file: "ieee_13_dss/annual_hourly_load_profile.csv"
+system_load_rescale_factor: 1
+
+# EV agent parameters
+num_vehicles: 1
+minutes_per_step: 15
+max_charge_rate_kw: 7.0
+peak_threshold: 700.0
+vehicle_multiplier: 1.0
+rescale_spaces: False
+unserved_penalty: 5.0
+reward_scale: 1
+
+# Global reward penalty scaling parameters
+power_loss_penalty: 0.0
+voltage_penalty: 10000.0
+cooperative_voltage: True
+load_2norm_penalty: 0
+tracking_reward_penalty: 5e3
+
+# Variable count flag
+variable_agent_count: False

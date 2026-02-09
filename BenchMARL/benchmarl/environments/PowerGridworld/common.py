@@ -135,6 +135,15 @@ class PowerGridworldClass(TaskClass):
             "start_time": config.get("start_time", "08-12-2020 20:00:00"),
             "end_time": config.get("end_time", "08-13-2020 08:00:00"),
             "control_timedelta": config.get("control_timedelta", 900),
+            # Global penalty parameters 
+            "power_loss_penalty": config.get("power_loss_penalty", 1e-4),
+            "voltage_penalty": config.get("voltage_penalty", 1e3),
+            "load_2norm_penalty": config.get("load_2norm_penalty", 10),
+            "tracking_reward_penalty": config.get("tracking_reward_penalty", 1.0),
+            # Signal tracking parameters
+            "signal_tracking": config.get("signal_tracking", False),
+            "track_total_load": config.get("track_total_load", False),
+            "setpoint": config.get("setpoint", 200.0),
         }
 
         # Power flow config

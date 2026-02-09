@@ -372,6 +372,7 @@ class Experiment(CallbackNotifier):
         self.total_frames = 0
         self.n_iters_performed = 0
         self.mean_return = 0
+        self._grad_health_logged = set()  # tracks which group/loss combos were logged this iter
 
         if self.config.restore_file is not None:
             self._load_experiment()
@@ -715,6 +716,7 @@ class Experiment(CallbackNotifier):
 
             # Loop over groups
             training_start = time.time()
+            self._grad_health_logged = set()  # reset so first minibatch logs
             for group in self.train_group_map.keys():
                 group_batch = batch.exclude(*self._get_excluded_keys(group))
                 group_batch = self.algorithm.process_batch(group, group_batch)
@@ -820,13 +822,31 @@ class Experiment(CallbackNotifier):
         subdata = self.replay_buffers[group].sample().to(self.config.train_device)
         loss_vals = self.losses[group](subdata)
         training_td = loss_vals.detach()
-        loss_vals = self.algorithm.process_loss_vals(group, loss_vals)
+        loss_vals = self.algorithm.process_loss_vals(group, loss_vals, batch=subdata)
 
         for loss_name, loss_value in loss_vals.items():
             if loss_name in self.optimizers[group].keys():
                 optimizer = self.optimizers[group][loss_name]
 
                 loss_value.backward()
+
+                # Log gradient health periodically (every 10 collection iters,
+                # first minibatch only per loss_name per collection iteration).
+                # We log directly to the logger (not training_td) because
+                # training_tds get torch.stack'd and not all will have these keys.
+                gh_key = f"{group}/{loss_name}"
+                if (
+                    self.n_iters_performed % 10 == 0
+                    and gh_key not in self._grad_health_logged
+                ):
+                    grad_stats = self._compute_grad_health(
+                        optimizer, prefix=f"{group}/{loss_name}"
+                    )
+                    self.logger.log(
+                        {k: v.item() for k, v in grad_stats.items()},
+                        step=self.n_iters_performed,
+                    )
+                    self._grad_health_logged.add(gh_key)
 
                 grad_norm = self._grad_clip(optimizer)
 
@@ -868,6 +888,52 @@ class Experiment(CallbackNotifier):
                 torch.nn.utils.clip_grad_value_(params, self.config.clip_grad_val)
 
         return float(total_norm)
+
+    @torch.no_grad()
+    def _compute_grad_health(
+        self, optimizer: torch.optim.Optimizer, prefix: str = ""
+    ) -> dict:
+        """Count trainable params with zero / non-zero / missing gradients.
+
+        Runs between backward() and zero_grad() so grads are still alive.
+        Returns a flat dict of scalar tensors ready for training_td / wandb.
+        """
+        dev = self.config.train_device
+        total = ok = zero = none = 0
+        total_norm_sq = 0.0
+        for pg in optimizer.param_groups:
+            for p in pg["params"]:
+                if not p.requires_grad:
+                    continue
+                total += 1
+                if p.grad is None:
+                    none += 1
+                elif p.grad.norm().item() == 0:
+                    zero += 1
+                else:
+                    ok += 1
+                    total_norm_sq += p.grad.norm().item() ** 2
+
+        return {
+            f"grad_health/{prefix}/total_params": torch.tensor(
+                float(total), device=dev
+            ),
+            f"grad_health/{prefix}/nonzero_grad": torch.tensor(
+                float(ok), device=dev
+            ),
+            f"grad_health/{prefix}/zero_grad": torch.tensor(
+                float(zero), device=dev
+            ),
+            f"grad_health/{prefix}/no_grad_attr": torch.tensor(
+                float(none), device=dev
+            ),
+            f"grad_health/{prefix}/frac_alive": torch.tensor(
+                float(ok) / max(total, 1), device=dev
+            ),
+            f"grad_health/{prefix}/total_grad_norm": torch.tensor(
+                total_norm_sq**0.5, device=dev
+            ),
+        }
 
     @local_seed()
     @torch.no_grad()

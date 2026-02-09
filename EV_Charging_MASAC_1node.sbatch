@@ -2,9 +2,9 @@
 #SBATCH --account=notchpeak-gpu
 #SBATCH --partition=notchpeak-gpu
 #SBATCH --qos=notchpeak-gpu
-#SBATCH --time=8:00:00
+#SBATCH --time=6:00:00
 #SBATCH --nodes=1
-#SBATCH --cpus-per-task=32
+#SBATCH --cpus-per-task=24
 #SBATCH --mem=128G
 #SBATCH --gres=gpu:1
 #SBATCH -o MASACslurmjob-%j.out-%N
@@ -37,15 +37,15 @@ export CUBLAS_WORKSPACE_CONFIG=:4096:8
 export TORCH_CUDNN_USE_HEURISTIC_MODE_B=1
 export CUDA_CACHE_DISABLE=0
 
-# Optimize for single-node computation with 32 cores - scale up for 11 agents
-export OMP_NUM_THREADS=4
-export MKL_NUM_THREADS=4
-export OPENBLAS_NUM_THREADS=4
-export NUMBA_NUM_THREADS=2
+# Optimize for single-node computation with 32 cores - maximize CPU utilization
+export OMP_NUM_THREADS=16
+export MKL_NUM_THREADS=16
+export OPENBLAS_NUM_THREADS=16 
+export NUMBA_NUM_THREADS=8
 
-# Increase process and file limits for parallel environments
-ulimit -n 4096    # Increase file descriptor limit
-ulimit -u 2048    # Increase process limit
+# Increase process and file limits for high parallel environments
+ulimit -n 8192     # File descriptor limit - increased for more parallel envs
+ulimit -u 16384    # Process limit - increased for more parallel envs
 
 # Show current limits and compare to SLURM allocation
 echo "Node: $SLURM_NODELIST"
@@ -73,28 +73,35 @@ python -c "import torch; print(f'PyTorch version: {torch.__version__}'); print(f
 nvidia-smi dmon -d 10 -s pucvmet -f $SCRDIR/gpu_usage.log &
 GPU_MONITOR_PID=$!
 
-# Optimized MASAC configuration for 11 agents - scale up parallelization
+# Aggressive MASAC configuration for faster training - targeting 60-90 min runtime
 python BenchMARL/benchmarl/run.py algorithm=masac task=PowerGridworld/evovernight13node_simple \
     model=layers/mlp \
-    "model.num_cells=[128,128]" \
+    model.num_cells=[128,128] \
     algorithm.share_param_critic=true \
     algorithm.alpha_init=1.0 \
+    algorithm.beta_min_param=1.0 \
     experiment.train_device=cuda \
     experiment.sampling_device=cpu \
     experiment.buffer_device=cpu \
-    experiment.lr=0.0001 \
-    experiment.polyak_tau=0.001 \
-    experiment.off_policy_n_envs_per_worker=64 \
-    experiment.off_policy_collected_frames_per_batch=32000 \
-    experiment.off_policy_n_optimizer_steps=800 \
-    experiment.off_policy_train_batch_size=4096 \
-    experiment.evaluation_interval=32000 \
-    experiment.evaluation_episodes=3 \
+    experiment.off_policy_use_prioritized_replay_buffer=true \
+    experiment.off_policy_prb_alpha=0.6 \
+    experiment.off_policy_prb_beta=0.4 \
+    experiment.lr=0.0005 \
+    experiment.polyak_tau=0.005 \
+    experiment.off_policy_n_envs_per_worker=256 \
+    experiment.off_policy_collected_frames_per_batch=36864 \
+    experiment.off_policy_n_optimizer_steps=600 \
+    experiment.off_policy_train_batch_size=16384 \
+    experiment.evaluation_interval=36864 \
+    experiment.evaluation_episodes=2 \
     experiment.parallel_collection=true \
     experiment.collect_with_grad=false \
-    experiment.clip_grad_val=2.0 \
     experiment.off_policy_init_random_frames=5000 \
-    "experiment.loggers=[wandb]" \
+    experiment.checkpoint_interval=73728 \
+    experiment.checkpoint_at_end=true \
+    +experiment.wandb_extra_kwargs.name="MASAC_$(date +%Y%m%d)_${SLURM_JOB_ID}_signal_tracking" \
+    experiment.project_name="EVOvernight13Node_Simple" \
+    experiment.loggers=[wandb] \
     experiment.create_json=false
 
 # Stop GPU monitoring

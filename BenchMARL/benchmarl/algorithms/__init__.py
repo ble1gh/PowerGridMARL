@@ -10,6 +10,7 @@ from .iddpg import Iddpg, IddpgConfig
 from .ippo import Ippo, IppoConfig
 from .iql import Iql, IqlConfig
 from .isac import Isac, IsacConfig
+from .HGTeam import HGTeam, HGTeamConfig
 from .maddpg import Maddpg, MaddpgConfig
 from .mappo import Mappo, MappoConfig
 from .masac import Masac, MasacConfig
@@ -25,6 +26,8 @@ classes = [
     "IqlConfig",
     "Isac",
     "IsacConfig",
+    "HGTeam",
+    "HGTeamConfig",
     "Maddpg",
     "MaddpgConfig",
     "Mappo",
@@ -46,6 +49,7 @@ algorithm_config_registry = {
     "iddpg": IddpgConfig,
     "masac": MasacConfig,
     "isac": IsacConfig,
+    "hgteam": HGTeamConfig,
     "qmix": QmixConfig,
     "vdn": VdnConfig,
     "iql": IqlConfig,

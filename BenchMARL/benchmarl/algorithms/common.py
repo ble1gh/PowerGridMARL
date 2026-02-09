@@ -349,7 +349,7 @@ class Algorithm(ABC):
         raise NotImplementedError
 
     def process_loss_vals(
-        self, group: str, loss_vals: TensorDictBase
+        self, group: str, loss_vals: TensorDictBase, batch: TensorDictBase = None
     ) -> TensorDictBase:
         """
         Here you can modify the loss_vals tensordict containing entries loss_name->loss_value
@@ -358,6 +358,7 @@ class Algorithm(ABC):
         Args:
             group (str): agent group
             loss_vals (TensorDictBase): the tensordict returned by the loss forward method
+            batch (TensorDictBase, optional): the input batch, for computing custom losses
 
         Returns: the processed loss_vals
         """

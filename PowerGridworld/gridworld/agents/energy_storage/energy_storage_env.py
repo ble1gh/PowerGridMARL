@@ -49,7 +49,11 @@ class EnergyStorageEnv(ComponentEnv):
         self.simulation_step = 0
         self.max_episode_steps = max_episode_steps
 
-        self.control_interval_in_hr = control_timedelta.seconds / 3600.0
+        # Handle both int (seconds) and pd.Timedelta for control_timedelta
+        if isinstance(control_timedelta, (int, float)):
+            self.control_interval_in_hr = control_timedelta / 3600.0
+        else:
+            self.control_interval_in_hr = control_timedelta.seconds / 3600.0
 
         self._obs_labels = ["stage_of_charge"]
 

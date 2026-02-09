@@ -123,6 +123,9 @@ class MultiComponentEnv(ComponentEnv):
         # Loop over envs and collect real power injection/consumption.
         for env in self.envs:
             env_kwargs = {k: v for k,v in kwargs.items() if k in env.obs_labels}
+            # Always pass current_time through (control metadata, not an obs dim)
+            if "current_time" in kwargs:
+                env_kwargs["current_time"] = kwargs["current_time"]
             ob, _, done, meta = env.step(action[env.name], **env_kwargs)
             obs[env.name] = ob.copy()
             dones.append(done)
@@ -166,6 +169,9 @@ class MultiComponentEnv(ComponentEnv):
         # Loop over envs and create the observation dict (of dicts).
         for env in self.envs:
             env_kwargs = {k: v for k,v in kwargs.items() if k in env.obs_labels}
+            # Always pass current_time through (control metadata, not an obs dim)
+            if "current_time" in kwargs:
+                env_kwargs["current_time"] = kwargs["current_time"]
             obs[env.name], meta[env.name] = env.get_obs(**env_kwargs)
 
         return obs, meta

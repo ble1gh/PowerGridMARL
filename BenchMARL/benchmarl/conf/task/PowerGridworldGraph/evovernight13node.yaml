@@ -1,9 +1,9 @@
 defaults:
-  - PowerGridworld_evovernight13node_simple_config
+  - PowerGridworldGraph_evovernight13node_config
   - _self_
 
 agents: [EVChargingEnv, PVEnv, EnergyStorageEnv]  # Agent types available
-EVs_per_node: 1
+EVs_per_node: 70
 PVs_per_node: 0
 Storage_per_node: 0
 
@@ -20,23 +20,24 @@ Storage_busses: []
 cls: "OpenDSSSolver"
 feeder_file: "ieee_13_dss/IEEE13Nodeckt.dss"
 loadshape_file: "ieee_13_dss/annual_hourly_load_profile.csv"
-system_load_rescale_factor: 0.9
+system_load_rescale_factor: 1
 
 # EV agent parameters
 num_vehicles: 1
 minutes_per_step: 15
 max_charge_rate_kw: 7.
 peak_threshold: 700.
-vehicle_multiplier: 140.
+vehicle_multiplier: 1.
 rescale_spaces: False
-unserved_penalty: 10.
+unserved_penalty: 1000.
 reward_scale: 1
 
 # Global reward penalty scaling parameters
-power_loss_penalty: 0   # Scaling factor for power loss reward (higher = more penalty)
-voltage_penalty: 1e4      # Scaling factor for voltage violation reward (higher = more penalty)
+power_loss_penalty: 0.0001   # Scaling factor for power loss reward (higher = more penalty)
+voltage_penalty: 1e3      # Scaling factor for voltage violation reward (higher = more penalty)
+cooperative_voltage: True
 load_2norm_penalty: 0         # Scaling factor for load penalty (higher = more penalty)
-tracking_reward_penalty: 5e3  # Scaling factor for tracking reward (higher = more penalty)
+tracking_reward_penalty: 1.0  # Scaling factor for tracking reward (higher = more penalty)
 
 # PV agent parameters
 pv_profile_csv: "pv_profile.csv"
@@ -55,4 +56,6 @@ max_power: 15.0
 # Signal tracking parameters
 signal_tracking: True
 track_total_load: True
-setpoint: 2000.
+setpoint: 200.
+
+

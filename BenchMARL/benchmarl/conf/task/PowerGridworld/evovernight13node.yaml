@@ -20,7 +20,7 @@ Storage_busses: []
 cls: "OpenDSSSolver"
 feeder_file: "ieee_13_dss/IEEE13Nodeckt.dss"
 loadshape_file: "ieee_13_dss/annual_hourly_load_profile.csv"
-system_load_rescale_factor: 0.9
+system_load_rescale_factor: 1
 
 # EV agent parameters
 num_vehicles: 1
@@ -31,6 +31,12 @@ vehicle_multiplier: 1.
 rescale_spaces: False
 unserved_penalty: 1000.
 reward_scale: 1
+
+# Global reward penalty scaling parameters
+power_loss_penalty: 0.0001   # Scaling factor for power loss reward (higher = more penalty)
+voltage_penalty: 1e3      # Scaling factor for voltage violation reward (higher = more penalty)
+load_2norm_penalty: 0         # Scaling factor for load penalty (higher = more penalty)
+tracking_reward_penalty: 1.0  # Scaling factor for tracking reward (higher = more penalty)
 
 # PV agent parameters
 pv_profile_csv: "pv_profile.csv"
@@ -45,5 +51,10 @@ initial_storage_std: 5.0
 charge_efficiency: 0.95
 discharge_efficiency: 0.9
 max_power: 15.0
+
+# Signal tracking parameters
+signal_tracking: True
+track_total_load: True
+setpoint: 200.
 
 

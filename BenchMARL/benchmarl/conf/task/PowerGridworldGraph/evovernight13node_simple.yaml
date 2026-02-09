@@ -1,5 +1,5 @@
 defaults:
-  - PowerGridworld_evovernight13node_simple_config
+  - PowerGridworldGraph_evovernight13node_simple_config
   - _self_
 
 agents: [EVChargingEnv, PVEnv, EnergyStorageEnv]  # Agent types available
@@ -21,6 +21,10 @@ cls: "OpenDSSSolver"
 feeder_file: "ieee_13_dss/IEEE13Nodeckt.dss"
 loadshape_file: "ieee_13_dss/annual_hourly_load_profile.csv"
 system_load_rescale_factor: 0.9
+load_noise_std: 0.0  # DEPRECATED legacy param (kept for backward compat, set to 0 when using new params)
+load_forecast_noise_std: 0.03  # Per-node noise on load coefficient that agents/GNN observe
+load_actual_noise_std: 0.03   # Per-node noise on top of forecast used in power flow
+include_load_in_agent_obs: False  # If True, append normalized load coefficient to each agent's observation
 
 # EV agent parameters
 num_vehicles: 1
@@ -35,12 +39,14 @@ reward_scale: 1
 # Global reward penalty scaling parameters
 power_loss_penalty: 0   # Scaling factor for power loss reward (higher = more penalty)
 voltage_penalty: 1e4      # Scaling factor for voltage violation reward (higher = more penalty)
+cooperative_voltage: True # If True, voltage penalty is applied to all agents. If False, only to agents at violating node.
 load_2norm_penalty: 0         # Scaling factor for load penalty (higher = more penalty)
 tracking_reward_penalty: 5e3  # Scaling factor for tracking reward (higher = more penalty)
 
 # PV agent parameters
 pv_profile_csv: "pv_profile.csv"
 pv_scaling_factor: 1.0
+pv_profile_noise_std: 0.0  # Std dev of Gaussian noise on normalized PV profile (0 = no noise)
 pv_grid_aware: False
 
 # Energy Storage agent parameters
@@ -54,5 +60,8 @@ max_power: 15.0
 
 # Signal tracking parameters
 signal_tracking: True
-track_total_load: True
+track_total_load: False  # If True, compare (agent_load + base_load) vs setpoint. If False, compare agent_load vs setpoint.
 setpoint: 2000.
+
+# Variable count flag
+variable_agent_count: False

@@ -30,6 +30,7 @@ class TaskConfig:
     # Global reward penalty scaling parameters
     power_loss_penalty: float = MISSING
     voltage_penalty: float = MISSING
+    cooperative_voltage: bool = MISSING
     load_2norm_penalty: float = MISSING
     tracking_reward_penalty: float = MISSING
     

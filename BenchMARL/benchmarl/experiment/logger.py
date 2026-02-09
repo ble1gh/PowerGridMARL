@@ -252,27 +252,26 @@ class Logger:
                         json_file, base_path=os.path.dirname(json_file)
                     )
         
-        # Add the custom plot to the log dictionary if it exists
+        # Add the custom plot(s) to the log dictionary if they exist.
+        # rollout_fig can be a single figure or a list of figures.
         if rollout_fig is not None:
-            buf = io.BytesIO()
-            rollout_fig.savefig(buf, format='png')
-            buf.seek(0)
-            img = Image.open(buf)
-            buf.seek(0)
-            # Log to each logger appropriately
-            for logger in self.loggers:
-                if isinstance(logger, WandbLogger):
-                    logger.experiment.log({"eval/rollout_plot": wandb.Image(img)}, commit=False)
-                elif hasattr(logger, "log_image"):
-                    logger.log_image("eval/rollout_plot", img, step=step)
-                    warnings.warn(
-                        "Using a logger that supports log_image, but it is not WandbLogger. "
-                        "Make sure the logger can handle images correctly."
-                    )
-                # Add more elifs for other logger types if needed
-            buf.close()
-            rollout_fig.clf()
-            plt.close(rollout_fig)
+            figs = rollout_fig if isinstance(rollout_fig, list) else [rollout_fig]
+            for fig_idx, fig in enumerate(figs):
+                suffix = "" if len(figs) == 1 else f"_{fig_idx}"
+                log_key = f"eval/rollout_plot{suffix}"
+                buf = io.BytesIO()
+                fig.savefig(buf, format='png')
+                buf.seek(0)
+                img = Image.open(buf)
+                buf.seek(0)
+                for logger in self.loggers:
+                    if isinstance(logger, WandbLogger):
+                        logger.experiment.log({log_key: wandb.Image(img)}, commit=False)
+                    elif hasattr(logger, "log_image"):
+                        logger.log_image(log_key, img, step=step)
+                buf.close()
+                fig.clf()
+                plt.close(fig)
 
         self.log(to_log, step=step)
         if video_frames is not None and max_length_rollout_0 > 1:
