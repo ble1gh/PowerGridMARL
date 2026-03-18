@@ -11,8 +11,10 @@ from .ippo import Ippo, IppoConfig
 from .iql import Iql, IqlConfig
 from .isac import Isac, IsacConfig
 from .HGTeam import HGTeam, HGTeamConfig
+from .HGTeamSAC import HGTeamSAC, HGTeamSACConfig
 from .maddpg import Maddpg, MaddpgConfig
 from .mappo import Mappo, MappoConfig
+from .mat import MAT, MATConfig
 from .masac import Masac, MasacConfig
 from .qmix import Qmix, QmixConfig
 from .vdn import Vdn, VdnConfig
@@ -28,10 +30,14 @@ classes = [
     "IsacConfig",
     "HGTeam",
     "HGTeamConfig",
+    "HGTeamSAC",
+    "HGTeamSACConfig",
     "Maddpg",
     "MaddpgConfig",
     "Mappo",
     "MappoConfig",
+    "MAT",
+    "MATConfig",
     "Masac",
     "MasacConfig",
     "Qmix",
@@ -44,12 +50,14 @@ classes = [
 # This is used to aid loading of algorithms from yaml
 algorithm_config_registry = {
     "mappo": MappoConfig,
+    "mat": MATConfig,
     "ippo": IppoConfig,
     "maddpg": MaddpgConfig,
     "iddpg": IddpgConfig,
     "masac": MasacConfig,
     "isac": IsacConfig,
     "hgteam": HGTeamConfig,
+    "hgteamsac": HGTeamSACConfig,
     "qmix": QmixConfig,
     "vdn": VdnConfig,
     "iql": IqlConfig,

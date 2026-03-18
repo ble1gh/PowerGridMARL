@@ -18,6 +18,7 @@ from .heterognn import HeteroGNN, HeteroGnnConfig
 from .gru import Gru, GruConfig
 from .lstm import Lstm, LstmConfig
 from .mlp import Mlp, MlpConfig
+from .transformer import Transformer, TransformerConfig
 
 classes = [
     "Mlp",
@@ -32,6 +33,8 @@ classes = [
     "GruConfig",
     "Lstm",
     "LstmConfig",
+    "Transformer",
+    "TransformerConfig",
 ]
 
 model_config_registry = {
@@ -41,4 +44,5 @@ model_config_registry = {
     "deepsets": DeepsetsConfig,
     "gru": GruConfig,
     "lstm": LstmConfig,
+    "transformer": TransformerConfig,
 }

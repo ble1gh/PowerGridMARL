@@ -2,7 +2,7 @@
 #SBATCH --account=rai
 #SBATCH --partition=rai-gpu-grn
 #SBATCH --qos=rai-gpu-grn
-#SBATCH --time=20:00:00
+#SBATCH --time=10:00:00
 #SBATCH --nodes=1
 #SBATCH -n 1
 #SBATCH --cpus-per-task=16
@@ -18,8 +18,8 @@
 # #SBATCH --gres=gpu:a800:1       # ~80GB VRAM
 # #SBATCH --gres=gpu:h100nvl:1       # ~141GB VRAM
 
-#SBATCH -o HGTeamslurmjob-%j.out-%N
-#SBATCH -e HGTeamslurmjob-%j.err-%N
+#SBATCH -o HGTeamSACslurmjob-%j.out-%N
+#SBATCH -e HGTeamSACslurmjob-%j.err-%N
 #SBATCH --exclude=grn030
 
 
@@ -56,16 +56,15 @@ export CUBLAS_WORKSPACE_CONFIG=:4096:8
 export TORCH_CUDNN_USE_HEURISTIC_MODE_B=1
 export CUDA_CACHE_DISABLE=0
 
-# Optimize for single-node computation with 64 cores - maximize CPU utilization
-# Set to 1 to avoid thread oversubscription when using 64 parallel environments
+# Optimize for single-node computation - avoid thread oversubscription
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
-export OPENBLAS_NUM_THREADS=1 
+export OPENBLAS_NUM_THREADS=1
 export NUMBA_NUM_THREADS=1
 
 # Increase process and file limits for high parallel environments
-ulimit -n 8192     # File descriptor limit - increased for more parallel envs
-ulimit -u 16384    # Process limit - increased for more parallel envs
+ulimit -n 8192
+ulimit -u 16384
 
 # Show current limits and compare to SLURM allocation
 echo "Node: $SLURM_NODELIST"
@@ -87,30 +86,30 @@ nvidia-smi
 echo "CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES"
 
 # Check if PyTorch can see GPU
-python -c "import torch; print(f'PyTorch version: {torch.__version__}'); print(f'CUDA available: {torch.cuda.is_available()}'); print(f'CUDA devices: {torch.cuda.device_count()}'); print(f'GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB')"
+python -c "import torch; print(f'PyTorch version: {torch.__version__}'); print(f'CUDA available: {torch.cuda.is_available()}'); print(f'CUDA devices: {torch.cuda.device_count()}'); print(f'GPU Memory: {torch.cuda.get_device_properties(0).total_mem / 1024**3:.1f} GB')"
 
 # Start background GPU monitoring
 nvidia-smi dmon -d 10 -s pucvmet -f $SCRDIR/gpu_usage.log &
 GPU_MONITOR_PID=$!
 
-# Run experiment
+# Run HGTeamSAC experiment
 python run_hgteam_mlp.py \
+    --algorithm sac \
     --seed 42 \
     --project-name "PowerGridworldVariable_VPP" \
-    --wandb-name "HGTeam_$(date +%Y%m%d)_${SLURM_JOB_ID}_tanhnormal_scalelbfloor_1e-4" \
+    --wandb-name "HGTeamSAC_$(date +%Y%m%d)_${SLURM_JOB_ID}_2layergnn_mlp" \
     --max-n-frames 10000000 \
-    --lr 5e-5 \
+    --lr 1e-4 \
+    --lr-actor 1e-4 \
+    --lr-encoder 1e-4 \
+    --lr-critic 1e-4 \
     --evaluation-interval 12288 \
     --evaluation-episodes 5 \
-    --n-envs-per-worker 32 \
-    --frames-per-batch 12288 \
-    --minibatch-size 256 \
-    --n-minibatch-iters 5 \
-    --entropy-coef 0.01 \
-    --gnn-mode concat \
+    --reward-scale 100000 \
+    --gnn-mode learned_query \
     --embedding-entropy-coef 0 \
     --embedding-diversity-coef 0 \
-    --stochastic-hypernet true \
+    --stochastic-hypernet False \
     --hypernet-hidden-dim 32 \
     --hypernet-feature-dim 64 \
     --gnn-norm-class LayerNorm \
@@ -118,9 +117,22 @@ python run_hgteam_mlp.py \
     --z-token-dim 32 \
     --z-query-dim 32 \
     --stochastic-z-query true \
-    --reward-scale 100000 \
     --use-vib true \
-    --vib-warmup-frames 500000 \
+    --alpha-init 0.2 \
+    --target-entropy 0.0 \
+    --min-alpha 0.01 \
+    --num-qvalue-nets 2 \
+    --fixed-alpha false \
+    --detach-action-from-q false \
+    --detach-z-from-transformer true \
+    --critic-use-mu true \
+    --off-policy-memory-size 500000 \
+    --off-policy-train-batch-size 512 \
+    --off-policy-collected-frames-per-batch 3072 \
+    --off-policy-n-optimizer-steps 2 \
+    --off-policy-init-random-frames 10000 \
+    --off-policy-n-envs-per-worker 32 \
+    --polyak-tau 0.005 \
 
 # Stop GPU monitoring
 kill $GPU_MONITOR_PID 2>/dev/null || true
@@ -128,7 +140,7 @@ kill $GPU_MONITOR_PID 2>/dev/null || true
 echo "Job completed at: $(date)"
 
 # Create results directory in home
-RESULTS_DIR=/uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/HGTeamresults_$(date +%Y%m%d)_${SLURM_JOB_ID}
+RESULTS_DIR=/uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/HGTeamSACresults_$(date +%Y%m%d)_${SLURM_JOB_ID}
 mkdir -p $RESULTS_DIR
 
 # Copy the actual training results from the outputs directory
@@ -140,16 +152,15 @@ fi
 cp $SCRDIR/gpu_usage.log $RESULTS_DIR/ 2>/dev/null || true
 
 # Copy the SLURM script for reference
-cp $SCRDIR/PowerGridMARL/EV_Charging_HGTeam_1node.sbatch $RESULTS_DIR/ 2>/dev/null || true
+cp $SCRDIR/PowerGridMARL/EV_Charging_HGTeamSAC_1node.sbatch $RESULTS_DIR/ 2>/dev/null || true
 
 # Copy SLURM output and error files to results directory and clean up from main directory
-cp /uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/HGTeamslurmjob-${SLURM_JOB_ID}.out-* $RESULTS_DIR/ 2>/dev/null || true
-cp /uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/HGTeamslurmjob-${SLURM_JOB_ID}.err-* $RESULTS_DIR/ 2>/dev/null || true
+cp /uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/HGTeamSACslurmjob-${SLURM_JOB_ID}.out-* $RESULTS_DIR/ 2>/dev/null || true
+cp /uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/HGTeamSACslurmjob-${SLURM_JOB_ID}.err-* $RESULTS_DIR/ 2>/dev/null || true
 
 # Clean up SLURM output files from main directory
-rm -f /uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/HGTeamslurmjob-${SLURM_JOB_ID}.out-* 2>/dev/null || true
-rm -f /uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/HGTeamslurmjob-${SLURM_JOB_ID}.err-* 2>/dev/null || true
+rm -f /uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/HGTeamSACslurmjob-${SLURM_JOB_ID}.out-* 2>/dev/null || true
+rm -f /uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/HGTeamSACslurmjob-${SLURM_JOB_ID}.err-* 2>/dev/null || true
 
 # Clean up
 cd /uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL
-rm -rf $SCRDIR

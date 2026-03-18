@@ -1,0 +1,11 @@
+name: transformer
+
+d_model: 128
+nhead: 4
+num_layers: 2
+dim_feedforward: 256
+dropout: 0.0
+max_seq_len: 32
+use_z_as_query: true
+append_actions: true
+norm_first: true

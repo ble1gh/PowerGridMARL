@@ -65,6 +65,9 @@ class PVEnv(ComponentEnv):
 
         super().__init__(name=name, **kwargs)
 
+        # Per-instance RNG (will be overwritten by MultiAgentEnv._set_seed)
+        self.rng = np.random.RandomState()
+
         self.scaling_factor = scaling_factor
         self.profile_noise_std = profile_noise_std
         self.rescale_spaces = rescale_spaces
@@ -92,6 +95,8 @@ class PVEnv(ComponentEnv):
 
         # The current interpolated PV value (set by _lookup_time)
         self._current_pv = 0.0
+        # Pre-noise scaled value at current time (for participation score)
+        self._current_pv_base = 0.0
         
         # Fallback index for standalone usage (no current_time provided).
         # When current_time is supplied, this is ignored.
@@ -127,6 +132,16 @@ class PVEnv(ComponentEnv):
             self._action_space, rescale=self.rescale_spaces)
 
 
+    @property
+    def participation_score(self) -> float:
+        """Returns the participation score for this PV agent.
+
+        Defined as the pre-noise, scaled profile value at the current time of
+        day (base_data * scaling_factor interpolated at the current timestamp).
+        This represents the *predicted* PV output before stochastic noise.
+        """
+        return float(self._current_pv_base)
+
     def _lookup_time(self, current_time):
         """Interpolate the 24-hour profile at the given time of day.
 
@@ -139,6 +154,7 @@ class PVEnv(ComponentEnv):
         """
         if current_time is None:
             self._current_pv = 0.0
+            self._current_pv_base = 0.0
             return
         hour_of_day = (
             current_time.hour
@@ -147,6 +163,11 @@ class PVEnv(ComponentEnv):
         )
         # Linear interpolation with wrap-around (np.interp handles ascending x)
         self._current_pv = float(np.interp(hour_of_day, self._profile_hours, self.data))
+        # Pre-noise scaled value for participation score
+        self._current_pv_base = float(
+            np.interp(hour_of_day, self._profile_hours,
+                      self.base_data * self.scaling_factor)
+        )
 
     def get_obs(self, **kwargs):
         """Returns the maximum real power possible for the current time of day.
@@ -159,7 +180,9 @@ class PVEnv(ComponentEnv):
             self._lookup_time(kwargs["current_time"])
         elif not self._use_time_lookup:
             # Fallback: use sequential index into the profile array
-            self._current_pv = self.data[min(self._index, len(self.data) - 1)]
+            idx = min(self._index, len(self.data) - 1)
+            self._current_pv = self.data[idx]
+            self._current_pv_base = self.base_data[idx] * self.scaling_factor
 
         raw_obs = [-self._current_pv]
         if self.grid_aware:
@@ -175,7 +198,7 @@ class PVEnv(ComponentEnv):
     def _apply_noise_and_scale(self):
         """Apply Gaussian noise to base profile and scale to get working data."""
         if self.profile_noise_std > 0:
-            noise = np.random.normal(0, self.profile_noise_std, size=self.base_data.shape)
+            noise = self.rng.normal(0, self.profile_noise_std, size=self.base_data.shape)
             noisy_data = self.base_data + noise
             # Clip to [0, 1] to keep valid capacity factors
             noisy_data = np.clip(noisy_data, 0, 1)
@@ -209,6 +232,7 @@ class PVEnv(ComponentEnv):
         else:
             self._use_time_lookup = False
             self._current_pv = self.data[0]
+            self._current_pv_base = self.base_data[0] * self.scaling_factor
         self.get_obs(**kwargs)
 
 
@@ -222,6 +246,7 @@ class PVEnv(ComponentEnv):
         # Update PV value from time of day, then get observation
         obs, obs_meta = self.get_obs(**kwargs)
         self._real_power = np.float64((action * obs_meta["real_power"]).squeeze())
+        obs_meta["real_power"] = float(self._real_power)
         
         # Advance fallback index for standalone (non-time-based) usage
         if not self._use_time_lookup:

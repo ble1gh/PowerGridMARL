@@ -96,6 +96,11 @@ def _add_rnn_transforms(
 
     def model_fun():
         env = env_fun()
+        # Ensure RNN state specs are placed on the same device as the environment to avoid CPU/CUDA mixing.
+        try:
+            device = env.device
+        except AttributeError:
+            device = None
         spec_actor = Composite(
             {
                 group: Composite(
@@ -104,7 +109,7 @@ def _add_rnn_transforms(
                         *model_config._get_model_state_spec_inner(group=group).shape
                     ),
                     shape=(len(agents),),
-                )
+                ).to(device)
                 for group, agents in group_map.items()
             }
         )

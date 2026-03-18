@@ -11,7 +11,7 @@ import torch
 import torch_geometric.nn
 
 from benchmarl.hydra_config import load_model_config_from_hydra
-from benchmarl.models import GnnConfig, model_config_registry
+from benchmarl.models import GnnConfig, TransformerConfig, model_config_registry
 
 from benchmarl.models.common import output_has_agent_dim, SequenceModelConfig
 from hydra import compose, initialize
@@ -201,6 +201,69 @@ def test_models_forward_shape(
         input_td["is_init"] = torch.randint(0, 2, (1,), dtype=torch.bool)
     out_td = model(input_td.expand(batch_size))
     assert output_spec.expand(batch_size).is_in(out_td)
+
+
+def test_transformer_history_and_actions():
+    torch.manual_seed(0)
+    n_agents = 2
+    obs_dim = 3
+    act_dim = 2
+
+    input_spec = Composite(
+        {
+            "agents": Composite(
+                {"observation": Unbounded(shape=(n_agents, obs_dim))},
+                shape=(n_agents,),
+            )
+        }
+    )
+    output_spec = Composite(
+        {
+            "agents": Composite(
+                {"out": Unbounded(shape=(n_agents, 4))},
+                shape=(n_agents,),
+            )
+        }
+    )
+    action_spec = Composite(
+        {"agents": Composite({"action": Unbounded(shape=(n_agents, act_dim))}, shape=(n_agents,))}
+    )
+
+    cfg = TransformerConfig(
+        d_model=16,
+        nhead=4,
+        num_layers=1,
+        dim_feedforward=32,
+        dropout=0.0,
+        max_seq_len=8,
+        use_z_as_query=False,
+        append_actions=True,
+        norm_first=True,
+    )
+
+    model = cfg.get_model(
+        input_spec=input_spec,
+        output_spec=output_spec,
+        agent_group="agents",
+        input_has_agent_dim=True,
+        n_agents=n_agents,
+        centralised=False,
+        share_params=True,
+        device="cpu",
+        action_spec=action_spec,
+    )
+
+    td = input_spec.rand().expand((1,))
+    td["is_init"] = torch.zeros((1, 1, 1), dtype=torch.bool)
+    td["agents", "action"] = torch.randn(1, n_agents, act_dim)
+
+    out_td = model(td)
+    assert output_spec.expand((1,)).is_in(out_td)
+    # History keys should exist after forward (populated in eval, None in training)
+    history_key = ("next", "agents", f"_hidden_transformer_history_{model.model_index}")
+    histlen_key = ("next", "agents", f"_hidden_transformer_len_{model.model_index}")
+    assert history_key in out_td.keys(True, True)
+    assert histlen_key in out_td.keys(True, True)
 
 
 @pytest.mark.parametrize("input_has_agent_dim", [True, False])

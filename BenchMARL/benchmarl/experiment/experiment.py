@@ -64,6 +64,7 @@ class ExperimentConfig:
     sampling_device: str = MISSING
     train_device: str = MISSING
     buffer_device: str = MISSING
+    collection_policy_device: Optional[str] = MISSING  # Device for policy during collection (defaults to sampling_device)
 
     share_policy_params: bool = MISSING
     prefer_continuous_actions: bool = MISSING
@@ -542,11 +543,7 @@ class Experiment(CallbackNotifier):
             self.group_policies.update({group: group_policy[0]})
 
         if not self.config.collect_with_grad:
-            self.collector = SyncDataCollector(
-                self.env_func,
-                self.policy,
-                device=self.config.sampling_device,
-                storing_device=self.config.sampling_device,
+            collector_kwargs = dict(
                 frames_per_batch=self.config.collected_frames_per_batch(self.on_policy),
                 total_frames=self.config.get_max_n_frames(self.on_policy),
                 init_random_frames=(
@@ -554,6 +551,18 @@ class Experiment(CallbackNotifier):
                     if not self.on_policy
                     else 0
                 ),
+                storing_device=self.config.sampling_device,
+            )
+            if self.config.collection_policy_device is not None:
+                # Use separate devices: envs on CPU, policy on GPU
+                collector_kwargs["env_device"] = self.config.sampling_device
+                collector_kwargs["policy_device"] = self.config.collection_policy_device
+            else:
+                collector_kwargs["device"] = self.config.sampling_device
+            self.collector = SyncDataCollector(
+                self.env_func,
+                self.policy,
+                **collector_kwargs,
             )
         else:
             if self.config.off_policy_init_random_frames and not self.on_policy:
@@ -812,9 +821,18 @@ class Experiment(CallbackNotifier):
 
     def _get_excluded_keys(self, group: str):
         excluded_keys = []
-        for other_group in self.group_map.keys():
-            if other_group != group:
-                excluded_keys += [other_group, ("next", other_group)]
+        # When the critic is shared across groups, or the actor uses a shared
+        # GNN encoder, we need observations from ALL agent types in the batch.
+        share_critic = getattr(
+            self.algorithm, "share_critic_across_groups", False
+        )
+        shared_actor_gnn = getattr(
+            self.algorithm, "gnn_mode", "none"
+        ) != "none"
+        if not (share_critic or shared_actor_gnn):
+            for other_group in self.group_map.keys():
+                if other_group != group:
+                    excluded_keys += [other_group, ("next", other_group)]
         excluded_keys += ["info", (group, "info"), ("next", group, "info")]
         return excluded_keys
 
@@ -854,6 +872,28 @@ class Experiment(CallbackNotifier):
                     f"grad_norm_{loss_name}",
                     torch.tensor(grad_norm, device=self.config.train_device),
                 )
+                
+                # Extract gradient norms from retain_grad() refs stored by HGTeamLoss.
+                # Only after loss_objective backward, since that's the actor loss
+                # whose graph flows through embedding_z and participation scores.
+                if loss_name == "loss_objective":
+                    loss_module = self.losses[group]
+                    if hasattr(loss_module, '_grad_embedding_z_ref'):
+                        z = loss_module._grad_embedding_z_ref
+                        if z is not None and z.grad is not None:
+                            training_td.set(
+                                "grad_norm_z",
+                                z.grad.norm().detach(),
+                            )
+                        loss_module._grad_embedding_z_ref = None
+                    if hasattr(loss_module, '_grad_participation_ref'):
+                        p = loss_module._grad_participation_ref
+                        if p is not None and p.grad is not None:
+                            training_td.set(
+                                "grad_norm_participation",
+                                p.grad.norm().detach(),
+                            )
+                        loss_module._grad_participation_ref = None
 
                 optimizer.step()
                 optimizer.zero_grad()

@@ -37,6 +37,9 @@ class EnergyStorageEnv(ComponentEnv):
 
         super().__init__(name=name)
 
+        # Per-instance RNG (will be overwritten by MultiAgentEnv._set_seed)
+        self.rng = np.random.RandomState()
+
         self.storage_range = storage_range
         self.initial_storage_mean = initial_storage_mean
         self.initial_storage_std = initial_storage_std
@@ -76,6 +79,15 @@ class EnergyStorageEnv(ComponentEnv):
             self._action_space, rescale=self.rescale_spaces)
 
 
+    @property
+    def participation_score(self) -> float:
+        """Returns the participation score for this energy storage agent.
+
+        Defined as the maximum storage capacity (upper bound of storage_range
+        in kWh), representing the full energy capacity of the device.
+        """
+        return float(self.storage_range[1])
+
     def reset(self, **kwargs):
         """ Reset the battery storage at the beginning of an episode.
         """
@@ -87,7 +99,7 @@ class EnergyStorageEnv(ComponentEnv):
         if init_storage is None:
             # Initial battery storage is sampled from a truncated normal distribution.
             self.current_storage =\
-                float(truncnorm(-1, 1).rvs() *\
+                float(truncnorm(-1, 1).rvs(random_state=self.rng) *\
                 self.initial_storage_std + self.initial_storage_mean)
         else:
             try:

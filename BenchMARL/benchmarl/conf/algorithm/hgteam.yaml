@@ -10,15 +10,17 @@ critic_coef: 1.0
 loss_critic_type: "l2"
 lmbda: 0.95
 scale_mapping: "biased_softplus_1.0"
-use_tanh_normal: False
+scale_lb: 0.0001
+use_tanh_normal: True
 minibatch_advantage: True
-use_beta: True
-beta_min_param: 1.0
+use_beta: False
+beta_min_param: 1.
 
 # HGTeam-specific parameters
 share_critic_across_groups: True
 centralised_value_per_agent: True
-gnn_mode: "hypernetwork"  # Options: "none", "concat", "hypernetwork"
+critic_embed_dim: 32
+gnn_mode: "learned_query"  # Options: "none", "concat", "hypernetwork", "learned_query"
 hypernet_hidden_dim: 8
 hypernet_feature_dim: 64
 stochastic_hypernet: True
@@ -26,11 +28,25 @@ embedding_entropy_coef: 0.0
 embedding_diversity_coef: 0.0
 
 # GNN configuration parameters
-gnn_num_layers: 4
+gnn_num_layers: 2
 gnn_heads: 2
-gnn_concat_heads: True
+gnn_concat_heads: False
 gnn_use_beta: True
 gnn_self_loops: True
 gnn_agent_node_feature_key: "participation_score"
 gnn_agent_node_feature_dim: 1
 gnn_norm_class: null  # Options: null, "LayerNorm", "BatchNorm1d", "InstanceNorm1d", "GroupNorm"
+critic_use_other_actions: True  # Condition value function on other agents' actions (counterfactual)
+
+# Split-z: separate GNN output into z_token (KV) and z_query (cross-attn query)
+# Only used when gnn_mode="learned_query". When False, a single embedding_z is used for both.
+split_z: False
+z_token_dim: 32          # Dimensionality of the deterministic z_token (prepended to KV sequence)
+z_query_dim: 32          # Dimensionality of z_query (used as cross-attention query)
+stochastic_z_query: False # Whether z_query uses reparameterized stochastic sampling
+
+# VIB (Variational Information Bottleneck): KL(q(z|x) || N(0,I)) with beta warm-up
+# and selective noise injection (deterministic z for PPO, stochastic for collection).
+use_vib: False
+vib_beta: 0.001           # Maximum KL coefficient (reached after warm-up)
+vib_warmup_frames: 500000 # Linearly anneal beta from 0 to vib_beta over this many frames

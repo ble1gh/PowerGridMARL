@@ -26,6 +26,10 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--project-name", type=str, default="PowerGridworldVariable_VPP")
     parser.add_argument("--wandb-name", type=str, default=f"HGTeam_{date_str}_{job_id}")
+    parser.add_argument("--wandb-group", type=str, default=None,
+                        help="WandB group for organizing related runs")
+    parser.add_argument("--wandb-tags", type=str, nargs="*", default=None,
+                        help="WandB tags for filtering runs")
     parser.add_argument("--max-n-frames", type=int, default=10_000_000)
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--evaluation-interval", type=int, default=12288)
@@ -147,23 +151,23 @@ def main():
     # This is the functional part that processes local observations
     # For Hypernetwork, we usually want this to be an MLP or LSTM processing raw obs
     # Transformer actor (tokens = obs plus previous actions; queries come from GNN embedding_z)
-    actor_model_config = TransformerConfig(
-        d_model=128,
-        nhead=4,
-        num_layers=1,
-        dim_feedforward=256,
-        dropout=0.0,
-        max_seq_len=300,
-        use_z_as_query=True,
-        append_actions=True,
-        norm_first=True,
-        prepend_z_token=True,
-    )
-    # actor_model_config = MlpConfig(
-    #     num_cells = [128, 128, 64],
-    #     layer_class = torch.nn.Linear,
-    #     activation_class = torch.nn.ReLU,
+    # actor_model_config = TransformerConfig(
+    #     d_model=128,
+    #     nhead=4,
+    #     num_layers=1,
+    #     dim_feedforward=256,
+    #     dropout=0.0,
+    #     max_seq_len=300,
+    #     use_z_as_query=True,
+    #     append_actions=True,
+    #     norm_first=True,
+    #     prepend_z_token=True,
     # )
+    actor_model_config = MlpConfig(
+        num_cells = [128, 128, 64],
+        layer_class = torch.nn.Linear,
+        activation_class = torch.nn.ReLU,
+    )
     critic_model_config = critic_gnn_config
 
     # 2. Algorithm Configuration - load from yaml and override as needed
@@ -224,7 +228,12 @@ def main():
     experiment_config.evaluation_interval = args.evaluation_interval
     experiment_config.project_name = args.project_name
     experiment_config.loggers = ["wandb"]
-    experiment_config.wandb_extra_kwargs = {"name": args.wandb_name}
+    wandb_extra = {"name": args.wandb_name}
+    if args.wandb_group:
+        wandb_extra["group"] = args.wandb_group
+    if args.wandb_tags:
+        wandb_extra["tags"] = args.wandb_tags
+    experiment_config.wandb_extra_kwargs = wandb_extra
 
     if args.algorithm == "sac":
         # Off-policy experiment settings

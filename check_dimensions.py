@@ -2,6 +2,7 @@
 import sys
 import os
 sys.path.append(os.path.join(os.getcwd(), "BenchMARL"))
+sys.path.append(os.path.join(os.getcwd(), "PowerGridworld"))
 
 from benchmarl.environments.PowerGridworldVariable.common import PowerGridworldVariableTask
 

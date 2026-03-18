@@ -9,6 +9,7 @@ import pandas as pd
 
 from gridworld.base import ComponentEnv, MultiComponentEnv
 from gridworld.log import logger
+from gridworld.utils import to_scaled, to_raw
 
 from torchrl.envs import EnvBase
 
@@ -88,6 +89,12 @@ class MultiAgentEnv(EnvBase):
         if "include_load_in_agent_obs" not in common_config:
             logger.info(f"Using default include_load_in_agent_obs: {self.include_load_in_agent_obs}")
 
+        # Bounds for the extra observations appended by obs_transform.
+        # Used for rescaling to [-1, 1] and for TorchRL spec construction.
+        self._voltage_bounds = (0.8, 1.2)            # p.u.
+        self._setpoint_bounds = (0.0, max(self.setpoint, 1e-6))  # kW (avoid /0)
+        self._base_load_bounds = (-0.2, 1.2)          # normalized coefficient (widened to cover Gaussian noise tails)
+
         # TODO:  If we required certain keys in this config dict, we need
         # to do some simple checking and raise a helpful error.
         self.start_time = pd.Timestamp(common_config["start_time"])
@@ -128,7 +135,12 @@ class MultiAgentEnv(EnvBase):
             self.agents.append(new_agent)
 
         # Keep track of which bus each agent is attached to.    
-        self.agent_name_bus_map = {a["name"]: a["bus"] for a in agents} 
+        self.agent_name_bus_map = {a["name"]: a["bus"] for a in agents}
+
+        # Per-instance RNG (properly seeded via _set_seed by TorchRL)
+        self.rng = np.random.RandomState()
+        for agent in self.agents:
+            agent.rng = self.rng
         
         # Create a list of agent names and ensure they are unique.
         self.agent_names = list(set([a.name for a in self.agents]))
@@ -136,6 +148,39 @@ class MultiAgentEnv(EnvBase):
 
         # Instantiate the powerflow solver.
         self.pf_solver = pf_config["cls"](**pf_config["config"])
+
+        # ------------------------------------------------------------------
+        # Build per-type agent groups
+        # ------------------------------------------------------------------
+        self._agent_type_prefixes = ["EV", "PV", "Storage"]  # canonical order
+        
+        # Classify agents by type prefix
+        self._type_agents = {}  # type_name -> [agent_obj, ...]
+        self._type_agent_names = {}  # type_name -> [name, ...]
+        for agent in self.agents:
+            for prefix in self._agent_type_prefixes:
+                if agent.name.startswith(prefix + "-"):
+                    self._type_agents.setdefault(prefix, []).append(agent)
+                    self._type_agent_names.setdefault(prefix, []).append(agent.name)
+                    break
+            else:
+                # Fallback: agents without recognized prefix go into "Other"
+                self._type_agents.setdefault("Other", []).append(agent)
+                self._type_agent_names.setdefault("Other", []).append(agent.name)
+        
+        # Only keep types that actually have agents
+        self.agent_types = [t for t in self._agent_type_prefixes if t in self._type_agents]
+        if "Other" in self._type_agents:
+            self.agent_types.append("Other")
+        
+        # Build group_map: {type_name: [agent_names]}
+        self.group_map = {t: self._type_agent_names[t] for t in self.agent_types}
+        
+        # Flat index mapping: agent_name -> (type, index_within_type)
+        self._agent_to_type_idx = {}
+        for t in self.agent_types:
+            for i, name in enumerate(self._type_agent_names[t]):
+                self._agent_to_type_idx[name] = (t, i)
 
         # Create the gym observation and action spaces.
         try:
@@ -153,101 +198,118 @@ class MultiAgentEnv(EnvBase):
 
         self.action_space = {
             agent.name: agent.action_space for agent in self.agents}
+
+        # ------------------------------------------------------------------
+        # Build per-type TorchRL specs
+        # ------------------------------------------------------------------
+        # Extra obs dims appended by obs_transform:
+        #   voltage(1) + setpoint(1 if signal_tracking) + base_load(1 if include_load_in_agent_obs)
+        extra_obs = 1  # voltage is always included
+        if self.signal_tracking:
+            extra_obs += 1  # setpoint
+        if self.include_load_in_agent_obs:
+            extra_obs += 1  # base_load
+
+        obs_spec_dict = {}
+        act_spec_dict = {}
+        reward_spec_dict = {}
+        done_spec_dict = {}
         
-        n_agents = len(self.agents)
-        # Observation dimension: base + voltage + setpoint + (optionally) base load
-        obs_dim = self.agents[0].observation_space.shape[0] + 2  # +1 for voltage, +1 for setpoint
-        if self.include_load_in_agent_obs:
-            obs_dim += 1  # +1 for base load
-        act_dim = self.agents[0].action_space.shape[0]
+        self._type_obs_dim = {}  # cache per-type obs dim for _reset / _step
 
-        # Get bounds from any agent (they are all the same)
-        obs_low = torch.as_tensor(self.agents[0].observation_space.low, dtype=torch.float32)
-        obs_high = torch.as_tensor(self.agents[0].observation_space.high, dtype=torch.float32)
-        # Append 0 to obs_low and inf to obs_high for the voltage dimension
-        obs_low = torch.cat([obs_low, torch.tensor([0.0], dtype=torch.float32)])
-        obs_high = torch.cat([obs_high, torch.tensor([float('inf')], dtype=torch.float32)])
-        # Append bounds for the setpoint dimension (can be any positive value)
-        obs_low = torch.cat([obs_low, torch.tensor([0.0], dtype=torch.float32)])
-        obs_high = torch.cat([obs_high, torch.tensor([float('inf')], dtype=torch.float32)])
-        # Optionally append bounds for the normalized base load dimension
-        if self.include_load_in_agent_obs:
-            obs_low = torch.cat([obs_low, torch.tensor([0.0], dtype=torch.float32)])
-            obs_high = torch.cat([obs_high, torch.tensor([1.0], dtype=torch.float32)])
-        # print("obs_low shape:", obs_low.shape)
-        # print("obs_high shape:", obs_high.shape)
-        act_high = torch.as_tensor(self.agents[0].action_space.high, dtype=torch.float32)
-        act_low = torch.as_tensor(self.agents[0].action_space.low, dtype=torch.float32)
+        for t in self.agent_types:
+            type_agents = self._type_agents[t]
+            n = len(type_agents)
+            
+            # Observation spec (native dim differs by type)
+            native_obs_dim = type_agents[0].observation_space.shape[0]
+            obs_dim = native_obs_dim + extra_obs
+            self._type_obs_dim[t] = obs_dim
+            
+            obs_low = torch.as_tensor(type_agents[0].observation_space.low, dtype=torch.float32)
+            obs_high = torch.as_tensor(type_agents[0].observation_space.high, dtype=torch.float32)
 
-        # First create a per-agent spec without batching
-        agent_obs_spec = Composite({
-            "observation": Bounded(
-                low=obs_low,
-                high=obs_high,
-                shape=(obs_dim,),
-                dtype=torch.float32
-            )
-        })
+            if self.rescale_spaces:
+                # All dims (native + appended) are rescaled to [-1, 1]
+                extra_low = -1.0
+                extra_high = 1.0
+            else:
+                extra_low = None  # use physical bounds below
+                extra_high = None
 
-        # Then expand it to match your agent count
-        self.observation_spec = Composite({
-            "agents": agent_obs_spec.expand(n_agents)
-        })
-        # print("Observation spec:", self.observation_spec)
-
-        # Same for action spec
-        agent_act_spec = Composite({
-            "action": Bounded(
-                low=act_low,
-                high=act_high,
-                shape=(act_dim,),
-                dtype=torch.float32
-            )
-        })
-
-        self.action_spec = Composite({
-            "agents": agent_act_spec.expand(n_agents)
-        })
-
-        # Define reward spec
-        agent_reward_spec = Composite({
-            "reward": Bounded(
-                low=float("-inf"),
-                high=float("inf"),
-                shape=(1,),
-                dtype=torch.float32
-            ),
-            "episode_reward": Bounded(
-                low=float("-inf"),
-                high=float("inf"),
-                shape=(1,),
-                dtype=torch.float32
-            )
-        })
-
-        # Expand to all agents
-        self.reward_spec = Composite({
-            "agents": agent_reward_spec.expand(n_agents)
-        })
-
-        self.done_spec = Composite({
-            "agents": Composite({
+            # Append voltage bounds
+            v_lo = extra_low if extra_low is not None else self._voltage_bounds[0]
+            v_hi = extra_high if extra_high is not None else self._voltage_bounds[1]
+            obs_low = torch.cat([obs_low, torch.tensor([v_lo], dtype=torch.float32)])
+            obs_high = torch.cat([obs_high, torch.tensor([v_hi], dtype=torch.float32)])
+            # Append setpoint bounds (only when signal_tracking is active)
+            if self.signal_tracking:
+                s_lo = extra_low if extra_low is not None else self._setpoint_bounds[0]
+                s_hi = extra_high if extra_high is not None else self._setpoint_bounds[1]
+                obs_low = torch.cat([obs_low, torch.tensor([s_lo], dtype=torch.float32)])
+                obs_high = torch.cat([obs_high, torch.tensor([s_hi], dtype=torch.float32)])
+            if self.include_load_in_agent_obs:
+                bl_lo = extra_low if extra_low is not None else self._base_load_bounds[0]
+                bl_hi = extra_high if extra_high is not None else self._base_load_bounds[1]
+                obs_low = torch.cat([obs_low, torch.tensor([bl_lo], dtype=torch.float32)])
+                obs_high = torch.cat([obs_high, torch.tensor([bl_hi], dtype=torch.float32)])
+            
+            type_obs_spec = Composite({
+                "observation": Bounded(
+                    low=obs_low, high=obs_high, shape=(obs_dim,), dtype=torch.float32
+                )
+            })
+            obs_spec_dict[t] = type_obs_spec.expand(n)
+            
+            # Action spec (all types currently have 1-D actions but this is general)
+            act_dim = type_agents[0].action_space.shape[0]
+            act_low = torch.as_tensor(type_agents[0].action_space.low, dtype=torch.float32)
+            act_high = torch.as_tensor(type_agents[0].action_space.high, dtype=torch.float32)
+            type_act_spec = Composite({
+                "action": Bounded(
+                    low=act_low, high=act_high, shape=(act_dim,), dtype=torch.float32
+                )
+            })
+            act_spec_dict[t] = type_act_spec.expand(n)
+            
+            # Reward spec
+            type_reward_spec = Composite({
+                "reward": Bounded(low=float("-inf"), high=float("inf"), shape=(1,), dtype=torch.float32),
+                "episode_reward": Bounded(low=float("-inf"), high=float("inf"), shape=(1,), dtype=torch.float32),
+            })
+            reward_spec_dict[t] = type_reward_spec.expand(n)
+            
+            # Done spec
+            type_done_spec = Composite({
                 "done": Categorical(n=2, dtype=torch.bool, shape=(1,)),
                 "terminated": Categorical(n=2, dtype=torch.bool, shape=(1,)),
                 "truncated": Categorical(n=2, dtype=torch.bool, shape=(1,)),
-            }).expand(n_agents),
+            })
+            done_spec_dict[t] = type_done_spec.expand(n)
+
+        self.observation_spec = Composite(obs_spec_dict)
+        self.action_spec = Composite(act_spec_dict)
+        self.reward_spec = Composite(reward_spec_dict)
+
+        self.done_spec = Composite({
+            **done_spec_dict,
             "done": Categorical(n=2, dtype=torch.bool, shape=(1,)),
             "terminated": Categorical(n=2, dtype=torch.bool, shape=(1,)),
             "truncated": Categorical(n=2, dtype=torch.bool, shape=(1,)),
         })
 
-        self.info_spec = Composite({
-            "agents": Composite({
+        # Build info spec per type
+        info_per_type = {}
+        for t in self.agent_types:
+            n = len(self._type_agents[t])
+            info_per_type[t] = Composite({
                 "agent_info": Composite({
                     "energy_remaining": Bounded(low=float(0.0), high=float("inf"), shape=(), dtype=torch.float32),
                     "peak_reward": Bounded(low=float("-inf"), high=float(0.0), shape=(), dtype=torch.float32),
                 })
-            }).expand(n_agents),
+            }).expand(n)
+        self.info_spec = Composite({
+            **info_per_type,
             "info": Composite({
                 "power_loss_reward": Bounded(low=float("-inf"), high=float(0.0), shape=(), dtype=torch.float32),
                 "voltage_reward": Bounded(low=float("-inf"), high=float(0.0), shape=(), dtype=torch.float32),
@@ -299,101 +361,109 @@ class MultiAgentEnv(EnvBase):
         self._global_reward_components = {}
         self.episode_reward = 0
         
-        agent_obs = torch.stack([
-            torch.as_tensor(obs_dict[agent_name], dtype=torch.float32)
-            for agent_name in self.agent_names
-        ])
+        # Build per-type observation tensors
+        obs_td_dict = {}
+        for t in self.agent_types:
+            type_names = self._type_agent_names[t]
+            type_obs = torch.stack([
+                torch.as_tensor(obs_dict[name], dtype=torch.float32)
+                for name in type_names
+            ])
+            obs_td_dict[t] = TensorDict({
+                "observation": type_obs,
+            }, batch_size=[len(type_names)])
         
-        # Create TensorDict matching spec structure 
-        obs_td = TensorDict({
-            "agents": TensorDict({
-                "observation": agent_obs,
-            }, batch_size=[len(self.agent_names)])
-        }, batch_size=[])
-        # print(f"Observation on Reset: {obs_td}")
-        
+        obs_td = TensorDict(obs_td_dict, batch_size=[])
         return obs_td
 
     def _step(self, tensordict=None):
-        # Extract actions from tensordict
-        actions = tensordict["agents"]["action"].clone()
-        
-        # Convert actions to dictionary format for env logic
-        action_dict = {
-            self.agent_names[i]: actions[i].cpu().numpy() 
-            for i in range(len(self.agent_names))
-        }
+        # Extract actions from per-type groups and build flat action dict
+        action_dict = {}
+        for t in self.agent_types:
+            type_actions = tensordict[t]["action"].clone()
+            type_names = self._type_agent_names[t]
+            for i, name in enumerate(type_names):
+                action_dict[name] = type_actions[i].cpu().numpy()
         
         # Call environment step logic
         obs, rewards, dones, truncated, per_agent_info = self._step_logic(action_dict)
         
-        # Stack all agent observations into a single tensor [n_agents, obs_dim]
-        agent_obs = torch.stack([
-            torch.as_tensor(obs[agent_name], dtype=torch.float32) 
-            for agent_name in self.agent_names
-        ])
+        # Build per-type tensors
+        td_dict = {}
+        all_dones = []
+        all_truncs = []
         
-        # Create per-agent reward tensor
-        agent_rewards = torch.tensor([
-            rewards[agent_name] for agent_name in self.agent_names
-        ], dtype=torch.float32).unsqueeze(-1)
+        for t in self.agent_types:
+            type_names = self._type_agent_names[t]
+            n = len(type_names)
+            
+            type_obs = torch.stack([
+                torch.as_tensor(obs[name], dtype=torch.float32)
+                for name in type_names
+            ])
+            
+            type_rewards = torch.tensor([
+                rewards[name] for name in type_names
+            ], dtype=torch.float32).unsqueeze(-1)
+            
+            type_dones = torch.tensor([
+                dones[name] for name in type_names
+            ], dtype=torch.bool).unsqueeze(-1)
+            
+            type_truncs = torch.tensor([
+                truncated[name] if isinstance(truncated, dict) else truncated
+                for name in type_names
+            ], dtype=torch.bool).unsqueeze(-1)
+            
+            type_episode_rewards = torch.tensor([
+                self.obs_dict["episode_reward"].get(name, 0)
+                for name in type_names
+            ], dtype=torch.float32).unsqueeze(-1)
+            
+            type_info = TensorDict({
+                "energy_remaining": torch.tensor([
+                    sum(per_agent_info[name].get("energy_remaining", {}).values())
+                    if isinstance(per_agent_info[name].get("energy_remaining", {}), dict)
+                    else 0.0
+                    for name in type_names
+                ], dtype=torch.float32),
+                "peak_reward": torch.tensor([
+                    per_agent_info[name].get("peak_reward", 0)
+                    for name in type_names
+                ], dtype=torch.float32),
+            }, batch_size=[n])
+            
+            td_dict[t] = TensorDict({
+                "observation": type_obs,
+                "reward": type_rewards,
+                "episode_reward": type_episode_rewards,
+                "terminated": type_dones,
+                "truncated": type_truncs,
+                "done": type_dones | type_truncs,
+                "agent_info": type_info,
+            }, batch_size=[n])
+            
+            all_dones.append(type_dones)
+            all_truncs.append(type_truncs)
         
-        # Get done and truncated as boolean tensors
-        agent_dones = torch.tensor([
-            dones[agent_name] for agent_name in self.agent_names
-        ], dtype=torch.bool).unsqueeze(-1)
+        # Global done/terminated/truncated
+        all_dones_cat = torch.cat(all_dones, dim=0)
+        all_truncs_cat = torch.cat(all_truncs, dim=0)
         
-        agent_truncs = torch.tensor([
-            truncated[agent_name] if isinstance(truncated, dict) else truncated 
-            for agent_name in self.agent_names
-        ], dtype=torch.bool).unsqueeze(-1)
-        
-        # Create per-agent episode reward tensor
-        agent_episode_rewards = torch.tensor([
-            self.obs_dict["episode_reward"].get(agent_name, 0) 
-            for agent_name in self.agent_names
-        ], dtype=torch.float32).unsqueeze(-1)
-        
-        # Create per-agent info dictionary
-        per_agent_info_td = TensorDict({
-            "energy_remaining": torch.tensor([
-                sum(per_agent_info[agent_name].get("energy_remaining", {}).values()) 
-                if isinstance(per_agent_info[agent_name].get("energy_remaining", {}), dict)
-                else 0.0
-                for agent_name in self.agent_names
-            ], dtype=torch.float32),
-            "peak_reward": torch.tensor([
-                per_agent_info[agent_name].get("peak_reward", 0) 
-                for agent_name in self.agent_names
-            ], dtype=torch.float32),
-        }, batch_size=[len(self.agent_names)])
-        
-        # Create group-level info dictionary
+        # Group-level info dictionary
         group_info_td = TensorDict({
             key: torch.tensor(value, dtype=torch.float32)
             for key, value in self._global_reward_components.items()
         }, batch_size=[])
 
-        # Create output TensorDict
         next_obs = TensorDict({
-            "agents": TensorDict({
-                "observation": agent_obs,  # Per-agent observations
-                "reward": agent_rewards,  # Per-agent rewards
-                "episode_reward": agent_episode_rewards,  # Per-agent episode rewards
-                "terminated": agent_dones,  # Per-agent termination flags
-                "truncated": agent_truncs,  # Per-agent truncated flags
-                "done": agent_dones | agent_truncs,  # Per-agent done flags
-                "agent_info": per_agent_info_td,  # Per-agent info
-            }, batch_size=[len(self.agent_names)]),
-            "info": group_info_td,  # Group-level info
-            "done": (agent_dones.squeeze(-1) | agent_truncs.squeeze(-1)).any().reshape(1),
-            "terminated": agent_dones.any().reshape(1),
-            "truncated": agent_truncs.any().reshape(1),
+            **td_dict,
+            "info": group_info_td,
+            "done": (all_dones_cat.squeeze(-1) | all_truncs_cat.squeeze(-1)).any().reshape(1),
+            "terminated": all_dones_cat.any().reshape(1),
+            "truncated": all_truncs_cat.any().reshape(1),
         }, batch_size=[])
 
-        # print(f"Next Obs reward: {next_obs['agents']['reward']}")
-        # print(f"Next Obs episode reward: {next_obs['agents']['episode_reward']}")
-    
         return next_obs
 
     def get_external_obs_vars(
@@ -493,8 +563,8 @@ class MultiAgentEnv(EnvBase):
             )
 
             load_bus = self.agent_name_bus_map[name]
-            agent_p_consumed = agent.real_power
-            agent_q_consumed = agent.reactive_power
+            agent_p_consumed = float(agent.real_power)
+            agent_q_consumed = float(agent.reactive_power)
             agent_power_p.append(agent_p_consumed)
 
             if load_bus in load_p.keys():
@@ -579,7 +649,18 @@ class MultiAgentEnv(EnvBase):
         self.history["agent_power_p"].append(agent_power_p)
         self.history["total_load"].append(self.total_load)
         self.history["losses"].append(self.losses)
-        self.history["actions"].append(action)
+        # Store actions in physical range for history/plotting.
+        if self.rescale_spaces:
+            physical_action = {}
+            for agent in self.agents:
+                physical_action[agent.name] = to_raw(
+                    action[agent.name],
+                    agent._action_space.low,
+                    agent._action_space.high
+                )
+            self.history["actions"].append(physical_action)
+        else:
+            self.history["actions"].append(action)
         self.history["reward_components"].append(self._global_reward_components.copy())
         self.history["per_agent_info"].append(per_agent_info)
         self.history["agent_rewards"].append(rew.copy())
@@ -592,7 +673,18 @@ class MultiAgentEnv(EnvBase):
         # Get the current total base load (this is system-wide information)
         # Use the sum of real power from base load only (excluding controllable agents)
         total_base_load = float(self.pf_solver.normalized_load_coefficient)  # normalized load coefficient
-        
+
+        # Pre-compute scaled base load ONCE so every agent gets the same value.
+        # (Previously this was computed inside the loop, overwriting total_base_load
+        #  each iteration and causing cascading double-scaling for agents 2+.)
+        if self.include_load_in_agent_obs and self.rescale_spaces:
+            scaled_base_load = float(to_scaled(
+                np.array([total_base_load]),
+                np.array([self._base_load_bounds[0]]),
+                np.array([self._base_load_bounds[1]]))[0])
+        else:
+            scaled_base_load = total_base_load
+
         for agent_name in obs_dict:
             # Ensure the observation array is of type float32
             obs_dict[agent_name] = obs_dict[agent_name].astype(np.float32)
@@ -608,15 +700,26 @@ class MultiAgentEnv(EnvBase):
             else:
                 voltage = float(voltage)
 
+            # Rescale appended values to [-1, 1] when rescale_spaces is on
+            if self.rescale_spaces:
+                voltage = float(to_scaled(
+                    np.array([voltage]), np.array([self._voltage_bounds[0]]), np.array([self._voltage_bounds[1]]))[0])
+
             # Append the voltage to the observation
             obs_dict[agent_name] = np.append(obs_dict[agent_name], voltage).astype(np.float32)
             
-            # Append the setpoint to the observation
-            obs_dict[agent_name] = np.append(obs_dict[agent_name], self.setpoint).astype(np.float32)
+            # Append the setpoint to the observation (only when signal_tracking is active)
+            if self.signal_tracking:
+                if self.rescale_spaces:
+                    setpoint_val = float(to_scaled(
+                        np.array([self.setpoint]), np.array([self._setpoint_bounds[0]]), np.array([self._setpoint_bounds[1]]))[0])
+                else:
+                    setpoint_val = self.setpoint
+                obs_dict[agent_name] = np.append(obs_dict[agent_name], setpoint_val).astype(np.float32)
             
             # Optionally append the total base load to the observation
             if self.include_load_in_agent_obs:
-                obs_dict[agent_name] = np.append(obs_dict[agent_name], total_base_load).astype(np.float32)
+                obs_dict[agent_name] = np.append(obs_dict[agent_name], scaled_base_load).astype(np.float32)
 
 
         return obs_dict
@@ -718,7 +821,7 @@ class MultiAgentEnv(EnvBase):
         for agent_name in rew_dict:
             if isinstance(rew_dict[agent_name], (int, float)):
                 # Base global rewards (loss, load stability, tracking, VPP)
-                rew_dict[agent_name] += 100 + power_loss_reward + load_2norm_penalty + tracking_reward + vpp_reward_value
+                rew_dict[agent_name] += power_loss_reward + load_2norm_penalty + tracking_reward + vpp_reward_value
                 
                 # Voltage Reward Logic
                 if self.cooperative_voltage:
@@ -763,10 +866,11 @@ class MultiAgentEnv(EnvBase):
         return {a.name: a for a in self.agents}
     
     def _set_seed(self, seed: int):
-        # Implement your seeding logic if needed
         self.seed = seed
-        np.random.seed(seed)
-        # If your agents or other components need seeding, do it here
+        self.rng = np.random.RandomState(seed)
+        # Propagate per-instance RNG to all agents
+        for agent in self.agents:
+            agent.rng = self.rng
     
     def render_rollout_fig(self):
         """
@@ -1151,8 +1255,10 @@ class MultiAgentEnv(EnvBase):
                 info = step_info.get(agent, {})
                 pv_power[agent].append(info.get("pv_real_power", 0.0))
 
-        # Total load & aggregate agent impact (VPP production)
-        total_load = [l[1][:, 0].sum() for l in self.history["total_load"]]
+        # Load breakdown & VPP production
+        base_load = [l[1][:, 0].sum() for l in self.history["total_load"]]
+        agent_load = [sum(p) for p in self.history["agent_power_p"]]
+        system_load = [b + a for b, a in zip(base_load, agent_load)]
         vpp_production = [rc.get("vpp_production", 0.0) for rc in self.history["reward_components"]]
         vpp_setpoint_val = getattr(self, "vpp_setpoint", 0.0)
 
@@ -1186,7 +1292,7 @@ class MultiAgentEnv(EnvBase):
         # ==================================================================
         # FIGURE 1: System-level view  (3 rows × 2 cols)
         # ==================================================================
-        fig1, axes1 = plt.subplots(3, 2, figsize=(20, 18), tight_layout=True)
+        fig1, axes1 = plt.subplots(4, 2, figsize=(20, 24), tight_layout=True)
         fig1.suptitle(f"VPP Evaluation – System View (N_agents={len(active_agents)})", fontsize=16)
 
         # (0,0) Nodal Voltages
@@ -1232,7 +1338,7 @@ class MultiAgentEnv(EnvBase):
                 label = f"{agent} ({bus})" if agent not in plotted else None
                 ax.plot(actions_df.index, actions_df[agent], label=label, color=agent_color[agent])
                 plotted.add(agent)
-        ax.set_title("PV Curtailment Actions")
+        ax.set_title("PV Actions")
         ax.set_ylabel("Action [0-1]"); ax.set_ylim(-0.05, 1.05)
         ax.grid(True); ax.legend(loc='best', fontsize='small')
 
@@ -1249,18 +1355,26 @@ class MultiAgentEnv(EnvBase):
         ax.set_ylabel("Action [-1, 1]"); ax.set_ylim(-1.05, 1.05)
         ax.grid(True); ax.legend(loc='best', fontsize='small')
 
-        # (2,0) System Load + VPP tracking
+        # (2,0) System Load vs Base Load
         ax = axes1[2, 0]
-        ax.plot(timestamps, total_load, label="Total Load (kW)", color='black')
-        ax.plot(timestamps, vpp_production, label="VPP Production (kW)", color='tab:green', linewidth=2)
-        ax.axhline(vpp_setpoint_val, color='tab:green', linestyle='--', alpha=0.7,
-                    label=f"VPP Setpoint ({vpp_setpoint_val:.0f} kW)")
-        ax.set_title("System Load & VPP Tracking")
+        ax.plot(timestamps, system_load, label="System Load (kW)", color='black', linewidth=2)
+        ax.plot(timestamps, base_load, label="Base Load (kW)", color='tab:blue', linestyle='--', linewidth=1.5)
+        ax.plot(timestamps, agent_load, label="Agent Load (kW)", color='tab:orange', linewidth=1.5)
+        ax.set_title("System Load Breakdown")
         ax.set_ylabel("Power (kW)")
         ax.grid(True); ax.legend(loc='best', fontsize='small')
 
-        # (2,1) Rewards per Agent
+        # (2,1) VPP Production & Setpoint
         ax = axes1[2, 1]
+        ax.plot(timestamps, vpp_production, label="VPP Production (kW)", color='tab:green', linewidth=2)
+        ax.axhline(vpp_setpoint_val, color='tab:red', linestyle='--', alpha=0.7,
+                    label=f"VPP Setpoint ({vpp_setpoint_val:.0f} kW)")
+        ax.set_title("VPP Production Tracking")
+        ax.set_ylabel("Power (kW)")
+        ax.grid(True); ax.legend(loc='best', fontsize='small')
+
+        # (3,0) Rewards per Agent
+        ax = axes1[3, 0]
         plotted = set()
         for agent in active_agents:
             if agent in agent_reward_df.columns:
@@ -1271,6 +1385,13 @@ class MultiAgentEnv(EnvBase):
                 plotted.add(agent)
         ax.set_title("Agent Rewards")
         ax.set_ylabel("Reward")
+        ax.grid(True)
+
+        # (3,1) Reward Components
+        ax = axes1[3, 1]
+        reward_comp_df.drop(columns=["vpp_production"], errors="ignore").plot(ax=ax)
+        ax.set_title("Reward Components")
+        ax.set_ylabel("Value")
         ax.grid(True); ax.legend(loc='best', fontsize='small')
 
         # ==================================================================

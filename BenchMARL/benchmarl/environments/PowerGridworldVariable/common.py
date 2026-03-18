@@ -59,10 +59,21 @@ class VariableAgentMultiAgentEnv(MultiAgentEnv):
         self.max_agents = len(self.agents)
         self.active_mask = torch.ones(self.max_agents, dtype=torch.bool)
         
-        # Build agent name to index mapping
+        # Build agent name to index mapping (flat, over all agents)
         self._agent_name_to_idx = {agent.name: i for i, agent in enumerate(self.agents)}
         
-        # Add active_mask to observation spec so it's collected properly
+        # Build per-type active masks  (type -> BoolTensor of length n_type)
+        self._type_active_masks = {}
+        for t in self.agent_types:
+            n = len(self._type_agent_names[t])
+            self._type_active_masks[t] = torch.ones(n, dtype=torch.bool)
+        
+        # NOTE: Do NOT put active_mask inside per-type observation specs!
+        # The observation spec for each group is passed to the actor model, and
+        # the MLP cannot handle a boolean mask tensor. Instead, keep active_mask
+        # only at the root level of the observation spec (outside any group).
+        # Per-type masks are still set in the TensorDict during _reset/_step and
+        # will be preserved by TorchRL's collector even without a spec entry.
         from torchrl.data import Unbounded
         self.observation_spec.set("active_mask", Unbounded(shape=(self.max_agents,), dtype=torch.bool))
 
@@ -82,22 +93,40 @@ class VariableAgentMultiAgentEnv(MultiAgentEnv):
                  # Shape: (N_grid, N_grid, F)
                  self.adj_tensors[f"{k}_adjacency"] = torch.from_numpy(v).float()
                  
-             # 3. Compute Agent <-> Grid Node mapping
+             # 3. Compute Agent <-> Grid Node mapping (flat, all agents)
              self.agent_grid_edge_index = self._compute_agent_grid_mapping()
+             
+             # 3b. Compute per-type edge index mappings
+             # Each type uses local indices (0..n_type-1) for the agent dimension
+             self._type_agent_grid_edge_index = {}
+             for t in self.agent_types:
+                 self._type_agent_grid_edge_index[t] = self._compute_agent_grid_mapping(
+                     agent_subset=self._type_agents[t]
+                 )
              
              # Store grid node count for reference
              self.n_grid_nodes = len(self.grid_nodes)
 
              # 4. Update Observation Spec to include static graph info
-             # This ensures TorchRL knows about these keys
+             # Graph structure is stored at the top level (shared across types)
              if self.agent_grid_edge_index is not None:
                 from torchrl.data import Unbounded
+                # Per-type agent-grid mappings and participation scores
+                for t in self.agent_types:
+                    n = len(self._type_agents[t])
+                    edge_idx = self._type_agent_grid_edge_index[t]
+                    self.observation_spec.set(
+                        f"{t}_agent_grid_edge_index",
+                        Unbounded(shape=edge_idx.shape, dtype=torch.long)
+                    )
+                    self.observation_spec.set(
+                        f"{t}_participation_score",
+                        Unbounded(shape=(n, 1), dtype=torch.float32)
+                    )
+                
+                # Shared graph data (same for all types)
                 self.observation_spec.set("agent_grid_edge_index", Unbounded(shape=self.agent_grid_edge_index.shape, dtype=torch.long))
-                # Add grid node features spec
-                # Shape: (N_grid_nodes, 2) [kW, kvar]
                 self.observation_spec.set("grid_node_features", Unbounded(shape=(self.n_grid_nodes, 2), dtype=torch.float32))
-                # Add participation score spec for agent node features in GNN
-                # Shape: (n_agents, 1) - one score per agent
                 self.observation_spec.set("participation_score", Unbounded(shape=(self.max_agents, 1), dtype=torch.float32))
 
                 # Add adjacency tensors to observation spec so they are passed to the model
@@ -152,15 +181,32 @@ class VariableAgentMultiAgentEnv(MultiAgentEnv):
                 scores[i, 0] = agent.participation_score
         return scores
 
+    def _get_type_participation_scores(self, agent_type):
+        """Get participation scores for agents of a specific type."""
+        type_agents = self._type_agents[agent_type]
+        scores = torch.zeros(len(type_agents), 1, dtype=torch.float32)
+        for i, agent in enumerate(type_agents):
+            if hasattr(agent, 'participation_score'):
+                scores[i, 0] = agent.participation_score
+        return scores
 
-    def _compute_agent_grid_mapping(self):
+
+    def _compute_agent_grid_mapping(self, agent_subset=None):
+        """Compute edge index mapping agents to grid nodes.
+        
+        Args:
+            agent_subset: Optional list of agent objects. If provided, indices
+                are local (0..len(subset)-1). If None, uses all self.agents.
+        """
         if not hasattr(self, 'grid_nodes'): return None
         
+        agents_to_map = agent_subset if agent_subset is not None else self.agents
+        
         node_map = {name: i for i, name in enumerate(self.grid_nodes)}
-        edges_src = [] # Agent index
+        edges_src = [] # Agent index (local to subset)
         edges_dst = [] # Grid Node index
         
-        for agent_idx, agent in enumerate(self.agents):
+        for agent_idx, agent in enumerate(agents_to_map):
             bus = None
             if hasattr(agent, 'bus'):
                 bus = agent.bus
@@ -222,6 +268,7 @@ class VariableAgentMultiAgentEnv(MultiAgentEnv):
         # If min and max are equal, skip usage of np.random to ensure consistency
         if min_evs == max_evs and min_pvs == max_pvs and min_storage == max_storage:
              self.active_mask = torch.ones(self.max_agents, dtype=torch.bool)
+             self._sync_type_masks_from_flat()
              return
         
         # Get available buses
@@ -252,15 +299,15 @@ class VariableAgentMultiAgentEnv(MultiAgentEnv):
             # n_to_activate = np.random.randint(actual_min, actual_max + 1)
             # print(f"[Sampling] Type {agent_prefix}: Activating {n_to_activate} / {actual_max} agents")
             
-            # Use torch random for sampling
-            n_to_activate = int(torch.randint(actual_min, actual_max + 1, (1,)).item())
+            # Use per-instance RNG for reproducibility
+            n_to_activate = int(self.rng.randint(actual_min, actual_max + 1))
             
             if n_to_activate == 0:
                 return []
             
             if allow_multi:
                 # Can have multiple agents per node - just sample from all
-                perm = torch.randperm(len(type_agents))
+                perm = self.rng.permutation(len(type_agents))
                 selected_indices = perm[:n_to_activate].tolist()
                 return [type_agents[i][1] for i in selected_indices]
             else:
@@ -284,7 +331,7 @@ class VariableAgentMultiAgentEnv(MultiAgentEnv):
                     return []
                 
                 # Sample buses
-                perm_buses = torch.randperm(len(available_busses))
+                perm_buses = self.rng.permutation(len(available_busses))
                 selected_bus_indices = perm_buses[:n_to_select].tolist()
                 selected_busses = [available_busses[i] for i in selected_bus_indices]
                 
@@ -293,7 +340,7 @@ class VariableAgentMultiAgentEnv(MultiAgentEnv):
                 for bus in selected_busses:
                     agents_at_bus = bus_to_agents[bus]
                     # Pick one agent
-                    idx_on_bus = int(torch.randint(0, len(agents_at_bus), (1,)).item())
+                    idx_on_bus = int(self.rng.randint(0, len(agents_at_bus)))
                     selected.append(agents_at_bus[idx_on_bus])
                 
                 return selected
@@ -311,6 +358,19 @@ class VariableAgentMultiAgentEnv(MultiAgentEnv):
         if not self.active_mask.any():
             # Fallback: activate first agent
             self.active_mask[0] = True
+        
+        # Sync per-type masks from the flat active_mask
+        self._sync_type_masks_from_flat()
+
+    def _sync_type_masks_from_flat(self):
+        """Rebuild per-type active masks from the flat self.active_mask."""
+        for t in self.agent_types:
+            type_names = self._type_agent_names[t]
+            mask = torch.zeros(len(type_names), dtype=torch.bool)
+            for i, name in enumerate(type_names):
+                flat_idx = self._agent_name_to_idx[name]
+                mask[i] = self.active_mask[flat_idx]
+            self._type_active_masks[t] = mask
 
     def _sample_pv_scaling_factors(self):
         """
@@ -328,33 +388,64 @@ class VariableAgentMultiAgentEnv(MultiAgentEnv):
         for i, agent in enumerate(self.agents):
             if agent.name.startswith('PV-') and self.active_mask[i]:
                 # Sample a new scaling factor uniformly
-                # Use torch or np depending on preference, sticking to numpy for continuous params
-                sampled_scale = np.random.uniform(min_scale, max_scale)
+                sampled_scale = self.rng.uniform(min_scale, max_scale)
                 agent.scaling_factor = sampled_scale
                 # Re-apply noise and scaling with new factor
                 if hasattr(agent, '_apply_noise_and_scale'):
                     agent._apply_noise_and_scale()
 
+    def _update_ev_connection_masks(self):
+        """Update active_mask for EV agents based on their vehicle connection status.
+        
+        When random_arrival is enabled, each EV agent's mask tracks whether its
+        vehicle is currently connected (arrived and not yet fully departed).
+        Only agents that were 'eligible' for this episode (per _sample_active_agents)
+        can become active.
+        """
+        if not self.variable_agent_config.get('random_arrival', False):
+            return
+        for i, agent in enumerate(self.agents):
+            if agent.name.startswith('EV-') and self._episode_eligible_mask[i]:
+                self.active_mask[i] = getattr(agent, 'is_connected', True)
+        self._sync_type_masks_from_flat()
+
     def _reset(self, tensordict=None, **kwargs):
         # Sample which agents are active for this episode
         self._sample_active_agents()
-        # print(f"DEBUG: Resetting Env. Active Agents: {self.active_mask.sum().item()} / {len(self.active_mask)}")
+        
+        # When random_arrival is enabled, force all EV agents to be eligible
+        # (their actual mask will be driven by per-step connection status)
+        if self.variable_agent_config.get('random_arrival', False):
+            for name, idx in self._agent_name_to_idx.items():
+                if name.startswith('EV-'):
+                    self.active_mask[idx] = True
+            self._sync_type_masks_from_flat()
+        
+        # Store episode-level eligibility (which agents CAN become active)
+        self._episode_eligible_mask = self.active_mask.clone()
         
         # Sample PV scaling factors for active PV agents
         self._sample_pv_scaling_factors()
             
         out = super()._reset(tensordict, **kwargs)
         
-        # Zero out observations for inactive agents
-        obs = out.get(("agents", "observation"))
-        if obs is not None:
-            obs[~self.active_mask] = 0.0
-            out.set(("agents", "observation"), obs)
+        # Update EV masks based on initial connection status (random_arrival mode)
+        self._update_ev_connection_masks()
+        
+        # Zero out observations for inactive agents (per-type)
+        for t in self.agent_types:
+            obs = out.get((t, "observation"))
+            if obs is not None:
+                mask = self._type_active_masks[t]
+                obs[~mask] = 0.0
+                out.set((t, "observation"), obs)
             
-        # Add active mask to tensordict so algorithms can use it
+        # Add active masks
         out.set("active_mask", self.active_mask.clone())
+        for t in self.agent_types:
+            out.set((t, "active_mask"), self._type_active_masks[t].clone())
                 
-        # Inject Graph Data into TensorDict
+        # Inject shared graph data into TensorDict
         if hasattr(self, 'adj_tensors'):
             for k, v in self.adj_tensors.items():
                 out.set(k, v)
@@ -367,52 +458,67 @@ class VariableAgentMultiAgentEnv(MultiAgentEnv):
         if grid_feats is not None:
             out.set("grid_node_features", grid_feats)
         
-        # Add participation scores for agent node features in GNN
+        # Add participation scores (flat for backward compat)
         participation_scores = self._get_participation_scores()
         out.set("participation_score", participation_scores)
+        
+        # Add per-type graph data
+        for t in self.agent_types:
+            if t in self._type_agent_grid_edge_index:
+                out.set(f"{t}_agent_grid_edge_index", self._type_agent_grid_edge_index[t])
+            out.set(f"{t}_participation_score", self._get_type_participation_scores(t))
                 
         return out
 
     def _step(self, tensordict):
-        # Mask actions for inactive agents BEFORE step to ensure they don't affect physics
-        # (e.g. consume power or charge batteries)
-        if hasattr(self, 'active_mask'):
-            actions = tensordict.get(("agents", "action"))
+        # Mask actions for inactive agents BEFORE step (per-type)
+        for t in self.agent_types:
+            actions = tensordict.get((t, "action"))
             if actions is not None:
-                # We modify the action in-place so that the environment executes 
-                # a no-op (0.0) for inactive agents.
-                actions[~self.active_mask] = 0.0
-                tensordict.set(("agents", "action"), actions)
+                mask = self._type_active_masks[t]
+                actions[~mask] = 0.0
+                tensordict.set((t, "action"), actions)
 
         out = super()._step(tensordict)
         
-        # Zero out next observations for inactive agents
-        obs = out.get(("next", "agents", "observation"))
-        if obs is not None:
-            obs[~self.active_mask] = 0.0
-            out.set(("next", "agents", "observation"), obs)
+        # Update EV masks based on current connection status (random_arrival mode)
+        self._update_ev_connection_masks()
+        
+        # Zero out next observations and rewards for inactive agents (per-type)
+        for t in self.agent_types:
+            obs = out.get((t, "observation"))
+            if obs is not None:
+                mask = self._type_active_masks[t]
+                obs[~mask] = 0.0
+                out.set((t, "observation"), obs)
             
-        # Zero out rewards for inactive agents
-        reward = out.get(("next", "agents", "reward"))
-        if reward is not None:
-            reward[~self.active_mask] = 0.0
-            out.set(("next", "agents", "reward"), reward)
+            reward = out.get((t, "reward"))
+            if reward is not None:
+                mask = self._type_active_masks[t]
+                reward[~mask] = 0.0
+                out.set((t, "reward"), reward)
         
-        # Include active mask in output
+        # Include active masks
         out.set("active_mask", self.active_mask.clone())
+        for t in self.agent_types:
+            out.set((t, "active_mask"), self._type_active_masks[t].clone())
         
-        # Inject graph data for next observation
+        # Inject shared graph data
         if hasattr(self, 'agent_grid_edge_index') and self.agent_grid_edge_index is not None:
             out.set("agent_grid_edge_index", self.agent_grid_edge_index)
         
-        # Add grid node features
         grid_feats = self._get_current_grid_features()
         if grid_feats is not None:
             out.set("grid_node_features", grid_feats)
         
-        # Add participation scores for agent node features in GNN
         participation_scores = self._get_participation_scores()
         out.set("participation_score", participation_scores)
+        
+        # Per-type graph data
+        for t in self.agent_types:
+            if t in self._type_agent_grid_edge_index:
+                out.set(f"{t}_agent_grid_edge_index", self._type_agent_grid_edge_index[t])
+            out.set(f"{t}_participation_score", self._get_type_participation_scores(t))
                 
         return out
 
@@ -478,6 +584,13 @@ class PowerGridworldVariableClass(TaskClass):
                             "vehicle_multiplier": config.get("vehicle_multiplier", 1.0),
                             "rescale_spaces": config.get("rescale_spaces", False),
                             "unserved_penalty": config.get("unserved_penalty", 0.0),
+                            "urgency_coef": config.get("urgency_coef", 0.0),
+                            "peak_penalty": config.get("peak_penalty", 1.0),
+                            "reward_scale": config.get("reward_scale", 1.0),
+                            "random_arrival": config.get("random_arrival", False),
+                            "arrival_probability": config.get("arrival_probability", 0.05),
+                            "min_charge_duration_min": config.get("min_charge_duration_min", 60),
+                            "max_charge_duration_min": config.get("max_charge_duration_min", 240),
                         }
                     })
             else:
@@ -496,6 +609,13 @@ class PowerGridworldVariableClass(TaskClass):
                             "vehicle_multiplier": config.get("vehicle_multiplier", 1.0),
                             "rescale_spaces": config.get("rescale_spaces", False),
                             "unserved_penalty": config.get("unserved_penalty", 0.0),
+                            "urgency_coef": config.get("urgency_coef", 0.0),
+                            "peak_penalty": config.get("peak_penalty", 1.0),
+                            "reward_scale": config.get("reward_scale", 1.0),
+                            "random_arrival": config.get("random_arrival", False),
+                            "arrival_probability": config.get("arrival_probability", 0.05),
+                            "min_charge_duration_min": config.get("min_charge_duration_min", 60),
+                            "max_charge_duration_min": config.get("max_charge_duration_min", 240),
                         }
                     })
         
@@ -600,6 +720,7 @@ class PowerGridworldVariableClass(TaskClass):
             "allow_multiple_agents_per_node": allow_multi,
             "min_pv_scaling_factor": config.get("min_pv_scaling_factor", config.get("pv_scaling_factor", 1.0)),
             "max_pv_scaling_factor": config.get("max_pv_scaling_factor", config.get("pv_scaling_factor", 1.0)),
+            "random_arrival": config.get("random_arrival", False),
         }
 
         # Common config
@@ -645,18 +766,28 @@ class PowerGridworldVariableClass(TaskClass):
             "variable_agent_config": variable_agent_config,
         }
 
-        # Return a function that creates the environment
-        return lambda: VariableAgentMultiAgentEnv(**env_config)
+        # Capture seed so the env is seeded on construction (for test envs);
+        # ParallelEnv workers will additionally call _set_seed with per-worker seeds.
+        _seed = seed
+
+        def _make_env():
+            env = VariableAgentMultiAgentEnv(**env_config)
+            if _seed is not None:
+                env._set_seed(_seed)
+            return env
+
+        return _make_env
     
     def get_reward_sum_transform(self, env: EnvBase) -> Transform:
-        """Define the reward sum transform with proper keys."""
+        """Define the reward sum transform with per-type group keys."""
         from torchrl.envs.transforms import RewardSum
     
-        # Use flat keys for rewards
-        return RewardSum(
-            in_keys=[("agents", "reward")],
-            out_keys=[("agents", "reward_sum")] # It's good practice to nest the output too
-        )
+        # Build reward keys for each agent type group
+        group_map = self.group_map(env)
+        in_keys = [(group, "reward") for group in group_map.keys()]
+        out_keys = [(group, "reward_sum") for group in group_map.keys()]
+        
+        return RewardSum(in_keys=in_keys, out_keys=out_keys)
     
     def _reward_spec(self):
         """Return the reward spec for the environment."""
@@ -679,11 +810,19 @@ class PowerGridworldVariableClass(TaskClass):
         return 100
 
     def group_map(self, env: EnvBase) -> Dict[str, List[str]]:
-        # The group map mapping group names to agent names
-        # The data in the tensordict will havebe presented this way
+        # Return per-type agent groups from the environment
         if hasattr(env, "group_map"):
             return env.group_map
-        return {"agents": [agent.name for agent in env.agents]}
+        # Fallback: classify by name prefix
+        groups = {}
+        for agent in env.agents:
+            for prefix in ["EV", "PV", "Storage"]:
+                if agent.name.startswith(prefix + "-"):
+                    groups.setdefault(prefix, []).append(agent.name)
+                    break
+            else:
+                groups.setdefault("Other", []).append(agent.name)
+        return groups
 
     def observation_spec(self, env: EnvBase) -> CompositeSpec:
         # A spec for the observation.
@@ -717,19 +856,23 @@ class PowerGridworldVariableClass(TaskClass):
 
     def log_info(self, batch: TensorDictBase) -> Dict[str, float]:
         # Optionally return a str->float dict with extra things to log
-        # This function has access to the collected batch and is optional
         logs = {}
         if "active_mask" in batch.keys():
-            # active_mask shape: (batch_size, n_agents)
             mask = batch["active_mask"]
-            # Convert boolean to float and sum over agents (dim=-1)
             active_counts = mask.float().sum(dim=-1)
-            # Log the mean, min, and max active agents in the batch
             logs["counters/num_active_agents_mean"] = active_counts.mean().item()
             logs["counters/num_active_agents_min"] = active_counts.min().item()
             logs["counters/num_active_agents_max"] = active_counts.max().item()
-            # print(f"Active Agents in Batch: {active_counts.mean().item():.2f}")
-        else:
-            # print(f"Active mask not found in batch keys: {batch.keys()}")
-            pass
+        
+        # Log per-type active counts
+        for t in ["EV", "PV", "Storage"]:
+            key = (t, "active_mask")
+            try:
+                type_mask = batch.get(key, None)
+                if type_mask is not None:
+                    type_counts = type_mask.float().sum(dim=-1)
+                    logs[f"counters/num_active_{t}_mean"] = type_counts.mean().item()
+            except Exception:
+                pass
+        
         return logs

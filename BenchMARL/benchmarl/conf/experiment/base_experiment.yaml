@@ -9,6 +9,8 @@ train_device: "cpu"
 # The device for the replay buffer of off-policy algorithms (e.g. cuda).
 # Use "disk" to store it on disk (in the experiment save_folder)
 buffer_device: "cpu"
+# The device used for forward pass in collection
+collection_policy_device: "cpu"
 
 # Whether to share the parameters of the policy within agent groups
 share_policy_params: True

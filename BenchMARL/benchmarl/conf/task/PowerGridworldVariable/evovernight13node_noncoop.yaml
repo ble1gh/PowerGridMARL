@@ -4,8 +4,8 @@ defaults:
 
 agents: [EVChargingEnv, PVEnv, EnergyStorageEnv]  # Agent types available
 
-start_time: "08-12-2020 20:00:00"
-end_time: "08-13-2020 08:00:00"
+start_time: "08-12-2020 12:00:00"
+end_time: "08-13-2020 12:00:00"
 control_timedelta: 900 #seconds
 
 # Variable agent configuration
@@ -44,6 +44,15 @@ vehicle_multiplier: 140.
 rescale_spaces: False
 unserved_penalty: 100.
 reward_scale: 1
+urgency_coef: 50.
+
+# Random EV arrival parameters
+# When enabled, each vehicle arrives stochastically during the episode
+# and stays for a random duration drawn from [min, max].
+random_arrival: True
+arrival_probability: 0.05        # Per-timestep probability that an inactive vehicle arrives
+min_charge_duration_min: 60      # Minimum charging stay (minutes)
+max_charge_duration_min: 240     # Maximum charging stay (minutes)
 
 # Global reward penalty scaling parameters
 power_loss_penalty: 0   # Scaling factor for power loss reward (higher = more penalty)

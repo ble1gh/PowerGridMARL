@@ -1,0 +1,61 @@
+defaults:
+  - hgteamsac_config
+  - _self_
+
+# --- HGTeam architecture parameters (shared with HGTeam PPO) -----------
+share_param_critic: True
+scale_mapping: "biased_softplus_1.0"
+use_tanh_normal: False
+use_beta: True
+beta_min_param: 1.0
+
+share_critic_across_groups: True
+centralised_value_per_agent: True
+critic_embed_dim: 32
+gnn_mode: "learned_query"
+hypernet_hidden_dim: 8
+hypernet_feature_dim: 64
+stochastic_hypernet: True
+embedding_entropy_coef: 0.0
+embedding_diversity_coef: 0.0
+
+# GNN configuration
+gnn_num_layers: 2
+gnn_heads: 2
+gnn_concat_heads: False
+gnn_use_beta: True
+gnn_self_loops: True
+gnn_agent_node_feature_key: "participation_score"
+gnn_agent_node_feature_dim: 1
+gnn_norm_class: null
+
+# Split-z
+split_z: False
+z_token_dim: 32
+z_query_dim: 32
+stochastic_z_query: False
+
+# VIB
+use_vib: False
+vib_beta: 0.01
+vib_warmup_frames: 500000
+
+# --- SAC-specific parameters -------------------------------------------
+alpha_init: 1.0
+target_entropy: "auto"
+num_qvalue_nets: 2
+fixed_alpha: False
+delay_qvalue: True
+min_alpha: null
+max_alpha: null
+loss_function: "l2"
+
+# --- Gradient control ---------------------------------------------------
+detach_action_from_q: False    # Both gradient paths ON by default
+detach_z_from_transformer: True  # Block indirect GNN gradient (Q->action->Transformer->z->GNN)
+critic_use_mu: True            # Feed mu to Q-network for direct gradient path
+
+# --- Learning rates (per optimizer group) --------------------------------
+lr_actor: 3e-4       # Transformer parameters
+lr_encoder: 1e-4     # GNN (encoder) parameters
+lr_critic: 3e-4      # Q-network parameters

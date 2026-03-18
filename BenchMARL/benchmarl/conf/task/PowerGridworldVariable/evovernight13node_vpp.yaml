@@ -1,21 +1,21 @@
 defaults:
-  - PowerGridworldVariable_evovernight13node_simple_config
+  - PowerGridworldVariable_evovernight13node_vpp_config
   - _self_
 
 agents: [EVChargingEnv, PVEnv, EnergyStorageEnv]  # Agent types available
 
-start_time: "08-12-2020 20:00:00"
-end_time: "08-13-2020 08:00:00"
-control_timedelta: 900 #seconds
+start_time: "08-12-2020 12:00:00"
+end_time: "08-14-2020 12:00:00"
+control_timedelta: 1800 #seconds
 
 # Variable agent configuration
 # Min/max number of each agent type (sampled uniformly at each episode reset)
-min_EVs: 6
-max_EVs: 11
-min_PVs: 3
-max_PVs: 7
-min_Storage: 2
-max_Storage: 5
+min_EVs: 10
+max_EVs: 20
+min_PVs: 25
+max_PVs: 25
+min_Storage: 5
+max_Storage: 8
 
 # Possible buses where each agent type can be located
 EV_busses: ['634a', '634b', '634c', '645', '675a', '675b', '675c', '670a', '670b', '670c', '684c']
@@ -33,21 +33,30 @@ system_load_rescale_factor: 0.9
 load_noise_std: 0.0  # DEPRECATED legacy param (kept for backward compat, set to 0 when using new params)
 load_forecast_noise_std: 0.03  # Per-node noise on load coefficient that agents/GNN observe
 load_actual_noise_std: 0.03   # Per-node noise on top of forecast used in power flow
-include_load_in_agent_obs: False  # If True, append normalized load coefficient to each agent's observation
+include_load_in_agent_obs: True  # If True, append normalized load coefficient to each agent's observation
 
 # EV agent parameters
 num_vehicles: 1
 minutes_per_step: 15
 max_charge_rate_kw: 7.
 peak_threshold: 700.
-vehicle_multiplier: 140.
-rescale_spaces: False
-unserved_penalty: 10.
+vehicle_multiplier: 1.
+rescale_spaces: True
+unserved_penalty: 100.
+urgency_coef: 100.
 reward_scale: 1
+
+# Random EV arrival parameters
+# When enabled, each vehicle arrives stochastically during the episode
+# and stays for a random duration drawn from [min, max].
+random_arrival: True
+arrival_probability: 0.05        # Per-timestep probability that an inactive vehicle arrives
+min_charge_duration_min: 240      # Minimum charging stay (minutes)
+max_charge_duration_min: 720     # Maximum charging stay (minutes)
 
 # Global reward penalty scaling parameters
 power_loss_penalty: 0   # Scaling factor for power loss reward (higher = more penalty)
-voltage_penalty: 5e3     # Scaling factor for voltage violation reward (higher = more penalty)
+voltage_penalty: 1e3     # Scaling factor for voltage violation reward (higher = more penalty)
 cooperative_voltage: False # If True, voltage penalty is applied to all agents. If False, only to agents at violating node.
 load_2norm_penalty: 0         # Scaling factor for load penalty (higher = more penalty)
 tracking_reward_penalty: 0    # Scaling factor for tracking reward (disabled for VPP task)
@@ -57,7 +66,7 @@ pv_profile_csv: "pv_profile.csv"
 pv_scaling_factor: 1.0  # Used when min/max are equal or not specified
 min_pv_scaling_factor: 5.0  # Minimum PV capacity (kW) when sampling
 max_pv_scaling_factor: 10.0  # Maximum PV capacity (kW) when sampling
-pv_profile_noise_std: 0.0  # Std dev of Gaussian noise on normalized PV profile (0 = no noise)
+pv_profile_noise_std: 0.05  # Std dev of Gaussian noise on normalized PV profile (0 = no noise)
 pv_grid_aware: False
 
 # Energy Storage agent parameters
@@ -70,7 +79,7 @@ discharge_efficiency: 0.9
 max_power: 15.0
 
 # Signal tracking parameters
-signal_tracking: False  # Disabled — VPP reward replaces signal tracking for this task
+signal_tracking: False  # Disabled — VPP reward replaces signal tracking for this task. If this is enabled with rescale spaces, it always produces 1 in the observation space
 track_total_load: False
 setpoint: 0.
 
@@ -78,5 +87,5 @@ setpoint: 0.
 # When enabled, agents are rewarded for collectively hitting a power production setpoint.
 # PV/Storage contribution = net injection (-real_power). EV contribution = demand response (max_draw - actual_draw).
 vpp_reward: True
-vpp_setpoint: 500.0    # Target VPP production (kW)
-vpp_reward_penalty: 1e2  # Scaling factor for quadratic VPP tracking penalty
+vpp_setpoint: 25.0    # Target VPP production (kW)
+vpp_reward_penalty: 1e-1  # Scaling factor for quadratic VPP tracking penalty

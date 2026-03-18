@@ -14,8 +14,8 @@ def to_scaled(
 ) -> np.ndarray:
     """Scale the input arr in [low, high] to [-1, 1]"""
 
-    # Warn the user if the arguments are out of bounds, this shouldn't happend.
-    if not np.all(x >= low) and np.all(x <= high):
+    # Warn the user if the arguments are out of bounds, this shouldn't happen.
+    if not (np.all(x >= low) and np.all(x <= high)):
         logger.warning(f"argument out of bounds, {x}, {low}, {high}")
     
     # Clip the values (in case the above warning is ignored).

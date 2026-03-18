@@ -42,6 +42,13 @@ class TaskConfig:
     rescale_spaces: bool = MISSING
     unserved_penalty: float = MISSING
     reward_scale: float = MISSING
+    urgency_coef: float = MISSING
+
+    # Random EV arrival parameters
+    random_arrival: bool = MISSING
+    arrival_probability: float = MISSING
+    min_charge_duration_min: int = MISSING
+    max_charge_duration_min: int = MISSING
     
     # Global reward penalty scaling parameters
     power_loss_penalty: float = MISSING

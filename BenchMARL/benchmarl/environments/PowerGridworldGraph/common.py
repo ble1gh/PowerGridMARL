@@ -293,6 +293,12 @@ class PowerGridworldGraphClass(TaskClass):
                             "vehicle_multiplier": config.get("vehicle_multiplier", 1.0),
                             "rescale_spaces": config.get("rescale_spaces", False),
                             "unserved_penalty": config.get("unserved_penalty", 0.0),
+                            "peak_penalty": config.get("peak_penalty", 1.0),
+                            "reward_scale": config.get("reward_scale", 1.0),
+                            "random_arrival": config.get("random_arrival", False),
+                            "arrival_probability": config.get("arrival_probability", 0.05),
+                            "min_charge_duration_min": config.get("min_charge_duration_min", 60),
+                            "max_charge_duration_min": config.get("max_charge_duration_min", 240),
                         }
                     })
         
