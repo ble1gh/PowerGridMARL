@@ -54,6 +54,8 @@ def parse_args():
     parser.add_argument("--z-token-dim", type=int, default=32)
     parser.add_argument("--z-query-dim", type=int, default=32)
     parser.add_argument("--stochastic-z-query", type=lambda x: x.lower() != "false", default=False)
+    parser.add_argument("--scale-lb", type=float, default=0.0001,
+                        help="Minimum std for NormalParamExtractor (ignored when use_beta=True)")
 
     # --- VIB (Variational Information Bottleneck) ---
     parser.add_argument("--use-vib", type=lambda x: x.lower() != "false", default=False)
@@ -205,6 +207,7 @@ def main():
     algorithm_config.z_token_dim = args.z_token_dim
     algorithm_config.z_query_dim = args.z_query_dim
     algorithm_config.stochastic_z_query = args.stochastic_z_query
+    algorithm_config.scale_lb = args.scale_lb
     algorithm_config.use_vib = args.use_vib
     algorithm_config.vib_beta = args.vib_beta
     algorithm_config.vib_warmup_frames = args.vib_warmup_frames
