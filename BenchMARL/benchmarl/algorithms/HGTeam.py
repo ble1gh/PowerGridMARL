@@ -4,6 +4,7 @@
 #  LICENSE file in the root directory of this source tree.
 #
 
+import warnings
 from dataclasses import dataclass, MISSING
 from typing import Dict, Iterable, Optional, Tuple, Type, List
 
@@ -150,7 +151,7 @@ class HGTeamBase(Algorithm):
         beta_min_param: float,
         share_critic_across_groups: bool = False,
         centralised_value_per_agent: bool = False,
-        gnn_mode: str = "none",
+        gnn_mode: str = "none",  # "none", "concat", "hypernetwork", or "learned_query"
         z_dim: int = None,
         hypernet_actor_feature_dim: int = None,
         stochastic_z: bool = False,
@@ -194,13 +195,63 @@ class HGTeamBase(Algorithm):
         self.hypernet_actor_feature_dim = hypernet_actor_feature_dim
         self.stochastic_z = stochastic_z
 
-        # Mode-specific validation
+        # Mode-specific validation (hard errors)
         if gnn_mode != "none" and z_dim is None:
             raise ValueError(f"z_dim is required when gnn_mode='{gnn_mode}'")
         if gnn_mode == "hypernetwork" and hypernet_actor_feature_dim is None:
             raise ValueError("hypernet_actor_feature_dim is required when gnn_mode='hypernetwork'")
         if gnn_mode != "none" and split_z and gnn_mode != "learned_query":
             raise ValueError(f"split_z is only supported with gnn_mode='learned_query', got '{gnn_mode}'")
+
+        # Mode-specific validation (warnings for ignored flags)
+        if gnn_mode == "none":
+            _ignored = []
+            if stochastic_z:
+                _ignored.append("stochastic_z")
+            if z_dim is not None:
+                _ignored.append("z_dim")
+            if hypernet_actor_feature_dim is not None:
+                _ignored.append("hypernet_actor_feature_dim")
+            if split_z:
+                _ignored.append("split_z")
+            if embedding_entropy_coef > 0:
+                _ignored.append("embedding_entropy_coef")
+            if embedding_diversity_coef > 0:
+                _ignored.append("embedding_diversity_coef")
+            if _ignored:
+                warnings.warn(
+                    f"gnn_mode='none' but the following GNN-related flags are set "
+                    f"and will be ignored: {', '.join(_ignored)}",
+                    stacklevel=2,
+                )
+        else:
+            if gnn_mode != "hypernetwork" and hypernet_actor_feature_dim is not None:
+                warnings.warn(
+                    f"hypernet_actor_feature_dim={hypernet_actor_feature_dim} is set "
+                    f"but only used when gnn_mode='hypernetwork' (current: '{gnn_mode}')",
+                    stacklevel=2,
+                )
+            if split_z and stochastic_z:
+                warnings.warn(
+                    "stochastic_z=True is ignored when split_z=True; "
+                    "use stochastic_z_query to control stochasticity in split-z mode",
+                    stacklevel=2,
+                )
+            if not split_z:
+                _split_ignored = []
+                if z_token_dim != 32:
+                    _split_ignored.append(f"z_token_dim={z_token_dim}")
+                if z_query_dim != 32:
+                    _split_ignored.append(f"z_query_dim={z_query_dim}")
+                if not stochastic_z_query:
+                    _split_ignored.append("stochastic_z_query=False")
+                if _split_ignored:
+                    warnings.warn(
+                        f"split_z=False but split-z params are set to non-defaults "
+                        f"and will be ignored: {', '.join(_split_ignored)}",
+                        stacklevel=2,
+                    )
+
         self.embedding_entropy_coef = embedding_entropy_coef
         self.embedding_diversity_coef = embedding_diversity_coef
 
