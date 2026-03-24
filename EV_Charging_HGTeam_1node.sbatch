@@ -97,7 +97,7 @@ GPU_MONITOR_PID=$!
 python run_hgteam_mlp.py \
     --seed 42 \
     --project-name "PowerGridworldVariable_VPP" \
-    --wandb-name "HGTeam_$(date +%Y%m%d)_${SLURM_JOB_ID}_tanhnormal_scalelb_0.01_H0.0" \
+    --wandb-name "HGTeam_$(date +%Y%m%d)_${SLURM_JOB_ID}_tanhnormal_scalelb_0.05_H0.01_refactor" \
     --max-n-frames 10000000 \
     --lr 5e-5 \
     --evaluation-interval 12288 \
@@ -106,19 +106,19 @@ python run_hgteam_mlp.py \
     --frames-per-batch 12288 \
     --minibatch-size 256 \
     --n-minibatch-iters 5 \
-    --entropy-coef 0.0 \
+    --entropy-coef 0.01 \
     --gnn-mode concat \
     --embedding-entropy-coef 0 \
     --embedding-diversity-coef 0 \
-    --stochastic-hypernet true \
-    --hypernet-hidden-dim 32 \
-    --hypernet-feature-dim 64 \
+    --stochastic-z true \
+    --z-dim 32 \
+    --hypernet-actor-feature-dim 64 \
     --gnn-norm-class LayerNorm \
     --split-z false \
     --z-token-dim 32 \
     --z-query-dim 32 \
     --stochastic-z-query true \
-    --scale-lb 0.01 \
+    --scale-lb 0.05 \
     --reward-scale 100000 \
     --use-vib true \
     --vib-warmup-frames 500000 \

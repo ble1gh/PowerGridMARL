@@ -73,9 +73,9 @@ def build_experiment() -> Experiment:
     algorithm_config.gnn_mode = "learned_query"
     algorithm_config.embedding_entropy_coef = 0.0
     algorithm_config.embedding_diversity_coef = 0.0
-    algorithm_config.stochastic_hypernet = False
-    algorithm_config.hypernet_hidden_dim = 8
-    algorithm_config.hypernet_feature_dim = 16
+    algorithm_config.stochastic_z = False
+    algorithm_config.z_dim = 8
+    algorithm_config.hypernet_actor_feature_dim = 16
     algorithm_config.gnn_norm_class = None
     algorithm_config.gnn_num_layers = 1
     algorithm_config.gnn_heads = 1

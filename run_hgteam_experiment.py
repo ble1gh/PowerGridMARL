@@ -41,9 +41,9 @@ def parse_args():
                         choices=["none", "concat", "hypernetwork", "learned_query"])
     parser.add_argument("--embedding-entropy-coef", type=float, default=1.0)
     parser.add_argument("--embedding-diversity-coef", type=float, default=0.001)
-    parser.add_argument("--stochastic-hypernet", type=lambda x: x.lower() != "false", default=True)
-    parser.add_argument("--hypernet-hidden-dim", type=int, default=32)
-    parser.add_argument("--hypernet-feature-dim", type=int, default=64)
+    parser.add_argument("--stochastic-z", type=lambda x: x.lower() != "false", default=True)
+    parser.add_argument("--z-dim", type=int, default=32)
+    parser.add_argument("--hypernet-actor-feature-dim", type=int, default=64)
     parser.add_argument("--gnn-norm-class", type=str, default="LayerNorm",
                         choices=["null", "LayerNorm", "BatchNorm1d", "InstanceNorm1d", "GroupNorm"])
     parser.add_argument("--split-z", type=lambda x: x.lower() != "false", default=False)
@@ -193,9 +193,9 @@ def main():
     algorithm_config.gnn_mode = args.gnn_mode
     algorithm_config.embedding_entropy_coef = args.embedding_entropy_coef
     algorithm_config.embedding_diversity_coef = args.embedding_diversity_coef
-    algorithm_config.stochastic_hypernet = args.stochastic_hypernet
-    algorithm_config.hypernet_hidden_dim = args.hypernet_hidden_dim
-    algorithm_config.hypernet_feature_dim = args.hypernet_feature_dim
+    algorithm_config.stochastic_z = args.stochastic_z
+    algorithm_config.z_dim = args.z_dim
+    algorithm_config.hypernet_actor_feature_dim = args.hypernet_actor_feature_dim
     algorithm_config.gnn_norm_class = None if args.gnn_norm_class == "null" else args.gnn_norm_class
     algorithm_config.split_z = args.split_z
     algorithm_config.z_token_dim = args.z_token_dim

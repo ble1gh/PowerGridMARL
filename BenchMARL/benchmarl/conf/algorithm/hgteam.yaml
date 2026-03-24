@@ -21,9 +21,9 @@ share_critic_across_groups: True
 centralised_value_per_agent: True
 critic_embed_dim: 32
 gnn_mode: "learned_query"  # Options: "none", "concat", "hypernetwork", "learned_query"
-hypernet_hidden_dim: 8
-hypernet_feature_dim: 64
-stochastic_hypernet: True
+z_dim: 32
+hypernet_actor_feature_dim: 64
+stochastic_z: True
 embedding_entropy_coef: 0.0
 embedding_diversity_coef: 0.0
 

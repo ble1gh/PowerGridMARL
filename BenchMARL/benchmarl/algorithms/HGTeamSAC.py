@@ -16,7 +16,12 @@ from torchrl.data import Composite, Unbounded
 from torchrl.objectives import LossModule, SACLoss, ValueEstimators
 
 from benchmarl.algorithms.common import AlgorithmConfig
-from benchmarl.algorithms.HGTeam import HGTeam, EmbeddingProcessor, HyperNetworkJoiner
+from benchmarl.algorithms.HGTeam import HGTeamBase
+from benchmarl.algorithms.hgteam_modules import (
+    EmbeddingProcessor,
+    HyperNetworkJoiner,
+    merge_embedding_losses,
+)
 from benchmarl.models import HeteroGnnConfig
 from benchmarl.models.heterognn import HeteroGNN
 
@@ -139,38 +144,39 @@ class HGTeamSACLoss(SACLoss):
                 part_clone.retain_grad()
                 self._grad_participation_ref = part_clone
 
+        # --- Snapshot z tensors BEFORE any mutations -----------------------
+        # Capture originals for ALL groups so that detach_z and VIB SNI can
+        # mutate freely; a single restore pass at the end is order-independent.
+        _z_stash: dict[tuple, torch.Tensor] = {}
+        _z_keys = ("embedding_z", "embedding_z_token")
+        for g in self.algorithm.group_map.keys():
+            for zk in _z_keys:
+                val = tensordict.get((g, zk), None)
+                if val is not None:
+                    _z_stash[(g, zk)] = val
+
         # --- Detach z from Transformer (block indirect GNN gradient) ----
-        _z_token_stash = None
-        _z_query_stash = None
         if self.algorithm.detach_z_from_transformer:
             z_token = tensordict.get((self.group, "embedding_z_token"), None)
             z_query = tensordict.get((self.group, "embedding_z"), None)
             if z_token is not None:
-                _z_token_stash = z_token
                 tensordict.set((self.group, "embedding_z_token"), z_token.detach())
             if z_query is not None:
-                _z_query_stash = z_query
                 tensordict.set((self.group, "embedding_z"), z_query.detach())
 
         # --- VIB SNI: use deterministic mu for SAC loss computation -----
-        _sni_stash = None
         if self.algorithm.use_vib:
             embedding_mu = tensordict.get((self.group, "embedding_mu"), None)
             embedding_z_pre = tensordict.get((self.group, "embedding_z"), None)
             if embedding_mu is not None and embedding_z_pre is not None:
-                _sni_stash = embedding_z_pre
                 tensordict.set((self.group, "embedding_z"), embedding_mu)
 
         # --- FORWARD: standard SAC losses ------------------------------
         out = super().forward(tensordict)
 
-        # --- Restore z after SAC forward --------------------------------
-        if _sni_stash is not None:
-            tensordict.set((self.group, "embedding_z"), _sni_stash)
-        if _z_query_stash is not None:
-            tensordict.set((self.group, "embedding_z"), _z_query_stash)
-        if _z_token_stash is not None:
-            tensordict.set((self.group, "embedding_z_token"), _z_token_stash)
+        # --- Restore z tensors from snapshot ----------------------------
+        for key, val in _z_stash.items():
+            tensordict.set(key, val)
 
         # --- POST-FORWARD: retain_grad on embedding_z -------------------
         embedding_z = tensordict.get((self.group, "embedding_z"), None)
@@ -183,16 +189,10 @@ class HGTeamSACLoss(SACLoss):
             z_token.retain_grad()
             self._grad_embedding_z_token_ref = z_token
 
-        # --- Compute auxiliary embedding losses -------------------------
-        embedding_losses = self.algorithm._compute_embedding_losses(
-            self.group, tensordict
+        # --- Compute and merge embedding auxiliary losses into loss_actor ---
+        merge_embedding_losses(
+            self.algorithm, self.group, tensordict, out, "loss_actor"
         )
-
-        for k, v in embedding_losses.items():
-            out.set(k, v)
-            # Add auxiliary losses to loss_actor (SAC's actor loss key)
-            if k.startswith("loss_") and "loss_actor" in out.keys():
-                out.set("loss_actor", out.get("loss_actor") + v)
 
         return out
 
@@ -201,11 +201,11 @@ class HGTeamSACLoss(SACLoss):
 # Algorithm
 # ======================================================================
 
-class HGTeamSAC(HGTeam):
+class HGTeamSAC(HGTeamBase):
     """HGTeam with SAC instead of PPO.
 
     Inherits the full actor pipeline (GNN → EmbeddingProcessor → Transformer
-    → Beta distribution) from HGTeam.  Replaces the critic with a Q(s,a,μ)
+    → Beta distribution) from HGTeamBase.  Replaces the critic with a Q(s,a,μ)
     network and uses SACLoss for differentiable gradient flow from Q to actor.
     """
 
@@ -230,10 +230,6 @@ class HGTeamSAC(HGTeam):
         lr_critic: float = 3e-4,
         **kwargs,
     ):
-        # Pass dummy PPO params to parent — they won't be used
-        kwargs.setdefault("clip_epsilon", 0.2)
-        kwargs.setdefault("lmbda", 0.95)
-        kwargs.setdefault("minibatch_advantage", False)
         super().__init__(**kwargs)
 
         # SAC-specific
@@ -446,7 +442,7 @@ class HGTeamSAC(HGTeam):
         if self.split_z and self.gnn_mode == "learned_query":
             mu_dim = self.z_query_dim
         elif self.gnn_mode != "none":
-            mu_dim = self.hypernet_hidden_dim
+            mu_dim = self.z_dim
         else:
             mu_dim = 0
 
@@ -608,6 +604,7 @@ class HGTeamSACConfig(AlgorithmConfig):
     # --- HGTeam architecture parameters (same as HGTeamConfig) ----------
     share_param_critic: bool = True
     scale_mapping: str = "biased_softplus_1.0"
+    scale_lb: float = 0.1
     use_tanh_normal: bool = False
     use_beta: bool = True
     beta_min_param: float = 1.0
@@ -615,9 +612,9 @@ class HGTeamSACConfig(AlgorithmConfig):
     share_critic_across_groups: bool = True
     centralised_value_per_agent: bool = True
     gnn_mode: str = "learned_query"
-    hypernet_hidden_dim: int = 8
-    hypernet_feature_dim: int = 64
-    stochastic_hypernet: bool = True
+    z_dim: int = 32
+    hypernet_actor_feature_dim: int = 64
+    stochastic_z: bool = True
     embedding_entropy_coef: float = 0.0
     embedding_diversity_coef: float = 0.0
 
@@ -659,15 +656,6 @@ class HGTeamSACConfig(AlgorithmConfig):
     lr_actor: float = 3e-4
     lr_encoder: float = 1e-4
     lr_critic: float = 3e-4
-
-    # --- Unused PPO params (required by HGTeam parent __init__) ---------
-    clip_epsilon: float = 0.2
-    entropy_coef: float = 0.01
-    critic_coef: float = 1.0
-    loss_critic_type: str = "l2"
-    lmbda: float = 0.95
-    minibatch_advantage: bool = False
-    critic_use_other_actions: bool = False
 
     @staticmethod
     def associated_class() -> Type["HGTeamSAC"]:

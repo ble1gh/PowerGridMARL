@@ -99,9 +99,9 @@ python run_hgteam_mlp.py \
     --gnn-mode $GNN_MODE \
     --embedding-entropy-coef 0 \
     --embedding-diversity-coef 0 \
-    --stochastic-hypernet true \
-    --hypernet-hidden-dim 32 \
-    --hypernet-feature-dim 64 \
+    --stochastic-z true \
+    --z-dim 32 \
+    --hypernet-actor-feature-dim 64 \
     --gnn-norm-class LayerNorm \
     --split-z false \
     --z-token-dim 32 \

@@ -5,6 +5,7 @@ defaults:
 # --- HGTeam architecture parameters (shared with HGTeam PPO) -----------
 share_param_critic: True
 scale_mapping: "biased_softplus_1.0"
+scale_lb: 0.1
 use_tanh_normal: False
 use_beta: True
 beta_min_param: 1.0
@@ -13,9 +14,9 @@ share_critic_across_groups: True
 centralised_value_per_agent: True
 critic_embed_dim: 32
 gnn_mode: "learned_query"
-hypernet_hidden_dim: 8
-hypernet_feature_dim: 64
-stochastic_hypernet: True
+z_dim: 32
+hypernet_actor_feature_dim: 64
+stochastic_z: True
 embedding_entropy_coef: 0.0
 embedding_diversity_coef: 0.0
 
@@ -56,6 +57,6 @@ detach_z_from_transformer: True  # Block indirect GNN gradient (Q->action->Trans
 critic_use_mu: True            # Feed mu to Q-network for direct gradient path
 
 # --- Learning rates (per optimizer group) --------------------------------
-lr_actor: 3e-4       # Transformer parameters
-lr_encoder: 1e-4     # GNN (encoder) parameters
-lr_critic: 3e-4      # Q-network parameters
+lr_actor: 0.0003       # Transformer parameters
+lr_encoder: 0.0001     # GNN (encoder) parameters
+lr_critic: 0.0003      # Q-network parameters

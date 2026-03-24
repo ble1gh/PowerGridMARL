@@ -62,9 +62,9 @@ def main():
         minibatch_advantage=True,
         beta_min_param=1.0,
         use_hypernetwork=True,
-        hypernet_hidden_dim=32,
-        hypernet_feature_dim=64,
-        stochastic_hypernet=True,
+        z_dim=32,
+        hypernet_actor_feature_dim=64,
+        stochastic_z=True,
         embedding_entropy_coef=0,
         embedding_diversity_coef=0,
     )

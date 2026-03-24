@@ -24,6 +24,12 @@ from torchrl.modules import (
 from torchrl.objectives import ClipPPOLoss, LossModule, ValueEstimators
 
 from benchmarl.algorithms.common import Algorithm, AlgorithmConfig
+from benchmarl.algorithms.hgteam_modules import (
+    EmbeddingProcessor,
+    HyperNetworkJoiner,
+    merge_embedding_losses,
+    reparameterize,
+)
 from benchmarl.models.common import ModelConfig
 from benchmarl.beta_param_extractor import BetaParamExtractor
 from benchmarl.independent_beta import IndependentBeta
@@ -64,25 +70,35 @@ class HGTeamLoss(ClipPPOLoss):
                 part_clone.retain_grad()
                 self._grad_participation_ref = part_clone
 
+        # --- Snapshot z tensors BEFORE any mutations -----------------------
+        # Capture originals for ALL groups so that VIB SNI (and future
+        # transforms like detach_z) can mutate freely; a single restore pass
+        # at the end is order-independent.
+        _z_stash: dict[tuple, torch.Tensor] = {}
+        _z_keys = ("embedding_z", "embedding_z_token")
+        for g in self.algorithm.group_map.keys():
+            for zk in _z_keys:
+                val = tensordict.get((g, zk), None)
+                if val is not None:
+                    _z_stash[(g, zk)] = val
+
         # --- VIB SNI: use deterministic mu for PPO loss computation --
         # Selective Noise Injection (Igl et al., NeurIPS 2019): during the
         # PPO update, replace stochastic z_query with its deterministic mean
         # so the importance ratio is not corrupted by re-sampled noise.
         # The stochastic z is restored afterwards for the VIB KL term.
-        _sni_stash = None
         if self.algorithm.use_vib:
             embedding_mu = tensordict.get((self.group, "embedding_mu"), None)
             embedding_z_pre = tensordict.get((self.group, "embedding_z"), None)
             if embedding_mu is not None and embedding_z_pre is not None:
-                _sni_stash = embedding_z_pre
                 tensordict.set((self.group, "embedding_z"), embedding_mu)
 
         # --- FORWARD: standard PPO losses --------------------------
         out = super().forward(tensordict)
 
-        # --- VIB SNI: restore stochastic z after PPO forward --------
-        if _sni_stash is not None:
-            tensordict.set((self.group, "embedding_z"), _sni_stash)
+        # --- Restore z tensors from snapshot ------------------------
+        for key, val in _z_stash.items():
+            tensordict.set(key, val)
 
         # --- POST-FORWARD: retain_grad on embedding_z --------------
         embedding_z = tensordict.get((self.group, "embedding_z"), None)
@@ -105,221 +121,39 @@ class HGTeamLoss(ClipPPOLoss):
                 embedding_z.retain_grad()
                 self._grad_embedding_z_ref = embedding_z
 
-        # Compute embedding losses using the input batch (tensordict)
-        embedding_losses = self.algorithm._compute_embedding_losses(self.group, tensordict)
-
-        # Log if we are missing losses unexpectedly
-        if not embedding_losses:
-            if self.algorithm.gnn_mode != "none":
-                print(f"[DEBUG] No embedding losses computed for group '{self.group}' with gnn_mode '{self.algorithm.gnn_mode}'.")
-
-        for k, v in embedding_losses.items():
-            out.set(k, v)
-            # Add auxiliary losses to the main objective so they are optimized
-            if k.startswith("loss_") and "loss_objective" in out.keys():
-                out.set("loss_objective", out.get("loss_objective") + v)
+        # Compute and merge embedding auxiliary losses into loss_objective
+        merge_embedding_losses(
+            self.algorithm, self.group, tensordict, out, "loss_objective"
+        )
 
         return out
 
-class HyperNetworkJoiner(nn.Module):
-    def __init__(
-        self,
-        embedding_dim: int,
-        feature_dim: int,
-        output_dim: int,
-        device: torch.device,
-        stochastic_embedding: bool = False,
-    ):
-        super().__init__()
-        self.embedding_dim = embedding_dim
-        self.feature_dim = feature_dim
-        self.output_dim = output_dim
-        self.stochastic_embedding = stochastic_embedding
-
-        # If stochastic, embedding_dim is actually 2x (mean + logvar)
-        # so the actual latent dim is embedding_dim // 2
-        if stochastic_embedding:
-            self.latent_dim = embedding_dim // 2
-        else:
-            self.latent_dim = embedding_dim
-
-        # Generators (operate on latent_dim, not raw embedding_dim)
-        self.weight_generator = nn.Linear(
-            self.latent_dim, feature_dim * output_dim, device=device
-        )
-        self.bias_generator = nn.Linear(self.latent_dim, output_dim, device=device)
-
-    def forward(self, features: torch.Tensor, embedding: torch.Tensor):
-        # features: (..., n_agents, feature_dim)
-        # embedding: (..., n_agents, embedding_dim)
-        # Returns: (logits, embedding_mean, embedding_logvar) if stochastic, else (logits, embedding, None)
-
-        if self.stochastic_embedding:
-            # Split embedding into mean and log_var
-            mean, log_var = embedding.chunk(2, dim=-1)
-            # Clamp log_var to prevent numerical instability
-            log_var = torch.clamp(log_var, min=-10, max=2)
-            # Reparameterization trick
-            std = torch.exp(0.5 * log_var)
-            eps = torch.randn_like(std)
-            z = mean + eps * std  # Sampled latent
-        else:
-            mean = embedding
-            log_var = None
-            z = embedding
-
-        weights = self.weight_generator(z)
-        weights = weights.view(*weights.shape[:-1], self.feature_dim, self.output_dim)
-        
-        bias = self.bias_generator(z)
-
-        # logits = features * weights + bias
-        logits = torch.einsum("...f,...fo->...o", features, weights)
-        return logits + bias, z, log_var
+# EmbeddingProcessor, HyperNetworkJoiner, reparameterize, and
+# merge_embedding_losses are imported from hgteam_modules.py.
 
 
-class EmbeddingProcessor(nn.Module):
-    """Process GNN embeddings — handles optional split-z and stochastic sampling.
+class HGTeamBase(Algorithm):
+    """Shared architecture base for HGTeam variants (PPO, SAC, HAPPO).
 
-    When ``split_z=False`` (default / legacy), the GNN output is treated as a
-    single embedding that serves as both token and query in the Transformer.
-    Stochastic sampling is controlled by the ``stochastic`` flag.
-
-    When ``split_z=True``, the GNN output is split into two independent
-    vectors:
-      * **z_token** (always deterministic) — prepended to the Transformer KV
-        sequence so self-attention can attend to structural context.
-      * **z_query** (optionally stochastic via ``stochastic_query``) — used as
-        the cross-attention query vector.
-
-    This eliminates gradient interference between the two roles and doubles
-    the representational budget without doubling GNN backbone parameters.
-    """
-
-    def __init__(
-        self,
-        embedding_dim: int,
-        stochastic: bool = False,
-        split_z: bool = False,
-        z_token_dim: int = 32,
-        z_query_dim: int = 32,
-        stochastic_query: bool = True,
-    ):
-        super().__init__()
-        self.split_z = split_z
-        self.stochastic = stochastic
-        self.stochastic_query = stochastic_query
-        self.z_token_dim = z_token_dim
-        self.z_query_dim = z_query_dim
-
-        if split_z:
-            # GNN output layout: [z_token | z_query_mean (| z_query_logvar)]
-            self.latent_dim = z_query_dim  # effective query latent dim
-        elif stochastic:
-            self.latent_dim = embedding_dim // 2
-        else:
-            self.latent_dim = embedding_dim
-
-    def forward(self, embedding: torch.Tensor):
-        # embedding: (..., n_agents, embedding_dim)
-        if self.split_z:
-            return self._forward_split(embedding)
-        return self._forward_legacy(embedding)
-
-    # -- Legacy (single-z) path ------------------------------------------
-    def _forward_legacy(self, embedding: torch.Tensor):
-        """Returns ``(z, mean, log_var)``."""
-        if self.stochastic:
-            mean, log_var = embedding.chunk(2, dim=-1)
-            log_var = torch.clamp(log_var, min=-10, max=2)
-            std = torch.exp(0.5 * log_var)
-            eps = torch.randn_like(std)
-            z = mean + eps * std
-        else:
-            z = embedding
-            mean = embedding  # Deterministic: mean is the value itself
-            log_var = None
-        return z, mean, log_var
-
-    # -- Split-z path ----------------------------------------------------
-    def _forward_split(self, embedding: torch.Tensor):
-        """Returns ``(z_token, z_query, query_mean, query_logvar)``.
-
-        * ``z_token`` is always deterministic (first ``z_token_dim`` dims).
-        * ``z_query`` is reparameterized-sampled when ``stochastic_query``.
-        * ``query_mean`` is the pre-noise mean (needed for VIB KL computation).
-        """
-        z_token = embedding[..., :self.z_token_dim]
-        remainder = embedding[..., self.z_token_dim:]
-
-        if self.stochastic_query:
-            mean, log_var = remainder.chunk(2, dim=-1)
-            log_var = torch.clamp(log_var, min=-10, max=2)
-            std = torch.exp(0.5 * log_var)
-            eps = torch.randn_like(std)
-            z_query = mean + eps * std
-        else:
-            z_query = remainder
-            mean = remainder  # Deterministic: mean is the value itself
-            log_var = None
-
-        return z_token, z_query, mean, log_var
-
-
-class HGTeam(Algorithm):
-    """Heterogeneous Graph Team PPO - Multi Agent PPO with GNN-based agent embeddings.
-
-    Args:
-        share_param_critic (bool): Whether to share the parameters of the critics within agent groups
-        gnn_mode (str): How to use GNN embeddings. Options:
-            - "none": No GNN, standard MLP actor
-            - "concat": GNN embeddings concatenated with observations as MLP input
-            - "hypernetwork": GNN embeddings generate weights for actor network
-            - "learned_query": GNN produces embedding_z which the actor reads
-              from the tensordict (e.g. Transformer cross-attention via use_z_as_query)
-        clip_epsilon (scalar): weight clipping threshold in the clipped PPO loss equation.
-        entropy_coef (scalar): entropy multiplier when computing the total loss.
-        critic_coef (scalar): critic loss multiplier when computing the total
-        loss_critic_type (str): loss function for the value discrepancy.
-            Can be one of "l1", "l2" or "smooth_l1".
-        lmbda (float): The GAE lambda
-        scale_mapping (str): positive mapping function to be used with the std.
-            choices: "softplus", "exp", "relu", "biased_softplus_1";
-        use_tanh_normal (bool): if ``True``, use TanhNormal as the continuyous action distribution with support bound
-            to the action domain. Otherwise, an IndependentNormal is used.
-        use_beta (bool): if ``True``, use Beta distribution for bounded [0,1] actions. Takes precedence over use_tanh_normal.
-        beta_min_param (float): minimum parameter value for Beta distribution to ensure numerical stability.
-        minibatch_advantage (bool): if ``True``, advantage computation is perfomend on minibatches of size
-            ``experiment.config.on_policy_minibatch_size`` instead of the full
-            ``experiment.config.on_policy_collected_frames_per_batch``, this helps not exploding memory usage
-        share_critic_across_groups (bool): if ``True``, the critic module will be shared across all agent groups.
-            This is only possible if a global state is present.
-        centralised_value_per_agent (bool): if ``True``, the centralised critic will output a value for each agent
-            instead of a single value for the group. This is useful when using models like HeteroGNN that can
-            produce individual values for each agent.
-
+    Encapsulates the GNN encoder, embedding processor, actor pipeline builder,
+    and auxiliary embedding losses.  Subclasses add loss-specific params
+    (e.g. clip_epsilon for PPO, alpha_init for SAC).
     """
 
     def __init__(
         self,
         share_param_critic: bool,
-        clip_epsilon: float,
-        entropy_coef: bool,
-        critic_coef: float,
-        loss_critic_type: str,
-        lmbda: float,
         scale_mapping: str,
         scale_lb: float,
         use_tanh_normal: bool,
         use_beta: bool,
         beta_min_param: float,
-        minibatch_advantage: bool,
         share_critic_across_groups: bool = False,
         centralised_value_per_agent: bool = False,
-        gnn_mode: str = "none",  # "none", "concat", "hypernetwork", or "learned_query"
-        hypernet_hidden_dim: int = None,
-        hypernet_feature_dim: int = None,
-        stochastic_hypernet: bool = False,
+        gnn_mode: str = "none",
+        z_dim: int = None,
+        hypernet_actor_feature_dim: int = None,
+        stochastic_z: bool = False,
         embedding_entropy_coef: float = 0.0,
         embedding_diversity_coef: float = 0.0,
         # GNN configuration parameters
@@ -332,7 +166,6 @@ class HGTeam(Algorithm):
         gnn_agent_node_feature_dim: int = 1,
         gnn_norm_class: Optional[str] = None,
         critic_embed_dim: int = 32,
-        critic_use_other_actions: bool = False,
         # Split-z parameters (learned_query mode)
         split_z: bool = False,
         z_token_dim: int = 32,
@@ -347,28 +180,30 @@ class HGTeam(Algorithm):
         super().__init__(**kwargs)
 
         self.share_param_critic = share_param_critic
-        self.clip_epsilon = clip_epsilon
-        self.entropy_coef = entropy_coef
-        self.critic_coef = critic_coef
-        self.loss_critic_type = loss_critic_type
-        self.lmbda = lmbda
         self.scale_mapping = scale_mapping
         self.scale_lb = scale_lb
         self.use_tanh_normal = use_tanh_normal
         self.use_beta = use_beta
         self.beta_min_param = beta_min_param
-        self.minibatch_advantage = minibatch_advantage
         self.share_critic_across_groups = share_critic_across_groups
         self.centralised_value_per_agent = centralised_value_per_agent
         self.gnn_mode = gnn_mode
         if gnn_mode not in ("none", "concat", "hypernetwork", "learned_query"):
             raise ValueError(f"gnn_mode must be 'none', 'concat', 'hypernetwork', or 'learned_query', got '{gnn_mode}'")
-        self.hypernet_hidden_dim = hypernet_hidden_dim
-        self.hypernet_feature_dim = hypernet_feature_dim
-        self.stochastic_hypernet = stochastic_hypernet
+        self.z_dim = z_dim
+        self.hypernet_actor_feature_dim = hypernet_actor_feature_dim
+        self.stochastic_z = stochastic_z
+
+        # Mode-specific validation
+        if gnn_mode != "none" and z_dim is None:
+            raise ValueError(f"z_dim is required when gnn_mode='{gnn_mode}'")
+        if gnn_mode == "hypernetwork" and hypernet_actor_feature_dim is None:
+            raise ValueError("hypernet_actor_feature_dim is required when gnn_mode='hypernetwork'")
+        if gnn_mode != "none" and split_z and gnn_mode != "learned_query":
+            raise ValueError(f"split_z is only supported with gnn_mode='learned_query', got '{gnn_mode}'")
         self.embedding_entropy_coef = embedding_entropy_coef
         self.embedding_diversity_coef = embedding_diversity_coef
-        
+
         # GNN configuration
         self.gnn_num_layers = gnn_num_layers
         self.gnn_heads = gnn_heads
@@ -397,7 +232,6 @@ class HGTeam(Algorithm):
             self.gnn_norm_class = None
 
         self.critic_embed_dim = critic_embed_dim
-        self.critic_use_other_actions = critic_use_other_actions
 
         # Split-z: separate GNN output into z_token (KV) and z_query (cross-attn)
         self.split_z = split_z
@@ -411,125 +245,10 @@ class HGTeam(Algorithm):
         self.vib_warmup_frames = vib_warmup_frames
 
         self.shared_critic_module = None
-        self._shared_projection = None   # ObservationProjection (shared across groups)
-        self._shared_gnn_critic = None   # The underlying GNN Model (shared)
-        self._shared_actor_gnn = None    # Shared actor GNN across all agent groups
+        self._shared_projection = None
+        self._shared_gnn_critic = None
+        self._shared_actor_gnn = None
 
-
-    def _get_loss(
-        self, group: str, policy_for_loss: TensorDictModule, continuous: bool
-    ) -> Tuple[LossModule, bool]:
-        # Loss
-        loss_module = HGTeamLoss(
-            algorithm=self,
-            group=group,
-            actor_network=policy_for_loss,
-            critic_network=self.get_critic(group),
-            clip_epsilon=self.clip_epsilon,
-            entropy_coeff=self.entropy_coef,
-            critic_coeff=self.critic_coef,
-            loss_critic_type=self.loss_critic_type,
-            normalize_advantage=True,
-            normalize_advantage_exclude_dims=(1,),
-        )
-        loss_module.set_keys(
-            reward=(group, "reward"),
-            action=(group, "action"),
-            done=(group, "done"),
-            terminated=(group, "terminated"),
-            advantage=(group, "advantage"),
-            value_target=(group, "value_target"),
-            value=(group, "state_value"),
-            sample_log_prob=(group, "log_prob"),
-        )
-        loss_module.make_value_estimator(
-            ValueEstimators.GAE, 
-            gamma=self.experiment_config.gamma, 
-            lmbda=self.lmbda,
-            vectorized=False,
-            deactivate_vmap=True,  # Clearly disable vmap for sparse graphs (dynamic shapes)
-        )
-        return loss_module, False
-
-    def _get_parameters(self, group: str, loss: ClipPPOLoss) -> Dict[str, Iterable]:
-        # --- Actor parameters ---
-        # The actor_network_params TensorDict contains all params from the
-        # actor pipeline, including the shared GNN.  In a multi-group setup
-        # the shared GNN appears in every group's optimizer, so it would
-        # receive one Adam step per group (effectively N× learning rate).
-        #
-        # Fix: split params into (a) per-group MLP/head params at full LR
-        # and (b) shared GNN params at LR/num_groups.  Returning param groups
-        # (list of dicts) makes Adam use the per-group LR override.
-        #
-        # We also filter out shared-GNN final-layer params whose gradients
-        # are structurally zero for this group (other-group output convs).
-        actor_params = list(loss.actor_network_params.flatten_keys().values())
-
-        if self.gnn_mode != "none" and self._shared_actor_gnn is not None:
-            n_before = len(actor_params)
-            actor_params = self._filter_shared_gnn_params(
-                actor_params, self._shared_actor_gnn, group, role="actor"
-            )
-            n_after = len(actor_params)
-            if n_before != n_after:
-                print(f"[HGTeam] {group}/actor: filtered {n_before - n_after} "
-                      f"other-group GNN params ({n_before} → {n_after})")
-
-            # Separate shared GNN params from per-group params for LR scaling
-            actor_params = self._split_shared_gnn_param_groups(
-                actor_params, self._shared_actor_gnn
-            )
-
-        # --- Critic parameters ---
-        critic_params = list(loss.critic_network_params.flatten_keys().values())
-
-        if self._shared_gnn_critic is not None:
-            n_before = len(critic_params)
-            critic_params = self._filter_shared_gnn_params(
-                critic_params, self._shared_gnn_critic, group, role="critic"
-            )
-            n_after = len(critic_params)
-            if n_before != n_after:
-                print(f"[HGTeam] {group}/critic: filtered {n_before - n_after} "
-                      f"other-group GNN params ({n_before} → {n_after})")
-
-            # Separate shared GNN params from per-group params for LR scaling
-            critic_params = self._split_shared_gnn_param_groups(
-                critic_params, self._shared_gnn_critic
-            )
-
-        return {
-            "loss_objective": actor_params,
-            "loss_critic": critic_params,
-        }
-
-    def _split_shared_gnn_param_groups(self, all_params, shared_gnn):
-        """Split params into per-group (full LR) and shared GNN (scaled LR).
-
-        Because the shared GNN appears in every group's optimizer, it receives
-        one Adam step per group per training iteration — effectively N× the
-        intended learning rate.  We return param groups so that Adam applies
-        ``lr / num_groups`` to the shared GNN params.
-
-        Returns a list of param-group dicts (accepted by torch.optim.Adam).
-        """
-        num_groups = len(self.group_map)
-        if num_groups <= 1:
-            return all_params  # No scaling needed with a single group
-
-        shared_ptrs = {p.data_ptr() for p in shared_gnn.parameters()}
-        gnn_params = [p for p in all_params if p.data_ptr() in shared_ptrs]
-        other_params = [p for p in all_params if p.data_ptr() not in shared_ptrs]
-
-        if not gnn_params:
-            return all_params  # No shared GNN params found
-
-        scaled_lr = self.experiment_config.lr / num_groups
-        return [
-            {"params": other_params},
-            {"params": gnn_params, "lr": scaled_lr},
-        ]
 
     def _filter_shared_gnn_params(
         self,
@@ -595,6 +314,7 @@ class HGTeam(Algorithm):
         filtered = [p for p in all_params if p.data_ptr() not in exclude_ptrs]
         return filtered
 
+
     def _get_policy_for_loss(
         self, group: str, model_config: ModelConfig, continuous: bool
     ) -> TensorDictModule:
@@ -615,7 +335,7 @@ class HGTeam(Algorithm):
         # Determine actor output based on gnn_mode
         if self.gnn_mode == "hypernetwork":
             # Hypernetwork mode: MLP outputs features, GNN embedding generates weights
-            feature_dim = self.hypernet_feature_dim
+            feature_dim = self.hypernet_actor_feature_dim
             actor_output_spec = Composite(
                 {
                     group: Composite(
@@ -664,9 +384,9 @@ class HGTeam(Algorithm):
                 gnn_output_dim = self.z_token_dim + z_query_raw_dim
             else:
                 gnn_output_dim = (
-                    self.hypernet_hidden_dim * 2
-                    if self.stochastic_hypernet
-                    else self.hypernet_hidden_dim
+                    self.z_dim * 2
+                    if self.stochastic_z
+                    else self.z_dim
                 )
 
             gnn_stream_module = self._get_or_build_shared_actor_gnn(gnn_output_dim)
@@ -697,7 +417,7 @@ class HGTeam(Algorithm):
             else:
                 embedding_processor = EmbeddingProcessor(
                     embedding_dim=gnn_output_dim,
-                    stochastic=self.stochastic_hypernet,
+                    stochastic=self.stochastic_z,
                 )
                 embedding_processor_module = TensorDictModule(
                     embedding_processor,
@@ -707,14 +427,14 @@ class HGTeam(Algorithm):
 
         if self.gnn_mode == "hypernetwork":
             # Hypernetwork mode: GNN embeddings generate weights for actor
-            feature_dim = self.hypernet_feature_dim
+            feature_dim = self.hypernet_actor_feature_dim
             
             joiner = HyperNetworkJoiner(
                 embedding_dim=gnn_output_dim,           # From GNN (2x if stochastic)
                 feature_dim=feature_dim,                # From Actor
                 output_dim=logits_shape[-1],
                 device=self.device,
-                stochastic_embedding=self.stochastic_hypernet,
+                stochastic_embedding=self.stochastic_z,
             )
             
             joiner_module = TensorDictModule(
@@ -735,7 +455,7 @@ class HGTeam(Algorithm):
             # Flow: GNN -> EmbeddingProcessor -> Concat with obs -> MLP -> logits
             
             # Get the latent dim (after stochastic processing)
-            latent_dim = self.hypernet_hidden_dim
+            latent_dim = self.z_dim
             
             # Get observation shape for this group
             obs_shape = self.observation_spec[group, "observation"].shape
@@ -872,82 +592,6 @@ class HGTeam(Algorithm):
 
         return policy
 
-    def _get_policy_for_collection(
-        self, policy_for_loss: TensorDictModule, group: str, continuous: bool
-    ) -> TensorDictModule:
-        # HGTeam uses the same stochastic actor for collection
-        return policy_for_loss
-
-    def process_batch(self, group: str, batch: TensorDictBase) -> TensorDictBase:
-        batch = batch.to(self.device)
-        keys = list(batch.keys(True, True))
-        group_shape = batch.get(group).shape
-
-        nested_done_key = ("next", group, "done")
-        nested_terminated_key = ("next", group, "terminated")
-        nested_reward_key = ("next", group, "reward")
-
-        if nested_done_key not in keys:
-            batch.set(
-                nested_done_key,
-                batch.get(("next", "done")).unsqueeze(-1).expand((*group_shape, 1)),
-            )
-        if nested_terminated_key not in keys:
-            batch.set(
-                nested_terminated_key,
-                batch.get(("next", "terminated"))
-                .unsqueeze(-1)
-                .expand((*group_shape, 1)),
-            )
-
-        if nested_reward_key not in keys:
-            batch.set(
-                nested_reward_key,
-                batch.get(("next", "reward")).unsqueeze(-1).expand((*group_shape, 1)),
-            )
-
-        # Pre-compute augmented critic observations with other agents' actions
-        if self.critic_use_other_actions:
-            self._augment_critic_observations(batch)
-
-        loss = self.get_loss_and_updater(group)[0]
-        if self.minibatch_advantage:
-            increment = -(
-                -self.experiment.config.train_minibatch_size(self.on_policy)
-                // batch.shape[1]
-            )
-        else:
-            increment = batch.batch_size[0] + 1
-        last_start_index = 0
-        start_index = increment
-        minibatches = []
-        while last_start_index < batch.shape[0]:
-            minimbatch = batch[last_start_index:start_index]
-            minibatches.append(minimbatch)
-            with torch.no_grad():
-                loss.value_estimator(
-                    minimbatch,
-                    params=loss.critic_network_params,
-                    target_params=loss.target_critic_network_params,
-                )
-            last_start_index = start_index
-            start_index += increment
-
-        batch = torch.cat(minibatches, dim=0)
-        return batch
-
-    def process_loss_vals(
-        self, group: str, loss_vals: TensorDictBase, batch: TensorDictBase = None
-    ) -> TensorDictBase:
-        loss_vals.set(
-            "loss_objective", loss_vals["loss_objective"] + loss_vals["loss_entropy"]
-        )
-        del loss_vals["loss_entropy"]
-        
-        # Note: embedding losses are already added to loss_objective in HGTeamLoss.forward()
-        # We don't add them again here to avoid double-counting
-        
-        return loss_vals
 
     def _compute_embedding_losses(
         self, group: str, batch: TensorDictBase
@@ -1127,6 +771,7 @@ class HGTeam(Algorithm):
     # Custom new methods
     #####################
 
+
     def _get_or_build_shared_actor_gnn(self, gnn_output_dim: int):
         """Lazily build and return a shared actor GNN that sees ALL agent groups.
 
@@ -1245,6 +890,301 @@ class HGTeam(Algorithm):
             action_spec=self.action_spec,
         )
         return self._shared_actor_gnn
+
+
+    def _add_graph_keys_to_spec(self, spec):
+        """Add GNN-required graph keys from observation_spec into *spec*.
+
+        Always adds keys for every agent group in ``self.group_map``.
+        """
+        cfg = self.critic_model_config
+        groups_to_add = list(self.group_map.keys())
+
+        # Grid adjacency matrices (shared across types)
+        if cfg.grid_edge_keys:
+            for spec_key in cfg.grid_edge_keys.values():
+                if spec_key in self.observation_spec.keys():
+                    spec.set(
+                        spec_key,
+                        self.observation_spec[spec_key].clone().to(self.device),
+                    )
+
+        # Node features
+        if cfg.node_features_keys:
+            for node_type, spec_key in cfg.node_features_keys.items():
+                if node_type == "grid_node":
+                    if spec_key in self.observation_spec.keys():
+                        spec.set(
+                            spec_key,
+                            self.observation_spec[spec_key].clone().to(self.device),
+                        )
+                else:
+                    for g in groups_to_add:
+                        per_type_key = f"{g}_{spec_key}"
+                        if per_type_key in self.observation_spec.keys():
+                            spec.set(
+                                per_type_key,
+                                self.observation_spec[per_type_key].clone().to(self.device),
+                            )
+
+        # Agent-grid edge index
+        if cfg.agent_node_index_key:
+            for g in groups_to_add:
+                key = f"{g}_agent_grid_edge_index"
+                if key in self.observation_spec.keys():
+                    spec.set(
+                        key,
+                        self.observation_spec[key].clone().to(self.device),
+                    )
+
+
+class HGTeam(HGTeamBase):
+    """Heterogeneous Graph Team PPO - Multi Agent PPO with GNN-based agent embeddings.
+
+    Args:
+        share_param_critic (bool): Whether to share the parameters of the critics within agent groups
+        gnn_mode (str): How to use GNN embeddings. Options:
+            - "none": No GNN, standard MLP actor
+            - "concat": GNN embeddings concatenated with observations as MLP input
+            - "hypernetwork": GNN embeddings generate weights for actor network
+            - "learned_query": GNN produces embedding_z which the actor reads
+              from the tensordict (e.g. Transformer cross-attention via use_z_as_query)
+        clip_epsilon (scalar): weight clipping threshold in the clipped PPO loss equation.
+        entropy_coef (scalar): entropy multiplier when computing the total loss.
+        critic_coef (scalar): critic loss multiplier when computing the total
+        loss_critic_type (str): loss function for the value discrepancy.
+            Can be one of "l1", "l2" or "smooth_l1".
+        lmbda (float): The GAE lambda
+        scale_mapping (str): positive mapping function to be used with the std.
+            choices: "softplus", "exp", "relu", "biased_softplus_1";
+        use_tanh_normal (bool): if ``True``, use TanhNormal as the continuyous action distribution with support bound
+            to the action domain. Otherwise, an IndependentNormal is used.
+        use_beta (bool): if ``True``, use Beta distribution for bounded [0,1] actions. Takes precedence over use_tanh_normal.
+        beta_min_param (float): minimum parameter value for Beta distribution to ensure numerical stability.
+        minibatch_advantage (bool): if ``True``, advantage computation is perfomend on minibatches of size
+            ``experiment.config.on_policy_minibatch_size`` instead of the full
+            ``experiment.config.on_policy_collected_frames_per_batch``, this helps not exploding memory usage
+        share_critic_across_groups (bool): if ``True``, the critic module will be shared across all agent groups.
+            This is only possible if a global state is present.
+        centralised_value_per_agent (bool): if ``True``, the centralised critic will output a value for each agent
+            instead of a single value for the group. This is useful when using models like HeteroGNN that can
+            produce individual values for each agent.
+
+    """
+
+    def __init__(
+        self,
+        clip_epsilon: float,
+        entropy_coef: float,
+        critic_coef: float,
+        loss_critic_type: str,
+        lmbda: float,
+        minibatch_advantage: bool,
+        critic_use_other_actions: bool = False,
+        **kwargs
+    ):
+        super().__init__(**kwargs)
+
+        self.clip_epsilon = clip_epsilon
+        self.entropy_coef = entropy_coef
+        self.critic_coef = critic_coef
+        self.loss_critic_type = loss_critic_type
+        self.lmbda = lmbda
+        self.minibatch_advantage = minibatch_advantage
+        self.critic_use_other_actions = critic_use_other_actions
+
+
+    def _get_loss(
+        self, group: str, policy_for_loss: TensorDictModule, continuous: bool
+    ) -> Tuple[LossModule, bool]:
+        # Loss
+        loss_module = HGTeamLoss(
+            algorithm=self,
+            group=group,
+            actor_network=policy_for_loss,
+            critic_network=self.get_critic(group),
+            clip_epsilon=self.clip_epsilon,
+            entropy_coeff=self.entropy_coef,
+            critic_coeff=self.critic_coef,
+            loss_critic_type=self.loss_critic_type,
+            normalize_advantage=True,
+            normalize_advantage_exclude_dims=(1,),
+        )
+        loss_module.set_keys(
+            reward=(group, "reward"),
+            action=(group, "action"),
+            done=(group, "done"),
+            terminated=(group, "terminated"),
+            advantage=(group, "advantage"),
+            value_target=(group, "value_target"),
+            value=(group, "state_value"),
+            sample_log_prob=(group, "log_prob"),
+        )
+        loss_module.make_value_estimator(
+            ValueEstimators.GAE, 
+            gamma=self.experiment_config.gamma, 
+            lmbda=self.lmbda,
+            vectorized=False,
+            deactivate_vmap=True,  # Clearly disable vmap for sparse graphs (dynamic shapes)
+        )
+        return loss_module, False
+
+    def _get_parameters(self, group: str, loss: ClipPPOLoss) -> Dict[str, Iterable]:
+        # --- Actor parameters ---
+        # The actor_network_params TensorDict contains all params from the
+        # actor pipeline, including the shared GNN.  In a multi-group setup
+        # the shared GNN appears in every group's optimizer, so it would
+        # receive one Adam step per group (effectively N× learning rate).
+        #
+        # Fix: split params into (a) per-group MLP/head params at full LR
+        # and (b) shared GNN params at LR/num_groups.  Returning param groups
+        # (list of dicts) makes Adam use the per-group LR override.
+        #
+        # We also filter out shared-GNN final-layer params whose gradients
+        # are structurally zero for this group (other-group output convs).
+        actor_params = list(loss.actor_network_params.flatten_keys().values())
+
+        if self.gnn_mode != "none" and self._shared_actor_gnn is not None:
+            n_before = len(actor_params)
+            actor_params = self._filter_shared_gnn_params(
+                actor_params, self._shared_actor_gnn, group, role="actor"
+            )
+            n_after = len(actor_params)
+            if n_before != n_after:
+                print(f"[HGTeam] {group}/actor: filtered {n_before - n_after} "
+                      f"other-group GNN params ({n_before} → {n_after})")
+
+            # Separate shared GNN params from per-group params for LR scaling
+            actor_params = self._split_shared_gnn_param_groups(
+                actor_params, self._shared_actor_gnn
+            )
+
+        # --- Critic parameters ---
+        critic_params = list(loss.critic_network_params.flatten_keys().values())
+
+        if self._shared_gnn_critic is not None:
+            n_before = len(critic_params)
+            critic_params = self._filter_shared_gnn_params(
+                critic_params, self._shared_gnn_critic, group, role="critic"
+            )
+            n_after = len(critic_params)
+            if n_before != n_after:
+                print(f"[HGTeam] {group}/critic: filtered {n_before - n_after} "
+                      f"other-group GNN params ({n_before} → {n_after})")
+
+            # Separate shared GNN params from per-group params for LR scaling
+            critic_params = self._split_shared_gnn_param_groups(
+                critic_params, self._shared_gnn_critic
+            )
+
+        return {
+            "loss_objective": actor_params,
+            "loss_critic": critic_params,
+        }
+
+    def _split_shared_gnn_param_groups(self, all_params, shared_gnn):
+        """Split params into per-group (full LR) and shared GNN (scaled LR).
+
+        Because the shared GNN appears in every group's optimizer, it receives
+        one Adam step per group per training iteration — effectively N× the
+        intended learning rate.  We return param groups so that Adam applies
+        ``lr / num_groups`` to the shared GNN params.
+
+        Returns a list of param-group dicts (accepted by torch.optim.Adam).
+        """
+        num_groups = len(self.group_map)
+        if num_groups <= 1:
+            return all_params  # No scaling needed with a single group
+
+        shared_ptrs = {p.data_ptr() for p in shared_gnn.parameters()}
+        gnn_params = [p for p in all_params if p.data_ptr() in shared_ptrs]
+        other_params = [p for p in all_params if p.data_ptr() not in shared_ptrs]
+
+        if not gnn_params:
+            return all_params  # No shared GNN params found
+
+        scaled_lr = self.experiment_config.lr / num_groups
+        return [
+            {"params": other_params},
+            {"params": gnn_params, "lr": scaled_lr},
+        ]
+
+    def _get_policy_for_collection(
+        self, policy_for_loss: TensorDictModule, group: str, continuous: bool
+    ) -> TensorDictModule:
+        # HGTeam uses the same stochastic actor for collection
+        return policy_for_loss
+
+    def process_batch(self, group: str, batch: TensorDictBase) -> TensorDictBase:
+        batch = batch.to(self.device)
+        keys = list(batch.keys(True, True))
+        group_shape = batch.get(group).shape
+
+        nested_done_key = ("next", group, "done")
+        nested_terminated_key = ("next", group, "terminated")
+        nested_reward_key = ("next", group, "reward")
+
+        if nested_done_key not in keys:
+            batch.set(
+                nested_done_key,
+                batch.get(("next", "done")).unsqueeze(-1).expand((*group_shape, 1)),
+            )
+        if nested_terminated_key not in keys:
+            batch.set(
+                nested_terminated_key,
+                batch.get(("next", "terminated"))
+                .unsqueeze(-1)
+                .expand((*group_shape, 1)),
+            )
+
+        if nested_reward_key not in keys:
+            batch.set(
+                nested_reward_key,
+                batch.get(("next", "reward")).unsqueeze(-1).expand((*group_shape, 1)),
+            )
+
+        # Pre-compute augmented critic observations with other agents' actions
+        if self.critic_use_other_actions:
+            self._augment_critic_observations(batch)
+
+        loss = self.get_loss_and_updater(group)[0]
+        if self.minibatch_advantage:
+            increment = -(
+                -self.experiment.config.train_minibatch_size(self.on_policy)
+                // batch.shape[1]
+            )
+        else:
+            increment = batch.batch_size[0] + 1
+        last_start_index = 0
+        start_index = increment
+        minibatches = []
+        while last_start_index < batch.shape[0]:
+            minimbatch = batch[last_start_index:start_index]
+            minibatches.append(minimbatch)
+            with torch.no_grad():
+                loss.value_estimator(
+                    minimbatch,
+                    params=loss.critic_network_params,
+                    target_params=loss.target_critic_network_params,
+                )
+            last_start_index = start_index
+            start_index += increment
+
+        batch = torch.cat(minibatches, dim=0)
+        return batch
+
+    def process_loss_vals(
+        self, group: str, loss_vals: TensorDictBase, batch: TensorDictBase = None
+    ) -> TensorDictBase:
+        loss_vals.set(
+            "loss_objective", loss_vals["loss_objective"] + loss_vals["loss_entropy"]
+        )
+        del loss_vals["loss_entropy"]
+        
+        # Note: embedding losses are already added to loss_objective in HGTeamLoss.forward()
+        # We don't add them again here to avoid double-counting
+        
+        return loss_vals
 
     def _compute_other_actions_dim(self) -> int:
         """Total dimension of all agents' actions across all groups."""
@@ -1443,51 +1383,6 @@ class HGTeam(Algorithm):
     # Shared-critic helpers
     # ------------------------------------------------------------------
 
-    def _add_graph_keys_to_spec(self, spec):
-        """Add GNN-required graph keys from observation_spec into *spec*.
-
-        Always adds keys for every agent group in ``self.group_map``.
-        """
-        cfg = self.critic_model_config
-        groups_to_add = list(self.group_map.keys())
-
-        # Grid adjacency matrices (shared across types)
-        if cfg.grid_edge_keys:
-            for spec_key in cfg.grid_edge_keys.values():
-                if spec_key in self.observation_spec.keys():
-                    spec.set(
-                        spec_key,
-                        self.observation_spec[spec_key].clone().to(self.device),
-                    )
-
-        # Node features
-        if cfg.node_features_keys:
-            for node_type, spec_key in cfg.node_features_keys.items():
-                if node_type == "grid_node":
-                    if spec_key in self.observation_spec.keys():
-                        spec.set(
-                            spec_key,
-                            self.observation_spec[spec_key].clone().to(self.device),
-                        )
-                else:
-                    for g in groups_to_add:
-                        per_type_key = f"{g}_{spec_key}"
-                        if per_type_key in self.observation_spec.keys():
-                            spec.set(
-                                per_type_key,
-                                self.observation_spec[per_type_key].clone().to(self.device),
-                            )
-
-        # Agent-grid edge index
-        if cfg.agent_node_index_key:
-            for g in groups_to_add:
-                key = f"{g}_agent_grid_edge_index"
-                if key in self.observation_spec.keys():
-                    spec.set(
-                        key,
-                        self.observation_spec[key].clone().to(self.device),
-                    )
-
     def _get_shared_critic(self, group: str, n_agents: int) -> TensorDictModule:
         """Build (or reuse) a shared critic where each agent type is a native
         heterogeneous node type in the GNN.
@@ -1648,9 +1543,9 @@ class HGTeamConfig(AlgorithmConfig):
     share_critic_across_groups: bool = MISSING
     centralised_value_per_agent: bool = MISSING
     gnn_mode: str = MISSING  # "none", "concat", "hypernetwork", or "learned_query"
-    hypernet_hidden_dim: int = MISSING
-    hypernet_feature_dim: int = MISSING
-    stochastic_hypernet: bool = MISSING
+    z_dim: int = MISSING
+    hypernet_actor_feature_dim: int = MISSING
+    stochastic_z: bool = MISSING
     embedding_entropy_coef: float = MISSING
     embedding_diversity_coef: float = MISSING
     
