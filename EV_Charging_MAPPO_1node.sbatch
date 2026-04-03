@@ -6,8 +6,14 @@
 #SBATCH --nodes=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=128G
-#SBATCH -o MAPPOslurmjob-%j.out-%N
-#SBATCH -e MAPPOslurmjob-%j.err-%N
+#SBATCH -o /uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/results/slurm/MAPPOslurmjob-%j.out-%N
+#SBATCH -e /uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/results/slurm/MAPPOslurmjob-%j.err-%N
+
+PROJECT_ROOT=/uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL
+RESULTS_ROOT=$PROJECT_ROOT/results
+RESULTS_DIR=$RESULTS_ROOT/MAPPOresults_$(date +%Y%m%d)_${SLURM_JOB_ID}
+
+mkdir -p "$RESULTS_DIR"
 
 # Enable GPU usage
 # SBATCH --gres=gpu:1
@@ -18,7 +24,7 @@ mkdir -p $SCRDIR
 
 # Copy the project to scratch directory for faster I/O, excluding old results
 echo "Copying project to scratch directory..."
-rsync -a --exclude='MASACresults_*' --exclude='results_*' --exclude='MADDPGresults_*' /uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/ $SCRDIR/PowerGridMARL/
+rsync -a --exclude='MASACresults_*' --exclude='results_*' --exclude='MADDPGresults_*' --exclude='results' $PROJECT_ROOT/ $SCRDIR/PowerGridMARL/
 echo "Copy complete. Starting experiment..."
 cd $SCRDIR/PowerGridMARL
 
@@ -26,6 +32,7 @@ cd $SCRDIR/PowerGridMARL
 module load benchmarl/3.10.3
 
 export PYTHONPATH=$SCRDIR/PowerGridMARL/PowerGridworld:$SCRDIR/PowerGridMARL/BenchMARL:$PYTHONPATH
+export WANDB_DIR="$RESULTS_DIR/wandb"
 
 # Enable GPU usage
 # export CUDA_VISIBLE_DEVICES="0"
@@ -77,6 +84,7 @@ echo "Memory allocated: $SLURM_MEM_PER_NODE MB"
 
 # MAPPO configuration optimized for 11 agents - on-policy with GAE
 python BenchMARL/benchmarl/run.py algorithm=mappo task=PowerGridworld/evovernight13node_simple \
+    hydra.run.dir="$RESULTS_DIR/outputs" \
     model=layers/mlp \
     "model.num_cells=[32,32]" \
     algorithm.share_param_critic=False \
@@ -106,10 +114,6 @@ python BenchMARL/benchmarl/run.py algorithm=mappo task=PowerGridworld/evovernigh
 
 echo "Job completed at: $(date)"
 
-# Create results directory in home
-RESULTS_DIR=/uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/MAPPOresults_$(date +%Y%m%d)_${SLURM_JOB_ID}
-mkdir -p $RESULTS_DIR
-
 # Copy the actual training results from the outputs directory
 if [ -d "$SCRDIR/PowerGridMARL/outputs" ]; then
     cp -r $SCRDIR/PowerGridMARL/outputs/* $RESULTS_DIR/ 2>/dev/null || true
@@ -121,16 +125,8 @@ fi
 # Copy the SLURM script for reference
 cp $SCRDIR/PowerGridMARL/EV_Charging_MAPPO_1node.sbatch $RESULTS_DIR/ 2>/dev/null || true
 
-# Copy SLURM output and error files to results directory and clean up from main directory
-cp /uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/MAPPOslurmjob-${SLURM_JOB_ID}.out-* $RESULTS_DIR/ 2>/dev/null || true
-cp /uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/MAPPOslurmjob-${SLURM_JOB_ID}.err-* $RESULTS_DIR/ 2>/dev/null || true
-
-# Clean up SLURM output files from main directory
-rm -f /uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/MAPPOslurmjob-${SLURM_JOB_ID}.out-* 2>/dev/null || true
-rm -f /uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/MAPPOslurmjob-${SLURM_JOB_ID}.err-* 2>/dev/null || true
-
 # Clean up
-cd /uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL
+cd $PROJECT_ROOT
 rm -rf $SCRDIR
 
 echo "MAPPO training completed successfully!"

@@ -370,10 +370,11 @@ class HeteroGNN(Model):
             device=self.device,
             n_agents=self.n_agents,
         )
-        self._full_position_key = None
-        self._full_edge_features_key = None
-        self._full_velocity_key = None        
-        self._full_agent_node_index_key = None
+        # Unified key-resolution cache: {(suffix, group): resolved_full_key}
+        # Populated on first forward pass, eliminates repeated key-tree scans.
+        self._resolved_keys = {}
+        # Pre-computed eye matrices for self-loop removal: {(n, device): Tensor}
+        self._eye_cache = {}
         
     def _perform_checks(self):
         # The base Model._perform_checks raises if len(out_keys) > 1.
@@ -508,6 +509,9 @@ class HeteroGNN(Model):
             # Fallback if no parameters
             device = self.device
 
+        # Build keys list once for all lookups in this forward pass
+        all_keys = list(tensordict.keys(True, True))
+
         x_dict = {}
         pos_dict = {}
         vel_dict = {}
@@ -544,7 +548,7 @@ class HeteroGNN(Model):
             if has_explicit_features:
                 # Load explicit agent node features (e.g., participation_score)
                 key = self.node_features_keys[group]
-                full_key = self._get_key_terminating_with(list(tensordict.keys(True, True)), key, None)
+                full_key = self._resolve_key(all_keys, key, None)
                 if full_key:
                     explicit_feats = tensordict.get(full_key)
                     input_list.append(explicit_feats)
@@ -557,7 +561,7 @@ class HeteroGNN(Model):
             pos = None
             vel = None
             if self.position_key is not None:
-                pos_key = self._get_key_terminating_with(list(tensordict.keys(True, True)), self.position_key, group)
+                pos_key = self._resolve_key(all_keys, self.position_key, group)
                 if pos_key:
                     pos = tensordict.get(pos_key)
                     if not self.exclude_pos_from_node_features:
@@ -565,7 +569,7 @@ class HeteroGNN(Model):
                     pos_dict[group] = pos
             
             if self.velocity_key is not None:
-                vel_key = self._get_key_terminating_with(list(tensordict.keys(True, True)), self.velocity_key, group)
+                vel_key = self._resolve_key(all_keys, self.velocity_key, group)
                 if vel_key:
                     vel = tensordict.get(vel_key)
                     input_list.append(vel)
@@ -589,24 +593,21 @@ class HeteroGNN(Model):
         if self.node_features_keys:
              for node_type, key in self.node_features_keys.items():
                  if node_type not in x_dict and node_type not in self.agent_groups:
-                     full_key = self._get_key_terminating_with(list(tensordict.keys(True, True)), key, None)
+                     full_key = self._resolve_key(all_keys, key, None)
                      if full_key:
                          x_dict[node_type] = tensordict.get(full_key)
 
         edge_attr_dense_dict = {}
         if self.grid_edge_keys:
              for rel, key in self.grid_edge_keys.items():
-                 full_key = self._get_key_terminating_with(list(tensordict.keys(True, True)), key, None)
+                 full_key = self._resolve_key(all_keys, key, None)
                  if full_key:
                      edge_attr_dense_dict[rel] = tensordict.get(full_key)
         
         # Legacy support
         if self.edge_features_key is not None and not edge_attr_dense_dict:
-             if self._full_edge_features_key is None:
-                 self._full_edge_features_key = self._get_key_terminating_with(
-                     list(tensordict.keys(True, True)), self.edge_features_key, None
-                 )
-             val = tensordict.get(self._full_edge_features_key)
+             full_edge_key = self._resolve_key(all_keys, self.edge_features_key, None)
+             val = tensordict.get(full_edge_key)
              # Default legacy name 'edge'
              if val is not None:
                  edge_attr_dense_dict['edge'] = val
@@ -616,18 +617,13 @@ class HeteroGNN(Model):
             # Support per-type mapping edges: try {group}_agent_grid_edge_index for each group
             for group in self.agent_groups:
                 per_type_key = f"{group}_agent_grid_edge_index"
-                full_key = self._get_key_terminating_with(
-                    list(tensordict.keys(True, True)), per_type_key, None
-                )
+                full_key = self._resolve_key(all_keys, per_type_key, None)
                 if full_key is not None:
                     agent_grid_edge_indices[group] = tensordict.get(full_key)
             # Fallback: single shared agent_grid_edge_index (backward compat)
             if not agent_grid_edge_indices:
-                if self._full_agent_node_index_key is None:
-                    self._full_agent_node_index_key = self._get_key_terminating_with(
-                        list(tensordict.keys(True, True)), self.agent_node_index_key, None
-                    )
-                val = tensordict.get(self._full_agent_node_index_key)
+                full_agent_idx_key = self._resolve_key(all_keys, self.agent_node_index_key, None)
+                val = tensordict.get(full_agent_idx_key)
                 if val is not None:
                     # Assign to first (or only) agent group for backward compat
                     agent_grid_edge_indices[self.agent_groups[0]] = val
@@ -686,6 +682,7 @@ class HeteroGNN(Model):
             edge_types=self.edge_types,
             node_types=self.node_types,
             agent_groups=self.agent_groups,
+            eye_cache=self._eye_cache,
         )
         
         # Forward pass
@@ -752,6 +749,15 @@ class HeteroGNN(Model):
 
         return tensordict
 
+    def _resolve_key(self, all_keys, key, group=None):
+        """Resolve a TensorDict key suffix, caching the result across forward passes."""
+        cache_key = (key, group)
+        if cache_key not in self._resolved_keys:
+            self._resolved_keys[cache_key] = self._get_key_terminating_with(
+                all_keys, key, group
+            )
+        return self._resolved_keys[cache_key]
+
     def _get_key_terminating_with(self, keys: List[NestedKey], key: str, group: Optional[str] = None) -> Optional[NestedKey]:
         for k in keys:
             k_tuple = _unravel_key_to_tuple(k)
@@ -804,6 +810,7 @@ def _tensordict_to_hetero_data(
     edge_attr_dense_dict: Dict[str, Tensor] = None,
     agent_grid_edge_indices: Dict[str, Tensor] = None,
     edge_radius: Optional[float] = None,
+    eye_cache: Dict = None,
 ) -> torch_geometric.data.Batch:
     # Infer batch size — prefer grid adjacencies (shape ...batch, N, N, F)
     # over x_dict, because agent tensors might have extra dims (e.g. LSTM states)
@@ -862,8 +869,15 @@ def _tensordict_to_hetero_data(
             
             mask = edge_attr_dense_flat.abs().sum(dim=-1) > 0 # (Batch, N, N)
             if not self_loops:
-                 # Remove diagonal
-                 mask &= ~torch.eye(n_grid_nodes, device=device, dtype=torch.bool).unsqueeze(0)
+                 # Remove diagonal (eye matrix is cached to avoid re-allocation)
+                 eye_key = (n_grid_nodes, device)
+                 if eye_cache is not None and eye_key in eye_cache:
+                     diag_mask = eye_cache[eye_key]
+                 else:
+                     diag_mask = torch.eye(n_grid_nodes, device=device, dtype=torch.bool).unsqueeze(0)
+                     if eye_cache is not None:
+                         eye_cache[eye_key] = diag_mask
+                 mask &= ~diag_mask
 
             nonzero_indices = mask.nonzero() 
             b_idx = nonzero_indices[:, 0]

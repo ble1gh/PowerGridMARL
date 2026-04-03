@@ -704,8 +704,10 @@ class HGTeamBase(Algorithm):
                 kl_per_agent = kl_per_element.sum(dim=-1)  # sum over z_query_dim
                 kl_mean = kl_per_agent.mean()  # mean over agents & batch
 
-                # Linear beta warm-up
-                total_frames = getattr(self.experiment, "total_frames", 0)
+                # Linear beta warm-up over collected frames.
+                # total_frames is maintained by Experiment and survives
+                # checkpoint resume (restored from state_dict).
+                total_frames = self.experiment.total_frames
                 if self.vib_warmup_frames > 0:
                     beta_effective = min(
                         self.vib_beta,
@@ -875,6 +877,43 @@ class HGTeamBase(Algorithm):
             for g2 in all_groups:
                 if g1 != g2:
                     edge_features_dims[f"{g1}_interact_{g2}"] = 0
+
+        # --- Validate key contract --------------------------------
+        # The GNN resolves keys at runtime via leaf-name matching
+        # (_get_key_terminating_with).  Collect all leaf names visible
+        # in observation_spec so we can warn about anything missing.
+        _obs_leaf_names = set()
+        for k in self.observation_spec.keys(True, True):
+            _obs_leaf_names.add(k[-1] if isinstance(k, tuple) else k)
+
+        _missing = []
+        # Grid node features (hard-coded as "grid_node_features")
+        if "grid_node_features" not in _obs_leaf_names:
+            _missing.append("grid_node_features")
+        # Grid adjacency matrices
+        for adj in ("line_adjacency", "transformer_adjacency", "switch_adjacency"):
+            if adj not in _obs_leaf_names:
+                _missing.append(adj)
+        # Per-group agent↔grid edge indices
+        for g in all_groups:
+            eidx = f"{g}_agent_grid_edge_index"
+            if eidx not in _obs_leaf_names:
+                _missing.append(eidx)
+        # Per-group agent node features (config-dependent)
+        if self.gnn_agent_node_feature_key is not None:
+            for g in all_groups:
+                feat = f"{g}_{self.gnn_agent_node_feature_key}"
+                if feat not in _obs_leaf_names:
+                    _missing.append(feat)
+
+        if _missing:
+            warnings.warn(
+                f"Actor GNN key contract: the following keys are expected "
+                f"by the GNN but not found in observation_spec: {_missing}. "
+                f"The GNN may silently produce degraded results. Verify "
+                f"that the environment provides all required graph keys.",
+                stacklevel=2,
+            )
 
         gnn_conf = HeteroGnnConfig(
             topology="adjacency",
@@ -1141,6 +1180,19 @@ class HGTeam(HGTeamBase):
         intended learning rate.  We return param groups so that Adam applies
         ``lr / num_groups`` to the shared GNN params.
 
+        Note: The 1/N LR scaling corrects the effective learning rate, but
+        Adam's second-moment estimate (v) still sees N independent steps of
+        |g/N|² each, yielding v ≈ g²/N instead of the single-step v = g².
+        The smaller sqrt(v) makes effective step sizes ~√N larger than a
+        single aggregated update.  With N=3 groups, this is a ~√3 ≈ 1.73×
+        over-correction — acceptable in practice but not mathematically exact.
+
+        TODO: For exact equivalence, replace this with a gradient-accumulating
+        Adam wrapper that buffers N calls to step(), sums their gradients,
+        and performs a single real Adam update on the Nth call.  This would
+        be transparent to BenchMARL's per-group optimizer loop and eliminate
+        the √N bias in Adam's variance estimate.
+
         Returns a list of param-group dicts (accepted by torch.optim.Adam).
         """
         num_groups = len(self.group_map)
@@ -1210,11 +1262,11 @@ class HGTeam(HGTeamBase):
         start_index = increment
         minibatches = []
         while last_start_index < batch.shape[0]:
-            minimbatch = batch[last_start_index:start_index]
-            minibatches.append(minimbatch)
+            minibatch = batch[last_start_index:start_index]
+            minibatches.append(minibatch)
             with torch.no_grad():
                 loss.value_estimator(
-                    minimbatch,
+                    minibatch,
                     params=loss.critic_network_params,
                     target_params=loss.target_critic_network_params,
                 )
@@ -1609,20 +1661,20 @@ class HGTeamConfig(AlgorithmConfig):
     gnn_agent_node_feature_key: Optional[str] = MISSING
     gnn_agent_node_feature_dim: int = MISSING
     critic_use_other_actions: bool = MISSING  # Condition value fn on other agents' actions (counterfactual)
-    gnn_norm_class: Optional[str] = None  # "LayerNorm", "BatchNorm1d", etc. or null/None
-    critic_embed_dim: int = 32  # Common dimension for per-type observation projections in shared critic
+    gnn_norm_class: Optional[str] = MISSING  # "LayerNorm", "BatchNorm1d", etc. or null/None
+    critic_embed_dim: int = MISSING  # Common dimension for per-type observation projections in shared critic
 
     # Split-z parameters (learned_query mode): separate GNN output into
     # z_token (deterministic, KV prepend) and z_query (cross-attention query).
-    split_z: bool = False
-    z_token_dim: int = 32
-    z_query_dim: int = 32
-    stochastic_z_query: bool = True
+    split_z: bool = MISSING
+    z_token_dim: int = MISSING
+    z_query_dim: int = MISSING
+    stochastic_z_query: bool = MISSING
 
     # VIB (Variational Information Bottleneck) parameters
-    use_vib: bool = False
-    vib_beta: float = 0.01
-    vib_warmup_frames: int = 500_000
+    use_vib: bool = MISSING
+    vib_beta: float = MISSING
+    vib_warmup_frames: int = MISSING
 
     @staticmethod
     def associated_class() -> Type[Algorithm]:

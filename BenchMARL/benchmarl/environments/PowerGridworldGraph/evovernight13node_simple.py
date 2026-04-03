@@ -58,3 +58,4 @@ class TaskConfig:
     signal_tracking: bool = MISSING
     track_total_load: bool = MISSING
     setpoint: float = MISSING
+    pv_curtailment_reward_penalty: MISSING

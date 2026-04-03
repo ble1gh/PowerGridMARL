@@ -9,23 +9,22 @@
 #SBATCH --mem=64GB
 #
 # GPU Request:
-# Generic request (any GPU in partition):
-#SBATCH --gres=gpu:1
-#
-# Specific GPU requests (uncomment one to ensure specific VRAM):
-# #SBATCH --gres=gpu:rtx6000:1    # ~24GB VRAM
-# #SBATCH --gres=gpu:l40s:1       # ~48GB VRAM
-# #SBATCH --gres=gpu:a800:1       # ~80GB VRAM
-# #SBATCH --gres=gpu:h100nvl:1       # ~141GB VRAM
+# MIG slices available on this partition:
+#   gpu:h200_1g.18gb  — 18 GB (grn025, 56 slices) — tight for 768+ minibatch
+#   gpu:h200_2g.35gb  — 35 GB (grn026, 16 slices) — good for 1024 minibatch
+#   gpu:h200_3g.71gb  — 71 GB (grn026, 8 slices)
+#   gpu:h200          — 141 GB full card (grn027-032, 8 each) — long queue
+#   gpu:1             — any available GPU (risky: may get 18 GB slice)
+#SBATCH --gres=gpu:h200_2g.35gb:1
 
-#SBATCH -o /uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/results/slurm/HGTeamslurmjob-%j.out-%N
-#SBATCH -e /uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/results/slurm/HGTeamslurmjob-%j.err-%N
-#SBATCH --exclude=grn030
+#SBATCH -o /uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/results/slurm/HGTeamHAslurmjob-%j.out-%N
+#SBATCH -e /uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/results/slurm/HGTeamHAslurmjob-%j.err-%N
+# #SBATCH --exclude=grn030
 
 
 PROJECT_ROOT=/uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL
 RESULTS_ROOT=$PROJECT_ROOT/results
-RESULTS_DIR=$RESULTS_ROOT/HGTeamresults_$(date +%Y%m%d)_${SLURM_JOB_ID}
+RESULTS_DIR=$RESULTS_ROOT/HGTeamHAresults_$(date +%Y%m%d)_${SLURM_JOB_ID}
 
 mkdir -p "$RESULTS_DIR"
 
@@ -53,8 +52,11 @@ module load benchmarl/nightly
 export PYTHONPATH=$SCRDIR/PowerGridMARL/PowerGridworld:$SCRDIR/PowerGridMARL/BenchMARL:$PYTHONPATH
 export WANDB_DIR="$RESULTS_DIR/wandb"
 
-# Enable GPU usage
-export CUDA_VISIBLE_DEVICES="0"
+# Enable GPU usage — respect SLURM's assignment (required for MIG slices)
+# MIG slices use UUID-based device IDs; hardcoding "0" breaks them.
+if [ -z "$CUDA_VISIBLE_DEVICES" ]; then
+    export CUDA_VISIBLE_DEVICES="0"
+fi
 
 # Force PyTorch to use GPU with optimized settings
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512,expandable_segments:True
@@ -96,27 +98,30 @@ nvidia-smi
 echo "CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES"
 
 # Check if PyTorch can see GPU
-python -c "import torch; print(f'PyTorch version: {torch.__version__}'); print(f'CUDA available: {torch.cuda.is_available()}'); print(f'CUDA devices: {torch.cuda.device_count()}'); print(f'GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB')"
+python -c "import torch; print(f'PyTorch version: {torch.__version__}'); print(f'CUDA available: {torch.cuda.is_available()}'); print(f'CUDA devices: {torch.cuda.device_count()}'); print(f'GPU Memory: {torch.cuda.get_device_properties(0).total_mem / 1024**3:.1f} GB')"
 
 # Start background GPU monitoring
 nvidia-smi dmon -d 10 -s pucvmet -f $SCRDIR/gpu_usage.log &
 GPU_MONITOR_PID=$!
 
-# Run experiment
+# Run experiment — HAPPO variant
 python run_hgteam_mlp.py \
     --seed 20 \
     --project-name "PowerGridworldVariable_VPP" \
-    --wandb-name "HGTeam_$(date +%Y%m%d)_${SLURM_JOB_ID}_tanhnormal_scalelb_0.01_H0.01_rewardupdate" \
+    --wandb-name "HGTeamHA_$(date +%Y%m%d)_${SLURM_JOB_ID}_lr1e-4_cc2_8ep_fixscalelb" \
     --results-dir "$RESULTS_DIR" \
     --max-n-frames 10000000 \
-    --lr 5e-5 \
-    --evaluation-interval 12288 \
-    --evaluation-episodes 5 \
+    --lr 1e-4 \
+    --evaluation-interval 24576 \
+    --evaluation-episodes 10 \
     --n-envs-per-worker 32 \
     --frames-per-batch 12288 \
-    --minibatch-size 256 \
-    --n-minibatch-iters 5 \
+    --minibatch-size 512 \
+    --n-minibatch-iters 8 \
     --entropy-coef 0.01 \
+    --algorithm happo \
+    --encoder-update-mode accumulated \
+    --fixed-order false \
     --gnn-mode concat \
     --embedding-entropy-coef 0 \
     --embedding-diversity-coef 0 \
@@ -128,10 +133,11 @@ python run_hgteam_mlp.py \
     --z-token-dim 32 \
     --z-query-dim 32 \
     --stochastic-z-query true \
-    --scale-lb 0.01 \
+    --scale-lb 0.0001 \
     --reward-scale 100000 \
     --use-vib true \
     --vib-warmup-frames 500000 \
+    --embedding-viz-interval 5 \
 
 # Stop GPU monitoring
 kill $GPU_MONITOR_PID 2>/dev/null || true
@@ -147,7 +153,7 @@ fi
 cp $SCRDIR/gpu_usage.log $RESULTS_DIR/ 2>/dev/null || true
 
 # Copy the SLURM script for reference
-cp $SCRDIR/PowerGridMARL/EV_Charging_HGTeam_1node.sbatch $RESULTS_DIR/ 2>/dev/null || true
+cp $SCRDIR/PowerGridMARL/EV_Charging_HGTeamHA_1node.sbatch $RESULTS_DIR/ 2>/dev/null || true
 
 # Clean up
 cd $PROJECT_ROOT

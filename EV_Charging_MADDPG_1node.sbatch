@@ -7,8 +7,14 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=128G
 #SBATCH --gres=gpu:1
-#SBATCH -o MADDPGslurmjob-%j.out-%N
-#SBATCH -e MADDPGslurmjob-%j.err-%N
+#SBATCH -o /uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/results/slurm/MADDPGslurmjob-%j.out-%N
+#SBATCH -e /uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/results/slurm/MADDPGslurmjob-%j.err-%N
+
+PROJECT_ROOT=/uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL
+RESULTS_ROOT=$PROJECT_ROOT/results
+RESULTS_DIR=$RESULTS_ROOT/MADDPGresults_$(date +%Y%m%d)_${SLURM_JOB_ID}
+
+mkdir -p "$RESULTS_DIR"
 
 # Set up the temporary directory
 SCRDIR=/scratch/general/vast/$USER/$SLURM_JOB_ID
@@ -16,7 +22,7 @@ mkdir -p $SCRDIR
 
 # Copy the project to scratch directory for faster I/O, excluding old results
 echo "Copying project to scratch directory..."
-rsync -a --exclude='MASACresults_*' --exclude='results_*' /uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/ $SCRDIR/PowerGridMARL/
+rsync -a --exclude='MASACresults_*' --exclude='results_*' --exclude='results' $PROJECT_ROOT/ $SCRDIR/PowerGridMARL/
 echo "Copy complete. Starting experiment..."
 cd $SCRDIR/PowerGridMARL
 
@@ -24,6 +30,7 @@ cd $SCRDIR/PowerGridMARL
 module load benchmarl/3.10.3
 
 export PYTHONPATH=$SCRDIR/PowerGridMARL/PowerGridworld:$SCRDIR/PowerGridMARL/BenchMARL:$PYTHONPATH
+export WANDB_DIR="$RESULTS_DIR/wandb"
 
 # Enable GPU usage
 export CUDA_VISIBLE_DEVICES="0"
@@ -75,6 +82,7 @@ GPU_MONITOR_PID=$!
 
 # MADDPG configuration optimized for faster training - aligned with MASAC improvements
 python BenchMARL/benchmarl/run.py algorithm=maddpg task=PowerGridworld/evovernight13node_simple \
+    hydra.run.dir="$RESULTS_DIR/outputs" \
     model=layers/mlp \
     "model.num_cells=[128,128]" \
     algorithm.share_param_critic=true \
@@ -105,10 +113,6 @@ kill $GPU_MONITOR_PID 2>/dev/null || true
 
 echo "Job completed at: $(date)"
 
-# Create results directory in home
-RESULTS_DIR=/uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/MADDPGresults_$(date +%Y%m%d)_${SLURM_JOB_ID}
-mkdir -p $RESULTS_DIR
-
 # Copy the actual training results from the outputs directory
 if [ -d "$SCRDIR/PowerGridMARL/outputs" ]; then
     cp -r $SCRDIR/PowerGridMARL/outputs/* $RESULTS_DIR/ 2>/dev/null || true
@@ -120,14 +124,6 @@ cp $SCRDIR/gpu_usage.log $RESULTS_DIR/ 2>/dev/null || true
 # Copy the SLURM script for reference
 cp $SCRDIR/PowerGridMARL/EV_Charging_MADDPG_1node.sbatch $RESULTS_DIR/ 2>/dev/null || true
 
-# Copy SLURM output and error files to results directory and clean up from main directory
-cp /uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/MADDPGslurmjob-${SLURM_JOB_ID}.out-* $RESULTS_DIR/ 2>/dev/null || true
-cp /uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/MADDPGslurmjob-${SLURM_JOB_ID}.err-* $RESULTS_DIR/ 2>/dev/null || true
-
-# Clean up SLURM output files from main directory
-rm -f /uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/MADDPGslurmjob-${SLURM_JOB_ID}.out-* 2>/dev/null || true
-rm -f /uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/MADDPGslurmjob-${SLURM_JOB_ID}.err-* 2>/dev/null || true
-
 # Clean up
-cd /uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL
+cd $PROJECT_ROOT
 rm -rf $SCRDIR

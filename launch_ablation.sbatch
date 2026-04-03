@@ -8,8 +8,8 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=384GB
 #SBATCH --gres=gpu:1
-#SBATCH -o Ablationslurmjob-%j.out-%N
-#SBATCH -e Ablationslurmjob-%j.err-%N
+#SBATCH -o /uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/results/slurm/Ablationslurmjob-%j.out-%N
+#SBATCH -e /uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/results/slurm/Ablationslurmjob-%j.err-%N
 #SBATCH --exclude=grn030
 
 # ── Parameterized ablation experiment ──
@@ -30,6 +30,12 @@ WANDB_TAGS=${WANDB_TAGS:-ablation}
 USE_VIB=${USE_VIB:-true}
 REWARD_SCALE=${REWARD_SCALE:-100000}
 
+PROJECT_ROOT=/uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL
+RESULTS_ROOT=$PROJECT_ROOT/results
+RESULTS_DIR=$RESULTS_ROOT/Ablationresults_${GNN_MODE}_seed${SEED}_${SLURM_JOB_ID}
+
+mkdir -p "$RESULTS_DIR"
+
 # Set up the temporary directory
 SCRDIR=/scratch/general/vast/$USER/$SLURM_JOB_ID
 mkdir -p $SCRDIR
@@ -38,11 +44,12 @@ mkdir -p $SCRDIR
 echo "Copying project to scratch directory..."
 rsync -a \
     --exclude='*results_*' \
+    --exclude='results' \
     --exclude='*slurmjob-*' \
     --exclude='outputs' \
     --exclude='wandb' \
     --exclude='.git' \
-    /uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/ $SCRDIR/PowerGridMARL/
+    $PROJECT_ROOT/ $SCRDIR/PowerGridMARL/
 echo "Copy complete. Starting experiment..."
 cd $SCRDIR/PowerGridMARL
 
@@ -50,6 +57,7 @@ cd $SCRDIR/PowerGridMARL
 module load benchmarl/nightly
 
 export PYTHONPATH=$SCRDIR/PowerGridMARL/PowerGridworld:$SCRDIR/PowerGridMARL/BenchMARL:$PYTHONPATH
+export WANDB_DIR="$RESULTS_DIR/wandb"
 
 # Enable GPU usage
 export CUDA_VISIBLE_DEVICES="0"
@@ -87,6 +95,7 @@ python run_hgteam_mlp.py \
     --wandb-name "HGTeam_${GNN_MODE}_seed${SEED}_${SLURM_JOB_ID}" \
     --wandb-group "$WANDB_GROUP" \
     --wandb-tags $WANDB_TAGS \
+    --results-dir "$RESULTS_DIR" \
     --max-n-frames 10000000 \
     --lr 5e-5 \
     --evaluation-interval 12288 \
@@ -116,20 +125,12 @@ kill $GPU_MONITOR_PID 2>/dev/null || true
 echo "Job completed at: $(date)"
 
 # Copy results back
-RESULTS_DIR=/uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/Ablationresults_${GNN_MODE}_seed${SEED}_${SLURM_JOB_ID}
-mkdir -p $RESULTS_DIR
 if [ -d "$SCRDIR/PowerGridMARL/outputs" ]; then
     cp -r $SCRDIR/PowerGridMARL/outputs/* $RESULTS_DIR/ 2>/dev/null || true
 fi
 cp $SCRDIR/gpu_usage.log $RESULTS_DIR/ 2>/dev/null || true
 cp $SCRDIR/PowerGridMARL/launch_ablation.sbatch $RESULTS_DIR/ 2>/dev/null || true
 
-# Copy and clean SLURM logs
-cp /uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/Ablationslurmjob-${SLURM_JOB_ID}.out-* $RESULTS_DIR/ 2>/dev/null || true
-cp /uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/Ablationslurmjob-${SLURM_JOB_ID}.err-* $RESULTS_DIR/ 2>/dev/null || true
-rm -f /uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/Ablationslurmjob-${SLURM_JOB_ID}.out-* 2>/dev/null || true
-rm -f /uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/Ablationslurmjob-${SLURM_JOB_ID}.err-* 2>/dev/null || true
-
 # Clean up scratch
-cd /uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL
+cd $PROJECT_ROOT
 rm -rf $SCRDIR

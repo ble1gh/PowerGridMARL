@@ -726,39 +726,11 @@ class Experiment(CallbackNotifier):
             # Loop over groups
             training_start = time.time()
             self._grad_health_logged = set()  # reset so first minibatch logs
-            for group in self.train_group_map.keys():
-                group_batch = batch.exclude(*self._get_excluded_keys(group))
-                group_batch = self.algorithm.process_batch(group, group_batch)
-                if not self.algorithm.has_rnn:
-                    group_batch = group_batch.reshape(-1)
-
-                group_buffer = self.replay_buffers[group]
-                group_buffer.extend(group_batch.to(group_buffer.storage.device))
-
-                training_tds = []
-                for _ in range(self.config.n_optimizer_steps(self.on_policy)):
-                    for _ in range(
-                        -(
-                            -self.config.train_batch_size(self.on_policy)
-                            // self.config.train_minibatch_size(self.on_policy)
-                        )
-                    ):
-                        training_tds.append(self._optimizer_loop(group))
-                training_td = torch.stack(training_tds)
-                self.logger.log_training(
-                    group, training_td, step=self.n_iters_performed
-                )
-
-                # Callback
-                self._on_train_end(training_td, group)
-
-                # Exploration update
-                if isinstance(self.group_policies[group], TensorDictSequential):
-                    explore_layer = self.group_policies[group][-1]
-                else:
-                    explore_layer = self.group_policies[group]
-                if hasattr(explore_layer, "step"):  # Step exploration annealing
-                    explore_layer.step(current_frames)
+            self.algorithm.train_groups(
+                experiment=self,
+                batch=batch,
+                current_frames=current_frames,
+            )
 
             # Update policy in collector
             if not self.config.collect_with_grad:

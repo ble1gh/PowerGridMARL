@@ -150,6 +150,7 @@ class PowerGridworldClass(TaskClass):
             "signal_tracking": config.get("signal_tracking", False),
             "track_total_load": config.get("track_total_load", False),
             "setpoint": config.get("setpoint", 200.0),
+            "pv_curtailment_reward_penalty": config.get("pv_curtailment_reward_penalty", 0.1),
         }
 
         # Power flow config

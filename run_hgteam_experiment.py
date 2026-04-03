@@ -2,6 +2,7 @@ import sys
 import os
 import argparse
 import datetime
+from pathlib import Path
 import torch
 import torch_geometric.nn as tgnn
 from torch import nn
@@ -19,6 +20,7 @@ from benchmarl.environments.PowerGridworldVariable.common import PowerGridworldV
 def parse_args():
     job_id = os.environ.get("SLURM_JOB_ID", "local")
     date_str = datetime.datetime.now().strftime("%Y%m%d")
+    default_results_dir = Path(__file__).resolve().parent / "results"
 
     parser = argparse.ArgumentParser(description="Run HGTeam experiment")
 
@@ -26,6 +28,7 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--project-name", type=str, default="PowerGridworldVariable_VPP")
     parser.add_argument("--wandb-name", type=str, default=f"HGTeam_{date_str}_{job_id}")
+    parser.add_argument("--results-dir", type=Path, default=default_results_dir)
     parser.add_argument("--max-n-frames", type=int, default=10_000_000)
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--evaluation-interval", type=int, default=12288)
@@ -94,6 +97,10 @@ def parse_args():
 def main():
     args = parse_args()
     print("Preparing Experiment...")
+
+    results_dir = args.results_dir.resolve()
+    results_dir.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("WANDB_DIR", str(results_dir / "wandb"))
 
     # Critic Configuration (Different from Actor)
     # When share_critic_across_groups=True, the critic GNN natively handles
@@ -224,6 +231,7 @@ def main():
     experiment_config.evaluation_interval = args.evaluation_interval
     experiment_config.project_name = args.project_name
     experiment_config.loggers = ["wandb"]
+    experiment_config.save_folder = str(results_dir)
     experiment_config.wandb_extra_kwargs = {"name": args.wandb_name}
 
     if args.algorithm == "sac":

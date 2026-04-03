@@ -95,38 +95,49 @@ class HGTeamSACLoss(SACLoss):
         # --- PRE-FORWARD: Fill missing next-actions for OTHER groups ---
         # The shared Q-network (HeteroGNN) requires inputs from ALL groups.
         # SACLoss only computes next-action for the current group.
-        # We must manually compute next-actions for other groups using their *current* policies.
-        # (Using current policy for neighbors is a standard approximation in MARL if full target-sharing is hard)
+        # We must manually compute next-actions for other groups using their
+        # *current* policies on a CLONE of next_td to avoid mutating the
+        # original batch.
+        #
+        # Stale-params approximation: groups are trained sequentially within
+        # each iteration (Group A → step → Group B → step → …).  When Group
+        # B evaluates Group A's policy here, the shared GNN has already been
+        # updated by Group A's optimizer step, so the next-actions come from
+        # a slightly different policy than the one that collected the data.
+        # This is a standard MARL approximation (Citation) and is minor for off-policy
+        # SAC (N=3, one gradient step of drift).  For HAPPO, the sequential-
+        # update design will handle this differently (frozen encoder).
         if self.algorithm.has_centralized_critic:
+            next_td_peer = next_td.clone()
             with torch.no_grad():
                 for g in self.algorithm.group_map.keys():
                     if g == self.group:
                         continue
-                    
-                    # Check if action/mu already exist in next_td (unlikely)
+
                     has_action = (g, "action") in next_td.keys(True, True)
                     has_mu = (g, "embedding_mu") in next_td.keys(True, True)
-                    
+
                     if not has_action or (self.algorithm.critic_use_mu and not has_mu):
-                        # Get policy for this other group
-                        # Note: get_policy_for_loss creates a new Module instance but shares underlying parameters
                         other_policy = self.algorithm.get_policy_for_loss(
                             group=g
                         )
-                        
-                        # Run policy to populate keys in next_td (in-place)
-                        # We detach to stop gradients flowing through peers
-                        other_policy(next_td)
-                        
-                        # Detach the newly created tensors
-                        if (g, "action") in next_td.keys(True, True):
-                            next_td.set((g, "action"), next_td.get((g, "action")).detach())
-                        if (g, "embedding_mu") in next_td.keys(True, True):
-                            next_td.set((g, "embedding_mu"), next_td.get((g, "embedding_mu")).detach())
+                        # Run on clone to avoid polluting the original batch
+                        other_policy(next_td_peer)
 
-        # --- DEBUG: Print next_td keys before SAC forward ---
-        # print(f"DEBUG: HGTeamSACLoss forward. Group: {self.group}")
-        # print("DEBUG: keys in next_td:", sorted([str(k) for k in next_td.keys(True, True)]))
+            # Copy only the keys we need back to next_td (detached)
+            for g in self.algorithm.group_map.keys():
+                if g == self.group:
+                    continue
+                if (g, "action") in next_td_peer.keys(True, True):
+                    next_td.set(
+                        (g, "action"),
+                        next_td_peer.get((g, "action")).detach(),
+                    )
+                if (g, "embedding_mu") in next_td_peer.keys(True, True):
+                    next_td.set(
+                        (g, "embedding_mu"),
+                        next_td_peer.get((g, "embedding_mu")).detach(),
+                    )
         
         # --- PRE-FORWARD: make participation scores grad-enabled ----
         self._grad_participation_ref = None
@@ -336,6 +347,7 @@ class HGTeamSAC(HGTeamBase):
         # Build param groups with separate LRs
         # Scale shared GNN encoder LR by 1/num_groups to compensate for
         # the shared params receiving one Adam step per group per iteration.
+        # Note: same √N bias caveat as HGTeam._split_shared_gnn_param_groups.
         num_groups = len(self.group_map)
         encoder_lr = self.lr_encoder / max(num_groups, 1)
         actor_param_groups = []
@@ -385,6 +397,7 @@ class HGTeamSAC(HGTeamBase):
     # Override: process_batch (no GAE, no minibatch splitting)
     # ------------------------------------------------------------------
     def process_batch(self, group: str, batch: TensorDictBase) -> TensorDictBase:
+        batch = batch.to(self.device)
         keys = list(batch.keys(True, True))
         group_shape = batch.get(group).shape
 
@@ -602,60 +615,60 @@ class HGTeamSACConfig(AlgorithmConfig):
     """Configuration for HGTeamSAC — SAC-based variant of HGTeam."""
 
     # --- HGTeam architecture parameters (same as HGTeamConfig) ----------
-    share_param_critic: bool = True
-    scale_mapping: str = "biased_softplus_1.0"
-    scale_lb: float = 0.1
-    use_tanh_normal: bool = False
-    use_beta: bool = True
-    beta_min_param: float = 1.0
+    share_param_critic: bool = MISSING
+    scale_mapping: str = MISSING
+    scale_lb: float = MISSING
+    use_tanh_normal: bool = MISSING
+    use_beta: bool = MISSING
+    beta_min_param: float = MISSING
 
-    share_critic_across_groups: bool = True
-    centralised_value_per_agent: bool = True
-    gnn_mode: str = "learned_query"
-    z_dim: int = 32
-    hypernet_actor_feature_dim: int = 64
-    stochastic_z: bool = True
-    embedding_entropy_coef: float = 0.0
-    embedding_diversity_coef: float = 0.0
+    share_critic_across_groups: bool = MISSING
+    centralised_value_per_agent: bool = MISSING
+    gnn_mode: str = MISSING
+    z_dim: int = MISSING
+    hypernet_actor_feature_dim: int = MISSING
+    stochastic_z: bool = MISSING
+    embedding_entropy_coef: float = MISSING
+    embedding_diversity_coef: float = MISSING
 
-    gnn_num_layers: int = 3
-    gnn_heads: int = 2
-    gnn_concat_heads: bool = False
-    gnn_use_beta: bool = True
-    gnn_self_loops: bool = True
-    gnn_agent_node_feature_key: Optional[str] = "participation_score"
-    gnn_agent_node_feature_dim: int = 1
-    gnn_norm_class: Optional[str] = None
-    critic_embed_dim: int = 32
+    gnn_num_layers: int = MISSING
+    gnn_heads: int = MISSING
+    gnn_concat_heads: bool = MISSING
+    gnn_use_beta: bool = MISSING
+    gnn_self_loops: bool = MISSING
+    gnn_agent_node_feature_key: Optional[str] = MISSING
+    gnn_agent_node_feature_dim: int = MISSING
+    gnn_norm_class: Optional[str] = MISSING
+    critic_embed_dim: int = MISSING
 
-    split_z: bool = False
-    z_token_dim: int = 32
-    z_query_dim: int = 32
-    stochastic_z_query: bool = True
+    split_z: bool = MISSING
+    z_token_dim: int = MISSING
+    z_query_dim: int = MISSING
+    stochastic_z_query: bool = MISSING
 
-    use_vib: bool = False
-    vib_beta: float = 0.01
-    vib_warmup_frames: int = 500_000
+    use_vib: bool = MISSING
+    vib_beta: float = MISSING
+    vib_warmup_frames: int = MISSING
 
     # --- SAC-specific parameters ----------------------------------------
-    alpha_init: float = 1.0
-    target_entropy: Union[float, str] = "auto"
-    num_qvalue_nets: int = 2
-    fixed_alpha: bool = False
-    delay_qvalue: bool = True
-    min_alpha: Optional[float] = None
-    max_alpha: Optional[float] = None
-    loss_function: str = "l2"
+    alpha_init: float = MISSING
+    target_entropy: Union[float, str] = MISSING
+    num_qvalue_nets: int = MISSING
+    fixed_alpha: bool = MISSING
+    delay_qvalue: bool = MISSING
+    min_alpha: Optional[float] = MISSING  # null in YAML
+    max_alpha: Optional[float] = MISSING  # null in YAML
+    loss_function: str = MISSING
 
     # --- Gradient control -----------------------------------------------
-    detach_action_from_q: bool = False
-    detach_z_from_transformer: bool = True
-    critic_use_mu: bool = True
+    detach_action_from_q: bool = MISSING
+    detach_z_from_transformer: bool = MISSING
+    critic_use_mu: bool = MISSING
 
     # --- Learning rates -------------------------------------------------
-    lr_actor: float = 3e-4
-    lr_encoder: float = 1e-4
-    lr_critic: float = 3e-4
+    lr_actor: float = MISSING
+    lr_encoder: float = MISSING
+    lr_critic: float = MISSING
 
     @staticmethod
     def associated_class() -> Type["HGTeamSAC"]:

@@ -56,7 +56,7 @@ max_charge_duration_min: 720     # Maximum charging stay (minutes)
 
 # Global reward penalty scaling parameters
 power_loss_penalty: 0   # Scaling factor for power loss reward (higher = more penalty)
-voltage_penalty: 1e3     # Scaling factor for voltage violation reward (higher = more penalty)
+voltage_penalty: 50      # Scaling factor for voltage violation reward (reduced from 1e3 to let VPP signal through)
 cooperative_voltage: False # If True, voltage penalty is applied to all agents. If False, only to agents at violating node.
 load_2norm_penalty: 0         # Scaling factor for load penalty (higher = more penalty)
 tracking_reward_penalty: 0    # Scaling factor for tracking reward (disabled for VPP task)
@@ -68,6 +68,7 @@ min_pv_scaling_factor: 5.0  # Minimum PV capacity (kW) when sampling
 max_pv_scaling_factor: 10.0  # Maximum PV capacity (kW) when sampling
 pv_profile_noise_std: 0.05  # Std dev of Gaussian noise on normalized PV profile (0 = no noise)
 pv_grid_aware: False
+pv_curtailment_reward_penalty: 0.1  # Reward penalty scaling for PV curtailment (utilization * penalty)
 
 # Energy Storage agent parameters
 storage_range_min: 3.0
@@ -89,3 +90,4 @@ setpoint: 0.
 vpp_reward: True
 vpp_setpoint: 25.0    # Target VPP production (kW)
 vpp_reward_penalty: 1e-1  # Scaling factor for quadratic VPP tracking penalty
+vpp_reward_linear_penalty: 0.5  # Scaling factor for linear VPP tracking term (persistent gradient near setpoint)

@@ -72,6 +72,9 @@ class PVEnv(ComponentEnv):
         self.profile_noise_std = profile_noise_std
         self.rescale_spaces = rescale_spaces
         self.grid_aware = grid_aware
+        self.pv_curtailment_reward_penalty = float(
+            kwargs.get("pv_curtailment_reward_penalty", 0.1)
+        )
 
         # Read csv file.  If a full path is provide, that overrides reference to 
         # names of csv files stored locally in the `profiles` directory.
@@ -97,6 +100,8 @@ class PVEnv(ComponentEnv):
         self._current_pv = 0.0
         # Pre-noise scaled value at current time (for participation score)
         self._current_pv_base = 0.0
+        # One-step-ahead PV base forecast (for participation_score)
+        self._next_pv_base = 0.0
         
         # Fallback index for standalone usage (no current_time provided).
         # When current_time is supplied, this is ignored.
@@ -134,13 +139,11 @@ class PVEnv(ComponentEnv):
 
     @property
     def participation_score(self) -> float:
-        """Returns the participation score for this PV agent.
-
-        Defined as the pre-noise, scaled profile value at the current time of
-        day (base_data * scaling_factor interpolated at the current timestamp).
-        This represents the *predicted* PV output before stochastic noise.
+        """Returns the one-step-ahead PV forecast (pre-noise, scaled profile
+        value at the *next* control interval).  Used as a GNN node feature so
+        the policy knows upcoming solar availability when choosing actions.
         """
-        return float(self._current_pv_base)
+        return float(self._next_pv_base)
 
     def _lookup_time(self, current_time):
         """Interpolate the 24-hour profile at the given time of day.
@@ -165,6 +168,21 @@ class PVEnv(ComponentEnv):
         self._current_pv = float(np.interp(hour_of_day, self._profile_hours, self.data))
         # Pre-noise scaled value for participation score
         self._current_pv_base = float(
+            np.interp(hour_of_day, self._profile_hours,
+                      self.base_data * self.scaling_factor)
+        )
+
+    def _lookup_next_pv_base(self, next_time):
+        """Look up the base PV profile at next_time for participation_score."""
+        if next_time is None:
+            self._next_pv_base = self._current_pv_base
+            return
+        hour_of_day = (
+            next_time.hour
+            + next_time.minute / 60.0
+            + next_time.second / 3600.0
+        )
+        self._next_pv_base = float(
             np.interp(hour_of_day, self._profile_hours,
                       self.base_data * self.scaling_factor)
         )
@@ -216,8 +234,24 @@ class PVEnv(ComponentEnv):
 
 
     def step_reward(self, **kwargs):
-        """Step reward is always zero."""
-        return 0., {}
+        """Reward PV utilization to discourage curtailment.
+
+        Reward is bounded in [0, pv_curtailment_reward_penalty] per step.
+        """
+        available_pv = max(float(self._current_pv), 0.0)
+        if available_pv <= 1e-6:
+            return 0.0, {
+                "pv_curtailment_reward": 0.0,
+                "pv_utilization": 0.0,
+            }
+
+        actual_pv = max(-float(self._real_power), 0.0)
+        utilization = float(np.clip(actual_pv / available_pv, 0.0, 1.0))
+        reward = utilization * self.pv_curtailment_reward_penalty
+        return reward, {
+            "pv_curtailment_reward": reward,
+            "pv_utilization": utilization,
+        }
 
 
     def reset(self, **kwargs):
@@ -233,6 +267,8 @@ class PVEnv(ComponentEnv):
             self._use_time_lookup = False
             self._current_pv = self.data[0]
             self._current_pv_base = self.base_data[0] * self.scaling_factor
+        # Initialize next-step forecast for participation_score
+        self._lookup_next_pv_base(kwargs.get("next_time", None))
         self.get_obs(**kwargs)
 
 
@@ -245,6 +281,8 @@ class PVEnv(ComponentEnv):
 
         # Update PV value from time of day, then get observation
         obs, obs_meta = self.get_obs(**kwargs)
+        # Compute one-step-ahead PV base for participation_score forecast
+        self._lookup_next_pv_base(kwargs.get("next_time", None))
         self._real_power = np.float64((action * obs_meta["real_power"]).squeeze())
         obs_meta["real_power"] = float(self._real_power)
         
@@ -252,6 +290,8 @@ class PVEnv(ComponentEnv):
         if not self._use_time_lookup:
             self._index += 1
         
-        rew, _ = self.step_reward(**kwargs)
+        rew, rew_meta = self.step_reward(**kwargs)
+        if isinstance(rew_meta, dict):
+            obs_meta.update(rew_meta)
 
         return obs, rew, self.is_terminal(), obs_meta

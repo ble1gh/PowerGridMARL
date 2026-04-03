@@ -743,6 +743,8 @@ class PowerGridworldVariableClass(TaskClass):
             "vpp_reward": config.get("vpp_reward", False),
             "vpp_setpoint": config.get("vpp_setpoint", 0.0),
             "vpp_reward_penalty": config.get("vpp_reward_penalty", 1.0),
+            "vpp_reward_linear_penalty": config.get("vpp_reward_linear_penalty", 0.5),
+            "pv_curtailment_reward_penalty": config.get("pv_curtailment_reward_penalty", 0.1),
         }
 
         # Power flow config

@@ -80,6 +80,11 @@ class MultiAgentEnv(EnvBase):
         self.vpp_reward_penalty = float(common_config.get("vpp_reward_penalty", 1.0))
         if "vpp_reward_penalty" not in common_config:
             logger.info(f"Using default vpp_reward_penalty: {self.vpp_reward_penalty}")
+
+        self.vpp_reward_linear_penalty = float(common_config.get("vpp_reward_linear_penalty", 0.5))
+        if "vpp_reward_linear_penalty" not in common_config:
+            logger.info(f"Using default vpp_reward_linear_penalty: {self.vpp_reward_linear_penalty}")
+
             
         self.cooperative_voltage = common_config.get("cooperative_voltage", True)
         if "cooperative_voltage" not in common_config:
@@ -483,6 +488,10 @@ class MultiAgentEnv(EnvBase):
         # (e.g. PVEnv) can look up the correct profile value.
         kwargs["current_time"] = self.time
 
+        # Pass the *next* timestamp so agents can compute one-step-ahead
+        # forecasts for participation_score (used as GNN node features).
+        kwargs["next_time"] = self.time + pd.Timedelta(seconds=self.control_timedelta)
+
         # Get the bus voltage at the agent's bus.
         if "bus_voltage" in agent.obs_labels:
             kwargs["bus_voltage"] = self.pf_solver.get_bus_voltage_by_name(
@@ -527,6 +536,8 @@ class MultiAgentEnv(EnvBase):
         # Reset the controllable agents and collect their obs arrays
         for agent in self.agents:
             kwargs = self.get_external_obs_vars(agent, seed=seed)
+            # Also pass next_time for the very first observation's forecast
+            kwargs["next_time"] = self.time + pd.Timedelta(seconds=self.control_timedelta)
             _ = agent.reset(**kwargs)
 
         # Return observations and an empty info dictionary
@@ -760,6 +771,8 @@ class MultiAgentEnv(EnvBase):
         # - PV / Energy Storage: VPP contribution = -real_power (net injection to grid)
         # - EV: VPP contribution = max_real_power - real_power (demand response)
         vpp_reward_value = 0.0
+        vpp_quadratic = 0.0
+        vpp_linear = 0.0
         total_vpp_production = 0.0
         if self.vpp_reward:
             for i, agent in enumerate(self.agents):
@@ -774,12 +787,14 @@ class MultiAgentEnv(EnvBase):
                     # PV / Storage: net power injection = -real_power
                     total_vpp_production += (-agent.real_power)
             
-            # Quadratic penalty on normalized error from VPP setpoint
+            # Combined quadratic + linear penalty on normalized error from VPP setpoint
             vpp_error = total_vpp_production - self.vpp_setpoint
             vpp_denom = max(abs(self.vpp_setpoint), 1.0)
             vpp_error_norm = vpp_error / vpp_denom
-            vpp_reward_value = -(vpp_error_norm ** 2) * self.vpp_reward_penalty
-    
+            vpp_quadratic = -(vpp_error_norm ** 2) * self.vpp_reward_penalty
+            vpp_linear = -abs(vpp_error_norm) * self.vpp_reward_linear_penalty
+            vpp_reward_value = vpp_quadratic + vpp_linear
+
         # Calculate the power loss reward using instance variable
         power_loss_reward = -self.losses[0] * self.power_loss_penalty
 
@@ -807,26 +822,23 @@ class MultiAgentEnv(EnvBase):
         # print(f"base_load: {self.history['base_load'][:]}")
         load_2norm_penalty = -np.linalg.norm(total_load_array) * self.load_2norm_penalty
 
-        # Store global reward components for group-level logging
-        self._global_reward_components = {
-            "power_loss_reward": float(power_loss_reward),
-            "voltage_reward": float(voltage_reward),
-            "load_2norm_penalty": float(load_2norm_penalty),
-            "tracking_reward": float(tracking_reward),
-            "vpp_reward": float(vpp_reward_value),
-            "vpp_production": float(total_vpp_production),
-        }
-
         # Add global rewards to each agent's reward individually
+        total_applied_voltage_penalty = 0.0
         for agent_name in rew_dict:
             if isinstance(rew_dict[agent_name], (int, float)):
                 # Base global rewards (loss, load stability, tracking, VPP)
-                rew_dict[agent_name] += power_loss_reward + load_2norm_penalty + tracking_reward + vpp_reward_value
+                rew_dict[agent_name] += (
+                    power_loss_reward
+                    + load_2norm_penalty
+                    + tracking_reward
+                    + vpp_reward_value
+                )
                 
                 # Voltage Reward Logic
                 if self.cooperative_voltage:
                     # Apply total system voltage penalty to everyone
                     rew_dict[agent_name] += voltage_reward
+                    total_applied_voltage_penalty += voltage_reward
                 else:
                     # Apply local voltage penalty only
                     # Use the map we created in __init__
@@ -842,14 +854,34 @@ class MultiAgentEnv(EnvBase):
                                  v = float(v)
                                  
                              if v < 0.95:
-                                 local_penalty = -(0.95 - v) * self.voltage_penalty
+                                 local_penalty = (v - 0.95) * self.voltage_penalty
                                  rew_dict[agent_name] += local_penalty
+                                 total_applied_voltage_penalty += local_penalty
+                             elif v > 1.05:
+                                 local_penalty = (v - 1.05) * self.voltage_penalty
+                                 rew_dict[agent_name] += local_penalty
+                                 total_applied_voltage_penalty += local_penalty
+
                          except Exception as e:
                              # Fallback or silent ignore if bus not found in solver
                              pass
                     # If bus has no violation, or bus unknown, 0 penalty added
             else:
                 logger.warning(f"Reward for agent {agent_name} is not a number: {rew_dict[agent_name]}")
+
+        # Store global reward components for group-level logging
+        # voltage_reward logged is the sum of penalties actually applied to agents
+        # (not the system-wide total across all buses, which includes agent-less buses)
+        self._global_reward_components = {
+            "power_loss_reward": float(power_loss_reward),
+            "voltage_reward": float(total_applied_voltage_penalty),
+            "load_2norm_penalty": float(load_2norm_penalty),
+            "tracking_reward": float(tracking_reward),
+            "vpp_reward": float(vpp_reward_value),
+            "vpp_reward_quadratic": float(vpp_quadratic),
+            "vpp_reward_linear": float(vpp_linear),
+            "vpp_production": float(total_vpp_production),
+        }
 
         # Track individual agent rewards for the episode
         for agent_name in rew_dict:

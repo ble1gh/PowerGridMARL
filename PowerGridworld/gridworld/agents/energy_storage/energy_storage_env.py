@@ -81,11 +81,12 @@ class EnergyStorageEnv(ComponentEnv):
 
     @property
     def participation_score(self) -> float:
-        """Returns the participation score for this energy storage agent.
-
-        Defined as the maximum storage capacity (upper bound of storage_range
-        in kWh), representing the full energy capacity of the device.
+        """Returns the current state of charge (kWh) as the participation
+        score.  This dynamic signal tells the GNN how much headroom the
+        battery has for charging or discharging at each timestep.
         """
+        if self.current_storage is not None:
+            return float(self.current_storage)
         return float(self.storage_range[1])
 
     def reset(self, **kwargs):

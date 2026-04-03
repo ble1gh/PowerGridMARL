@@ -18,9 +18,16 @@
 # #SBATCH --gres=gpu:a800:1       # ~80GB VRAM
 # #SBATCH --gres=gpu:h100nvl:1       # ~141GB VRAM
 
-#SBATCH -o HGTeamSACslurmjob-%j.out-%N
-#SBATCH -e HGTeamSACslurmjob-%j.err-%N
+#SBATCH -o /uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/results/slurm/HGTeamSACslurmjob-%j.out-%N
+#SBATCH -e /uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/results/slurm/HGTeamSACslurmjob-%j.err-%N
 #SBATCH --exclude=grn030
+
+
+PROJECT_ROOT=/uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL
+RESULTS_ROOT=$PROJECT_ROOT/results
+RESULTS_DIR=$RESULTS_ROOT/HGTeamSACresults_$(date +%Y%m%d)_${SLURM_JOB_ID}
+
+mkdir -p "$RESULTS_DIR"
 
 
 # Set up the temporary directory
@@ -31,11 +38,12 @@ mkdir -p $SCRDIR
 echo "Copying project to scratch directory..."
 rsync -a \
     --exclude='*results_*' \
+    --exclude='results' \
     --exclude='*slurmjob-*' \
     --exclude='outputs' \
     --exclude='wandb' \
     --exclude='.git' \
-    /uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/ $SCRDIR/PowerGridMARL/
+    $PROJECT_ROOT/ $SCRDIR/PowerGridMARL/
 echo "Copy complete. Starting experiment..."
 cd $SCRDIR/PowerGridMARL
 
@@ -43,6 +51,7 @@ cd $SCRDIR/PowerGridMARL
 module load benchmarl/nightly
 
 export PYTHONPATH=$SCRDIR/PowerGridMARL/PowerGridworld:$SCRDIR/PowerGridMARL/BenchMARL:$PYTHONPATH
+export WANDB_DIR="$RESULTS_DIR/wandb"
 
 # Enable GPU usage
 export CUDA_VISIBLE_DEVICES="0"
@@ -86,7 +95,7 @@ nvidia-smi
 echo "CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES"
 
 # Check if PyTorch can see GPU
-python -c "import torch; print(f'PyTorch version: {torch.__version__}'); print(f'CUDA available: {torch.cuda.is_available()}'); print(f'CUDA devices: {torch.cuda.device_count()}'); print(f'GPU Memory: {torch.cuda.get_device_properties(0).total_mem / 1024**3:.1f} GB')"
+python -c "import torch; print(f'PyTorch version: {torch.__version__}'); print(f'CUDA available: {torch.cuda.is_available()}'); print(f'CUDA devices: {torch.cuda.device_count()}'); print(f'GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB')"
 
 # Start background GPU monitoring
 nvidia-smi dmon -d 10 -s pucvmet -f $SCRDIR/gpu_usage.log &
@@ -98,6 +107,7 @@ python run_hgteam_mlp.py \
     --seed 42 \
     --project-name "PowerGridworldVariable_VPP" \
     --wandb-name "HGTeamSAC_$(date +%Y%m%d)_${SLURM_JOB_ID}_2layergnn_mlp" \
+    --results-dir "$RESULTS_DIR" \
     --max-n-frames 10000000 \
     --lr 1e-4 \
     --lr-actor 1e-4 \
@@ -139,10 +149,6 @@ kill $GPU_MONITOR_PID 2>/dev/null || true
 
 echo "Job completed at: $(date)"
 
-# Create results directory in home
-RESULTS_DIR=/uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/HGTeamSACresults_$(date +%Y%m%d)_${SLURM_JOB_ID}
-mkdir -p $RESULTS_DIR
-
 # Copy the actual training results from the outputs directory
 if [ -d "$SCRDIR/PowerGridMARL/outputs" ]; then
     cp -r $SCRDIR/PowerGridMARL/outputs/* $RESULTS_DIR/ 2>/dev/null || true
@@ -154,13 +160,6 @@ cp $SCRDIR/gpu_usage.log $RESULTS_DIR/ 2>/dev/null || true
 # Copy the SLURM script for reference
 cp $SCRDIR/PowerGridMARL/EV_Charging_HGTeamSAC_1node.sbatch $RESULTS_DIR/ 2>/dev/null || true
 
-# Copy SLURM output and error files to results directory and clean up from main directory
-cp /uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/HGTeamSACslurmjob-${SLURM_JOB_ID}.out-* $RESULTS_DIR/ 2>/dev/null || true
-cp /uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/HGTeamSACslurmjob-${SLURM_JOB_ID}.err-* $RESULTS_DIR/ 2>/dev/null || true
-
-# Clean up SLURM output files from main directory
-rm -f /uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/HGTeamSACslurmjob-${SLURM_JOB_ID}.out-* 2>/dev/null || true
-rm -f /uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/HGTeamSACslurmjob-${SLURM_JOB_ID}.err-* 2>/dev/null || true
-
 # Clean up
-cd /uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL
+cd $PROJECT_ROOT
+rm -rf $SCRDIR

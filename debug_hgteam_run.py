@@ -1,9 +1,11 @@
-"""Small-scale smoke tests for HGTeam (PPO) and HGTeamSAC.
+"""Small-scale smoke tests for HGTeam (PPO), HGTeamSAC, and HGTeamHAPPO.
 
 Usage:
-    python debug_hgteam_run.py          # run both PPO and SAC tests
+    python debug_hgteam_run.py          # run PPO and SAC tests
     python debug_hgteam_run.py ppo      # PPO only
     python debug_hgteam_run.py sac      # SAC only
+    python debug_hgteam_run.py happo    # HAPPO only
+    python debug_hgteam_run.py all      # run all three tests
 """
 
 import argparse
@@ -15,7 +17,7 @@ import torch_geometric.nn as tgnn
 # Ensure BenchMARL is in path
 sys.path.append(os.path.join(os.getcwd(), "BenchMARL"))
 
-from benchmarl.algorithms import HGTeamConfig, HGTeamSACConfig
+from benchmarl.algorithms import HGTeamConfig, HGTeamSACConfig, HGTeamHAPPOConfig
 from benchmarl.models import HeteroGnnConfig, MlpConfig, SequenceModelConfig, TransformerConfig
 from benchmarl.experiment import Experiment, ExperimentConfig
 from benchmarl.environments.PowerGridworldVariable.common import PowerGridworldVariableTask
@@ -208,6 +210,64 @@ def run_sac_test():
 
 
 # ------------------------------------------------------------------
+# HGTeamHAPPO test
+# ------------------------------------------------------------------
+
+def run_happo_test():
+    print("=" * 60)
+    print("  HGTeamHAPPO — DEBUG smoke test")
+    print("=" * 60)
+
+    algorithm_config = HGTeamHAPPOConfig.get_from_yaml()
+    algorithm_config.entropy_coef = 0.5
+    algorithm_config.gnn_mode = "concat"
+    algorithm_config.embedding_entropy_coef = 0
+    algorithm_config.embedding_diversity_coef = 0
+    algorithm_config.stochastic_z = True
+    algorithm_config.z_dim = 32
+    algorithm_config.hypernet_actor_feature_dim = 64
+    algorithm_config.encoder_update_mode = "accumulated"
+    algorithm_config.fixed_order = False
+
+    task = PowerGridworldVariableTask.EVOVERNIGHT13NODE_VPP.get_from_yaml()
+
+    experiment_config = ExperimentConfig.get_from_yaml()
+    experiment_config.sampling_device = "cpu"
+    experiment_config.train_device = _device()
+    experiment_config.collection_policy_device = _device()
+    experiment_config.share_policy_params = True
+    experiment_config.lr = 5e-6
+    experiment_config.evaluation_episodes = 1
+    experiment_config.evaluation_static = False
+
+    # Minimal scale
+    experiment_config.parallel_collection = False
+    experiment_config.on_policy_n_envs_per_worker = 2
+    experiment_config.on_policy_collected_frames_per_batch = 192
+    experiment_config.on_policy_minibatch_size = 25
+    experiment_config.on_policy_n_minibatch_iters = 2
+    experiment_config.max_n_frames = 384
+    experiment_config.evaluation_interval = 192
+
+    experiment_config.loggers = []
+    experiment_config.create_json = True
+    experiment_config.checkpoint_at_end = False
+
+    experiment = Experiment(
+        task=task,
+        algorithm_config=algorithm_config,
+        model_config=_actor_model_config(),
+        critic_model_config=_critic_gnn_config(),
+        seed=42,
+        config=experiment_config,
+    )
+
+    print("\nStarting HAPPO debug run...")
+    experiment.run()
+    print("HAPPO debug run completed successfully!\n")
+
+
+# ------------------------------------------------------------------
 # Main
 # ------------------------------------------------------------------
 
@@ -215,15 +275,17 @@ def main():
     parser = argparse.ArgumentParser(description="HGTeam debug smoke tests")
     parser.add_argument(
         "mode", nargs="?", default="both",
-        choices=["ppo", "sac", "both"],
-        help="Which algorithm to test (default: both)",
+        choices=["ppo", "sac", "happo", "both", "all"],
+        help="Which algorithm to test (default: both = ppo+sac; all = ppo+sac+happo)",
     )
     args = parser.parse_args()
 
-    if args.mode in ("ppo", "both"):
+    if args.mode in ("ppo", "both", "all"):
         run_ppo_test()
-    if args.mode in ("sac", "both"):
+    if args.mode in ("sac", "both", "all"):
         run_sac_test()
+    if args.mode in ("happo", "all"):
+        run_happo_test()
 
     print("All requested debug tests passed!")
 

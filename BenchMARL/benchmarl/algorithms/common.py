@@ -364,6 +364,52 @@ class Algorithm(ABC):
         """
         return loss_vals
 
+    def train_groups(self, experiment, batch, current_frames: int):
+        """Train all groups for one collection iteration.
+
+        The default implementation processes and trains each group independently
+        in sequence.  Algorithms that need cross-group coordination (e.g. HAPPO)
+        can override this method.
+
+        Args:
+            experiment: the running :class:`Experiment` instance
+            batch: the collected TensorDict batch
+            current_frames: number of frames collected this iteration
+        """
+        import torch
+
+        for group in experiment.train_group_map.keys():
+            group_batch = batch.exclude(*experiment._get_excluded_keys(group))
+            group_batch = self.process_batch(group, group_batch)
+            if not self.has_rnn:
+                group_batch = group_batch.reshape(-1)
+
+            group_buffer = experiment.replay_buffers[group]
+            group_buffer.extend(group_batch.to(group_buffer.storage.device))
+
+            training_tds = []
+            for _ in range(experiment.config.n_optimizer_steps(self.on_policy)):
+                for _ in range(
+                    -(
+                        -experiment.config.train_batch_size(self.on_policy)
+                        // experiment.config.train_minibatch_size(self.on_policy)
+                    )
+                ):
+                    training_tds.append(experiment._optimizer_loop(group))
+            training_td = torch.stack(training_tds)
+            experiment.logger.log_training(
+                group, training_td, step=experiment.n_iters_performed
+            )
+
+            experiment._on_train_end(training_td, group)
+
+            if isinstance(experiment.group_policies[group], TensorDictSequential):
+                explore_layer = experiment.group_policies[group][-1]
+            else:
+                explore_layer = experiment.group_policies[group]
+            if hasattr(explore_layer, "step"):
+                explore_layer.step(current_frames)
+
 
 @dataclass
 class AlgorithmConfig:

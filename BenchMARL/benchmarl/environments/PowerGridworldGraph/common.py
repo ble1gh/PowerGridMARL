@@ -361,6 +361,7 @@ class PowerGridworldGraphClass(TaskClass):
             "track_total_load": config.get("track_total_load", False),
             "setpoint": config.get("setpoint", 200.0),
             "include_load_in_agent_obs": config.get("include_load_in_agent_obs", True),
+            "pv_curtailment_reward_penalty": config.get("pv_curtailment_reward_penalty", 0.1),
         }
 
         # Power flow config

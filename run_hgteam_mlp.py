@@ -2,6 +2,7 @@ import sys
 import os
 import argparse
 import datetime
+from pathlib import Path
 import torch
 import torch_geometric.nn as tgnn
 from torch import nn
@@ -9,16 +10,18 @@ from torch import nn
 # Ensure BenchMARL is in path
 sys.path.append(os.path.join(os.getcwd(), "BenchMARL"))
 
-from benchmarl.algorithms import HGTeamConfig, HGTeamSACConfig
-from benchmarl.models import HeteroGnnConfig, MlpConfig, SequenceModelConfig, TransformerConfig
+from benchmarl.algorithms import HGTeamConfig, HGTeamSACConfig, HGTeamHAPPOConfig
+from benchmarl.models import HeteroGnnConfig, MlpConfig, SequenceModelConfig
 from benchmarl.models.lstm import LstmConfig
 from benchmarl.experiment import Experiment, ExperimentConfig
+from benchmarl.experiment.embedding_viz_callback import EmbeddingVizCallback
 from benchmarl.environments.PowerGridworldVariable.common import PowerGridworldVariableTask
 
 
 def parse_args():
     job_id = os.environ.get("SLURM_JOB_ID", "local")
     date_str = datetime.datetime.now().strftime("%Y%m%d")
+    default_results_dir = Path(__file__).resolve().parent / "results"
 
     parser = argparse.ArgumentParser(description="Run HGTeam experiment")
 
@@ -30,6 +33,7 @@ def parse_args():
                         help="WandB group for organizing related runs")
     parser.add_argument("--wandb-tags", type=str, nargs="*", default=None,
                         help="WandB tags for filtering runs")
+    parser.add_argument("--results-dir", type=Path, default=default_results_dir)
     parser.add_argument("--max-n-frames", type=int, default=10_000_000)
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--evaluation-interval", type=int, default=12288)
@@ -64,8 +68,8 @@ def parse_args():
 
     # --- Algorithm selection ---
     parser.add_argument("--algorithm", type=str, default="ppo",
-                        choices=["ppo", "sac"],
-                        help="Base RL algorithm: ppo (HGTeam) or sac (HGTeamSAC)")
+                        choices=["ppo", "sac", "happo"],
+                        help="Base RL algorithm: ppo (HGTeam), sac (HGTeamSAC), or happo (HGTeamHAPPO)")
 
     # --- SAC-specific ---
     parser.add_argument("--alpha-init", type=float, default=1.0)
@@ -82,12 +86,23 @@ def parse_args():
     parser.add_argument("--lr-encoder", type=float, default=1e-4)
     parser.add_argument("--lr-critic", type=float, default=3e-4)
 
+    # --- HAPPO-specific ---
+    parser.add_argument("--encoder-update-mode", type=str, default="accumulated",
+                        choices=["accumulated", "separate_forward"],
+                        help="How GNN encoder is updated across sequential group steps")
+    parser.add_argument("--fixed-order", type=lambda x: x.lower() != "false", default=False,
+                        help="Use fixed (not random) group ordering in HAPPO")
+
     # --- Off-policy (SAC) experiment config ---
     parser.add_argument("--off-policy-memory-size", type=int, default=1_000_000)
     parser.add_argument("--off-policy-train-batch-size", type=int, default=256)
     parser.add_argument("--off-policy-collected-frames-per-batch", type=int, default=256)
     parser.add_argument("--off-policy-n-optimizer-steps", type=int, default=1)
     parser.add_argument("--off-policy-init-random-frames", type=int, default=10_000)
+
+    # --- Embedding visualization ---
+    parser.add_argument("--embedding-viz-interval", type=int, default=0,
+                        help="Log embedding t-SNE/PCA/cosine plots every N iters (0=disabled)")
     parser.add_argument("--off-policy-n-envs-per-worker", type=int, default=4)
     parser.add_argument("--polyak-tau", type=float, default=0.005)
 
@@ -100,6 +115,10 @@ def parse_args():
 def main():
     args = parse_args()
     print("Preparing Experiment...")
+
+    results_dir = args.results_dir.resolve()
+    results_dir.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("WANDB_DIR", str(results_dir / "wandb"))
 
     # Critic Configuration (Different from Actor)
     # When share_critic_across_groups=True, the critic GNN natively handles
@@ -153,18 +172,6 @@ def main():
     # This is the functional part that processes local observations
     # For Hypernetwork, we usually want this to be an MLP or LSTM processing raw obs
     # Transformer actor (tokens = obs plus previous actions; queries come from GNN embedding_z)
-    # actor_model_config = TransformerConfig(
-    #     d_model=128,
-    #     nhead=4,
-    #     num_layers=1,
-    #     dim_feedforward=256,
-    #     dropout=0.0,
-    #     max_seq_len=300,
-    #     use_z_as_query=True,
-    #     append_actions=True,
-    #     norm_first=True,
-    #     prepend_z_token=True,
-    # )
     actor_model_config = MlpConfig(
         num_cells = [128, 128, 64],
         layer_class = torch.nn.Linear,
@@ -191,6 +198,11 @@ def main():
         algorithm_config.lr_actor = args.lr_actor
         algorithm_config.lr_encoder = args.lr_encoder
         algorithm_config.lr_critic = args.lr_critic
+    elif args.algorithm == "happo":
+        algorithm_config = HGTeamHAPPOConfig.get_from_yaml()
+        algorithm_config.entropy_coef = args.entropy_coef
+        algorithm_config.encoder_update_mode = args.encoder_update_mode
+        algorithm_config.fixed_order = args.fixed_order
     else:
         algorithm_config = HGTeamConfig.get_from_yaml()
         algorithm_config.entropy_coef = args.entropy_coef
@@ -231,6 +243,7 @@ def main():
     experiment_config.evaluation_interval = args.evaluation_interval
     experiment_config.project_name = args.project_name
     experiment_config.loggers = ["wandb"]
+    experiment_config.save_folder = str(results_dir)
     wandb_extra = {"name": args.wandb_name}
     if args.wandb_group:
         wandb_extra["group"] = args.wandb_group
@@ -255,13 +268,20 @@ def main():
         experiment_config.on_policy_minibatch_size = args.minibatch_size
         experiment_config.on_policy_n_minibatch_iters = args.n_minibatch_iters
 
+    callbacks = []
+    if args.embedding_viz_interval > 0:
+        callbacks.append(EmbeddingVizCallback(
+            log_every_n_iters=args.embedding_viz_interval,
+        ))
+
     experiment = Experiment(
         task=task,
         algorithm_config=algorithm_config,
         model_config=actor_model_config,
         critic_model_config=critic_model_config,
         seed=args.seed,
-        config=experiment_config
+        config=experiment_config,
+        callbacks=callbacks,
     )
 
     print("\nStarting Run")

@@ -1,0 +1,54 @@
+defaults:
+  - hgteamhappo_config
+  - _self_
+
+# PPO base parameters
+share_param_critic: True
+clip_epsilon: 0.2
+entropy_coef: 0.01
+critic_coef: 2.0
+loss_critic_type: "smooth_l1"
+lmbda: 0.9
+scale_mapping: "biased_softplus_1.0"
+scale_lb: 0.0001
+use_tanh_normal: True
+minibatch_advantage: True
+use_beta: False
+beta_min_param: 1.
+
+# HGTeam-specific parameters
+share_critic_across_groups: True
+centralised_value_per_agent: True
+critic_embed_dim: 32
+gnn_mode: "learned_query"  # Options: "none", "concat", "hypernetwork", "learned_query"
+z_dim: 32
+hypernet_actor_feature_dim: 64
+stochastic_z: True
+embedding_entropy_coef: 0.0
+embedding_diversity_coef: 0.0
+
+# GNN configuration parameters
+gnn_num_layers: 2
+gnn_heads: 2
+gnn_concat_heads: False
+gnn_use_beta: True
+gnn_self_loops: True
+gnn_agent_node_feature_key: "participation_score"
+gnn_agent_node_feature_dim: 1
+gnn_norm_class: null  # Options: null, "LayerNorm", "BatchNorm1d", "InstanceNorm1d", "GroupNorm"
+critic_use_other_actions: True  # Condition value function on other agents' actions (counterfactual)
+
+# Split-z: separate GNN output into z_token (KV) and z_query (cross-attn query)
+split_z: False
+z_token_dim: 32
+z_query_dim: 32
+stochastic_z_query: False
+
+# VIB (Variational Information Bottleneck)
+use_vib: False
+vib_beta: 0.001
+vib_warmup_frames: 500000
+
+# HAPPO-specific parameters
+encoder_update_mode: "accumulated"  # Options: "accumulated", "separate_forward"
+fixed_order: False                  # Random group ordering each epoch (True = fixed order)

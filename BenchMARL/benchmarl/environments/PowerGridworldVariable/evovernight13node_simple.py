@@ -83,3 +83,5 @@ class TaskConfig:
     vpp_reward: bool = MISSING
     vpp_setpoint: float = MISSING
     vpp_reward_penalty: float = MISSING
+    vpp_reward_linear_penalty: float = MISSING
+    pv_curtailment_reward_penalty: float = MISSING

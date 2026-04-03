@@ -89,3 +89,4 @@ setpoint: 1000.
 vpp_reward: False
 vpp_setpoint: 0.0    # Target VPP production (same units as agent real_power)
 vpp_reward_penalty: 1.0  # Scaling factor for quadratic VPP tracking penalty
+vpp_reward_linear_penalty: 0.5  # Scaling factor for linear VPP tracking term (persistent gradient near setpoint)
