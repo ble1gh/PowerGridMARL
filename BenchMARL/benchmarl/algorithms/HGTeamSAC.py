@@ -4,12 +4,10 @@
 #  to the actor GNN via mu (direct) and optionally through action (indirect).
 
 import copy
-from dataclasses import dataclass, MISSING
-from typing import Dict, Iterable, Optional, Tuple, Type, Union
+from collections.abc import Iterable
+from dataclasses import MISSING, dataclass
 
 import torch
-from torch import nn
-import torch_geometric.nn as tgnn
 from tensordict import TensorDictBase
 from tensordict.nn import TensorDictModule, TensorDictSequential
 from torchrl.data import Composite, Unbounded
@@ -19,16 +17,14 @@ from benchmarl.algorithms.common import AlgorithmConfig
 from benchmarl.algorithms.HGTeam import HGTeamBase
 from benchmarl.algorithms.hgteam_modules import (
     EmbeddingProcessor,
-    HyperNetworkJoiner,
     merge_embedding_losses,
 )
 from benchmarl.models import HeteroGnnConfig
-from benchmarl.models.heterognn import HeteroGNN
-
 
 # ======================================================================
 # Loss wrapper
 # ======================================================================
+
 
 class HGTeamSACLoss(SACLoss):
     """SACLoss wrapper that adds HGTeam embedding auxiliary losses.
@@ -46,13 +42,35 @@ class HGTeamSACLoss(SACLoss):
     target_qvalue_network_params: TensorDictBase
     target_actor_network_params: TensorDictBase
 
-    def __init__(self, algorithm, group, *args, **kwargs):
+    def __init__(self, algorithm: "HGTeamSAC", group: str, *args, **kwargs) -> None:
+        """Wrap SACLoss with HGTeam embedding and graph-key propagation.
+
+        Args:
+            algorithm: Parent HGTeamSAC instance.
+            group: Agent group name this loss operates on.
+            *args: Forwarded to ``SACLoss.__init__``.
+            **kwargs: Forwarded to ``SACLoss.__init__``.
+        """
         super().__init__(*args, **kwargs)
         self.algorithm = algorithm
         self.group = group
 
     def forward(self, tensordict: TensorDictBase) -> TensorDictBase:
-        # --- PRE-FORWARD: Propagate static graph keys to "next" tensordict ---
+        """Compute SAC loss with graph-key propagation and embedding aux losses.
+
+        Pre-forward: propagates static graph keys to ``"next"`` tensordict,
+        computes next-actions for peer groups, applies VIB SNI and z-detach.
+
+        Post-forward: restores z, retains grad on embeddings, computes and
+        merges embedding auxiliary losses into ``loss_actor``.
+
+        Args:
+            tensordict: Batch tensordict with observations, actions, rewards.
+
+        Returns:
+            TensorDict with ``loss_actor``, ``loss_qvalue``, ``loss_alpha``,
+            and any ``loss_embedding_*`` keys.
+        """
         # The actor GNN needs graph structure (adjacency, node features) to run.
         # These are usually static and present in the root tensordict, but not
         # automatically in "next". We must propagate them so the target actor
@@ -67,7 +85,7 @@ class HGTeamSACLoss(SACLoss):
                 "switch_adjacency",
             ]
             for k in global_keys:
-                if k in tensordict.keys() and k not in next_td.keys():
+                if k in tensordict and k not in next_td:
                     next_td.set(k, tensordict.get(k))
 
             # 2. Per-group keys (features & indices)
@@ -75,22 +93,22 @@ class HGTeamSACLoss(SACLoss):
             part_key_suffix = self.algorithm.gnn_agent_node_feature_key
             idx_key_suffix = "agent_grid_edge_index"  # Hardcoded in HGTeam
 
-            for g in self.algorithm.group_map.keys():
+            for g in self.algorithm.group_map:
                 # Participation score (or configured feature)
                 if part_key_suffix:
                     # Try (group, key)
                     if (g, part_key_suffix) in tensordict.keys(True, True):
-                         if (g, part_key_suffix) not in next_td.keys(True, True):
-                             next_td.set((g, part_key_suffix), tensordict.get((g, part_key_suffix)))
+                        if (g, part_key_suffix) not in next_td.keys(True, True):
+                            next_td.set((g, part_key_suffix), tensordict.get((g, part_key_suffix)))
                     # Try key at root (fallback, though unlikely for multi-agent)
-                    elif part_key_suffix in tensordict.keys():
-                         if part_key_suffix not in next_td.keys():
-                             next_td.set(part_key_suffix, tensordict.get(part_key_suffix))
+                    elif part_key_suffix in tensordict:
+                        if part_key_suffix not in next_td:
+                            next_td.set(part_key_suffix, tensordict.get(part_key_suffix))
 
                 # Agent index
                 if (g, idx_key_suffix) in tensordict.keys(True, True):
-                     if (g, idx_key_suffix) not in next_td.keys(True, True):
-                         next_td.set((g, idx_key_suffix), tensordict.get((g, idx_key_suffix)))
+                    if (g, idx_key_suffix) not in next_td.keys(True, True):
+                        next_td.set((g, idx_key_suffix), tensordict.get((g, idx_key_suffix)))
 
         # --- PRE-FORWARD: Fill missing next-actions for OTHER groups ---
         # The shared Q-network (HeteroGNN) requires inputs from ALL groups.
@@ -110,7 +128,7 @@ class HGTeamSACLoss(SACLoss):
         if self.algorithm.has_centralized_critic:
             next_td_peer = next_td.clone()
             with torch.no_grad():
-                for g in self.algorithm.group_map.keys():
+                for g in self.algorithm.group_map:
                     if g == self.group:
                         continue
 
@@ -118,14 +136,12 @@ class HGTeamSACLoss(SACLoss):
                     has_mu = (g, "embedding_mu") in next_td.keys(True, True)
 
                     if not has_action or (self.algorithm.critic_use_mu and not has_mu):
-                        other_policy = self.algorithm.get_policy_for_loss(
-                            group=g
-                        )
+                        other_policy = self.algorithm.get_policy_for_loss(group=g)
                         # Run on clone to avoid polluting the original batch
                         other_policy(next_td_peer)
 
             # Copy only the keys we need back to next_td (detached)
-            for g in self.algorithm.group_map.keys():
+            for g in self.algorithm.group_map:
                 if g == self.group:
                     continue
                 if (g, "action") in next_td_peer.keys(True, True):
@@ -138,7 +154,7 @@ class HGTeamSACLoss(SACLoss):
                         (g, "embedding_mu"),
                         next_td_peer.get((g, "embedding_mu")).detach(),
                     )
-        
+
         # --- PRE-FORWARD: make participation scores grad-enabled ----
         self._grad_participation_ref = None
         self._grad_embedding_z_ref = None
@@ -160,7 +176,7 @@ class HGTeamSACLoss(SACLoss):
         # mutate freely; a single restore pass at the end is order-independent.
         _z_stash: dict[tuple, torch.Tensor] = {}
         _z_keys = ("embedding_z", "embedding_z_token")
-        for g in self.algorithm.group_map.keys():
+        for g in self.algorithm.group_map:
             for zk in _z_keys:
                 val = tensordict.get((g, zk), None)
                 if val is not None:
@@ -201,9 +217,7 @@ class HGTeamSACLoss(SACLoss):
             self._grad_embedding_z_token_ref = z_token
 
         # --- Compute and merge embedding auxiliary losses into loss_actor ---
-        merge_embedding_losses(
-            self.algorithm, self.group, tensordict, out, "loss_actor"
-        )
+        merge_embedding_losses(self.algorithm, self.group, tensordict, out, "loss_actor")
 
         return out
 
@@ -211,6 +225,7 @@ class HGTeamSACLoss(SACLoss):
 # ======================================================================
 # Algorithm
 # ======================================================================
+
 
 class HGTeamSAC(HGTeamBase):
     """HGTeam with SAC instead of PPO.
@@ -224,12 +239,12 @@ class HGTeamSAC(HGTeamBase):
         self,
         # SAC-specific parameters
         alpha_init: float = 1.0,
-        target_entropy: Union[float, str] = "auto",
+        target_entropy: float | str = "auto",
         num_qvalue_nets: int = 2,
         fixed_alpha: bool = False,
         delay_qvalue: bool = True,
-        min_alpha: Optional[float] = None,
-        max_alpha: Optional[float] = None,
+        min_alpha: float | None = None,
+        max_alpha: float | None = None,
         loss_function: str = "l2",
         # Gradient control
         detach_action_from_q: bool = False,
@@ -271,11 +286,16 @@ class HGTeamSAC(HGTeamBase):
     # ------------------------------------------------------------------
     def _get_loss(
         self, group: str, policy_for_loss: TensorDictModule, continuous: bool
-    ) -> Tuple[LossModule, bool]:
+    ) -> tuple[LossModule, bool]:
+        """Create the HGTeamSACLoss module for *group*.
+
+        Configures TD(0) value estimator and sets TensorDict keys.
+
+        Returns:
+            ``(loss_module, True)`` — True enables target-network updater.
+        """
         if not continuous:
-            raise NotImplementedError(
-                "HGTeamSAC only supports continuous actions."
-            )
+            raise NotImplementedError("HGTeamSAC only supports continuous actions.")
 
         loss_module = HGTeamSACLoss(
             algorithm=self,
@@ -300,18 +320,24 @@ class HGTeamSAC(HGTeamBase):
             done=(group, "done"),
             terminated=(group, "terminated"),
         )
-        loss_module.make_value_estimator(
-            ValueEstimators.TD0, gamma=self.experiment_config.gamma
-        )
+        loss_module.make_value_estimator(ValueEstimators.TD0, gamma=self.experiment_config.gamma)
         return loss_module, True  # True = use target network updater
 
     # ------------------------------------------------------------------
     # Override: _get_parameters (4 param groups, 3 Adam instances)
     # ------------------------------------------------------------------
-    def _get_parameters(self, group: str, loss: LossModule) -> Dict[str, Iterable]:
-        all_actor_params = list(
-            loss.actor_network_params.flatten_keys().values()
-        )
+    def _get_parameters(self, group: str, loss: LossModule) -> dict[str, Iterable]:
+        """Return optimizer param groups with separate LRs for actor/encoder/critic.
+
+        Partitions actor params into GNN encoder (at lr_encoder/N) and
+        Transformer head (at lr_actor).  Critic GNN params are similarly
+        scaled by 1/N.
+
+        Returns:
+            Dict mapping loss keys to parameter lists or param-group dicts.
+            Includes ``"loss_alpha"`` if alpha is learnable.
+        """
+        all_actor_params = list(loss.actor_network_params.flatten_keys().values())
 
         # Partition actor params into GNN (encoder) vs Transformer (actor)
         gnn_param_ids = set()
@@ -352,24 +378,17 @@ class HGTeamSAC(HGTeamBase):
         encoder_lr = self.lr_encoder / max(num_groups, 1)
         actor_param_groups = []
         if transformer_params:
-            actor_param_groups.append(
-                {"params": transformer_params, "lr": self.lr_actor}
-            )
+            actor_param_groups.append({"params": transformer_params, "lr": self.lr_actor})
         if encoder_params:
-            actor_param_groups.append(
-                {"params": encoder_params, "lr": encoder_lr}
-            )
+            actor_param_groups.append({"params": encoder_params, "lr": encoder_lr})
 
         # Q-network params
-        qvalue_params = list(
-            loss.qvalue_network_params.flatten_keys().values()
-        )
+        qvalue_params = list(loss.qvalue_network_params.flatten_keys().values())
         if self._shared_qvalue_gnn is not None:
             qvalue_params = self._filter_shared_gnn_params(
                 qvalue_params, self._shared_qvalue_gnn, group, role="critic"
             )
-        # Scale shared critic GNN LR similarly
-        critic_lr = self.lr_critic
+        # Scale shared critic GNN LR
         if self._shared_qvalue_gnn is not None and num_groups > 1:
             shared_critic_ptrs = {p.data_ptr() for p in self._shared_qvalue_gnn.parameters()}
             critic_gnn = [p for p in qvalue_params if p.data_ptr() in shared_critic_ptrs]
@@ -378,11 +397,11 @@ class HGTeamSAC(HGTeamBase):
             if critic_other:
                 qvalue_param_groups.append({"params": critic_other, "lr": self.lr_critic})
             if critic_gnn:
-                qvalue_param_groups.append({"params": critic_gnn, "lr": self.lr_critic / num_groups})
+                qvalue_param_groups.append(
+                    {"params": critic_gnn, "lr": self.lr_critic / num_groups}
+                )
         else:
-            qvalue_param_groups = [
-                {"params": qvalue_params, "lr": self.lr_critic}
-            ]
+            qvalue_param_groups = [{"params": qvalue_params, "lr": self.lr_critic}]
 
         items = {
             "loss_actor": actor_param_groups,
@@ -397,6 +416,11 @@ class HGTeamSAC(HGTeamBase):
     # Override: process_batch (no GAE, no minibatch splitting)
     # ------------------------------------------------------------------
     def process_batch(self, group: str, batch: TensorDictBase) -> TensorDictBase:
+        """Prepare a collected batch for SAC training.
+
+        Broadcasts shared done/terminated/reward into per-group keys.
+        No advantage computation (SAC is off-policy, Q-based).
+        """
         batch = batch.to(self.device)
         keys = list(batch.keys(True, True))
         group_shape = batch.get(group).shape
@@ -408,23 +432,17 @@ class HGTeamSAC(HGTeamBase):
         if nested_done_key not in keys:
             batch.set(
                 nested_done_key,
-                batch.get(("next", "done")).unsqueeze(-1).expand(
-                    (*group_shape, 1)
-                ),
+                batch.get(("next", "done")).unsqueeze(-1).expand((*group_shape, 1)),
             )
         if nested_terminated_key not in keys:
             batch.set(
                 nested_terminated_key,
-                batch.get(("next", "terminated"))
-                .unsqueeze(-1)
-                .expand((*group_shape, 1)),
+                batch.get(("next", "terminated")).unsqueeze(-1).expand((*group_shape, 1)),
             )
         if nested_reward_key not in keys:
             batch.set(
                 nested_reward_key,
-                batch.get(("next", "reward"))
-                .unsqueeze(-1)
-                .expand((*group_shape, 1)),
+                batch.get(("next", "reward")).unsqueeze(-1).expand((*group_shape, 1)),
             )
 
         return batch
@@ -435,6 +453,7 @@ class HGTeamSAC(HGTeamBase):
     def process_loss_vals(
         self, group: str, loss_vals: TensorDictBase, batch: TensorDictBase = None
     ) -> TensorDictBase:
+        """Post-process SAC loss values (no-op — embedding losses already merged)."""
         # SACLoss returns loss_actor, loss_qvalue, loss_alpha — no merging needed.
         # Embedding aux losses are already added to loss_actor in HGTeamSACLoss.forward().
         return loss_vals
@@ -468,6 +487,7 @@ class HGTeamSAC(HGTeamBase):
 
             def _make_prep(grp, o_dim, a_dim, m_dim):
                 """Create a closure to avoid late-binding issues."""
+
                 def prep_fn(obs, action, mu):
                     if self.detach_action_from_q:
                         action = action.detach()
@@ -475,33 +495,38 @@ class HGTeamSAC(HGTeamBase):
                         return torch.cat([obs, action, mu], dim=-1)
                     else:
                         return torch.cat([obs, action], dim=-1)
+
                 return prep_fn
 
-            qvalue_input_dim = obs_dim + action_dim + (mu_dim if self.critic_use_mu else 0)
-
             if self.critic_use_mu and mu_dim > 0:
-                prep_modules.append(TensorDictModule(
-                    _make_prep(t, obs_dim, action_dim, mu_dim),
-                    in_keys=[
-                        (t, "observation"),
-                        (t, "action"),
-                        (t, "embedding_mu"),
-                    ],
-                    out_keys=[(t, q_input_key)],
-                ))
+                prep_modules.append(
+                    TensorDictModule(
+                        _make_prep(t, obs_dim, action_dim, mu_dim),
+                        in_keys=[
+                            (t, "observation"),
+                            (t, "action"),
+                            (t, "embedding_mu"),
+                        ],
+                        out_keys=[(t, q_input_key)],
+                    )
+                )
             else:
+
                 def _make_prep_no_mu(grp):
                     def prep_fn(obs, action):
                         if self.detach_action_from_q:
                             action = action.detach()
                         return torch.cat([obs, action], dim=-1)
+
                     return prep_fn
 
-                prep_modules.append(TensorDictModule(
-                    _make_prep_no_mu(t),
-                    in_keys=[(t, "observation"), (t, "action")],
-                    out_keys=[(t, q_input_key)],
-                ))
+                prep_modules.append(
+                    TensorDictModule(
+                        _make_prep_no_mu(t),
+                        in_keys=[(t, "observation"), (t, "action")],
+                        out_keys=[(t, q_input_key)],
+                    )
+                )
 
         # --- Build shared HeteroGNN Q-network ---------------------------
         if self._shared_qvalue_gnn is None:
@@ -510,8 +535,8 @@ class HGTeamSAC(HGTeamBase):
                 n_t = len(self.group_map[t])
                 obs_dim = self.observation_spec[t, "observation"].shape[-1]
                 action_dim = self.action_spec[t, "action"].shape[-1]
-                q_input_dim = obs_dim + action_dim + (
-                    mu_dim if self.critic_use_mu and mu_dim > 0 else 0
+                q_input_dim = (
+                    obs_dim + action_dim + (mu_dim if self.critic_use_mu and mu_dim > 0 else 0)
                 )
                 critic_input_spec.set(
                     t,
@@ -548,8 +573,8 @@ class HGTeamSAC(HGTeamBase):
                 for t in type_order:
                     obs_dim = self.observation_spec[t, "observation"].shape[-1]
                     action_dim = self.action_spec[t, "action"].shape[-1]
-                    q_input_dim = obs_dim + action_dim + (
-                        mu_dim if self.critic_use_mu and mu_dim > 0 else 0
+                    q_input_dim = (
+                        obs_dim + action_dim + (mu_dim if self.critic_use_mu and mu_dim > 0 else 0)
                     )
                     critic_config.node_features_keys[t] = f"{t}_qvalue_input"
                     critic_config.node_features_dims[t] = q_input_dim
@@ -603,12 +628,14 @@ class HGTeamSAC(HGTeamBase):
     def _get_policy_for_collection(
         self, policy_for_loss: TensorDictModule, group: str, continuous: bool
     ) -> TensorDictModule:
+        """Return the collection policy (same as loss policy for SAC)."""
         return policy_for_loss
 
 
 # ======================================================================
 # Config
 # ======================================================================
+
 
 @dataclass
 class HGTeamSACConfig(AlgorithmConfig):
@@ -636,9 +663,9 @@ class HGTeamSACConfig(AlgorithmConfig):
     gnn_concat_heads: bool = MISSING
     gnn_use_beta: bool = MISSING
     gnn_self_loops: bool = MISSING
-    gnn_agent_node_feature_key: Optional[str] = MISSING
+    gnn_agent_node_feature_key: str | None = MISSING
     gnn_agent_node_feature_dim: int = MISSING
-    gnn_norm_class: Optional[str] = MISSING
+    gnn_norm_class: str | None = MISSING
     critic_embed_dim: int = MISSING
 
     split_z: bool = MISSING
@@ -652,12 +679,12 @@ class HGTeamSACConfig(AlgorithmConfig):
 
     # --- SAC-specific parameters ----------------------------------------
     alpha_init: float = MISSING
-    target_entropy: Union[float, str] = MISSING
+    target_entropy: float | str = MISSING
     num_qvalue_nets: int = MISSING
     fixed_alpha: bool = MISSING
     delay_qvalue: bool = MISSING
-    min_alpha: Optional[float] = MISSING  # null in YAML
-    max_alpha: Optional[float] = MISSING  # null in YAML
+    min_alpha: float | None = MISSING  # null in YAML
+    max_alpha: float | None = MISSING  # null in YAML
     loss_function: str = MISSING
 
     # --- Gradient control -----------------------------------------------
@@ -671,7 +698,7 @@ class HGTeamSACConfig(AlgorithmConfig):
     lr_critic: float = MISSING
 
     @staticmethod
-    def associated_class() -> Type["HGTeamSAC"]:
+    def associated_class() -> type["HGTeamSAC"]:
         return HGTeamSAC
 
     @staticmethod

@@ -5,10 +5,10 @@
 #
 
 import pathlib
-
 from abc import ABC, abstractmethod
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Type
+from typing import Any
 
 from tensordict import TensorDictBase
 from tensordict.nn import TensorDictModule, TensorDictSequential
@@ -30,7 +30,7 @@ from torchrl.objectives import LossModule
 from torchrl.objectives.utils import HardUpdate, SoftUpdate, TargetNetUpdater
 
 from benchmarl.models.common import ModelConfig
-from benchmarl.utils import _read_yaml_config, DEVICE_TYPING
+from benchmarl.utils import DEVICE_TYPING, _read_yaml_config
 
 
 class Algorithm(ABC):
@@ -57,12 +57,8 @@ class Algorithm(ABC):
         self.action_spec = experiment.action_spec
         self.state_spec = experiment.state_spec
         self.action_mask_spec = experiment.action_mask_spec
-        self.has_independent_critic = (
-            experiment.algorithm_config.has_independent_critic()
-        )
-        self.has_centralized_critic = (
-            experiment.algorithm_config.has_centralized_critic()
-        )
+        self.has_independent_critic = experiment.algorithm_config.has_independent_critic()
+        self.has_centralized_critic = experiment.algorithm_config.has_centralized_critic()
         self.has_critic = experiment.algorithm_config.has_critic
         self.has_rnn = self.model_config.is_rnn or (
             self.critic_model_config.is_rnn and self.has_critic
@@ -107,7 +103,7 @@ class Algorithm(ABC):
                     "you can apply a transform to your environment to satisfy this criteria."
                 )
 
-    def get_loss_and_updater(self, group: str) -> Tuple[LossModule, TargetNetUpdater]:
+    def get_loss_and_updater(self, group: str) -> tuple[LossModule, TargetNetUpdater]:
         """
         Get the LossModule and TargetNetUpdater for a specific group.
         This function calls the abstract :class:`~benchmarl.algorithms.Algorithm._get_loss()` which needs to be implemented.
@@ -128,9 +124,7 @@ class Algorithm(ABC):
             )
             if use_target:
                 if self.experiment_config.soft_target_update:
-                    target_net_updater = SoftUpdate(
-                        loss, tau=self.experiment_config.polyak_tau
-                    )
+                    target_net_updater = SoftUpdate(loss, tau=self.experiment_config.polyak_tau)
                 else:
                     target_net_updater = HardUpdate(
                         loss,
@@ -141,9 +135,7 @@ class Algorithm(ABC):
             self._losses_and_updaters.update({group: (loss, target_net_updater)})
         return self._losses_and_updaters[group]
 
-    def get_replay_buffer(
-        self, group: str, transforms: List[Transform] = None
-    ) -> ReplayBuffer:
+    def get_replay_buffer(self, group: str, transforms: list[Transform] = None) -> ReplayBuffer:
         """
         Get the ReplayBuffer for a specific group.
         This function will check ``self.on_policy`` and create the buffer accordingly
@@ -245,7 +237,7 @@ class Algorithm(ABC):
             policies.append(self._policies_for_collection[group])
         return TensorDictSequential(*policies)
 
-    def get_parameters(self, group: str) -> Dict[str, Iterable]:
+    def get_parameters(self, group: str) -> dict[str, Iterable]:
         """
         Get the dictionary mapping loss names to the relative parameters to optimize for a given group.
         This function calls the abstract :class:`~benchmarl.algorithms.Algorithm._get_parameters()` which needs to be implemented.
@@ -280,7 +272,7 @@ class Algorithm(ABC):
     @abstractmethod
     def _get_loss(
         self, group: str, policy_for_loss: TensorDictModule, continuous: bool
-    ) -> Tuple[LossModule, bool]:
+    ) -> tuple[LossModule, bool]:
         """
         Implement this function to return the LossModule for a specific group.
 
@@ -294,7 +286,7 @@ class Algorithm(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def _get_parameters(self, group: str, loss: LossModule) -> Dict[str, Iterable]:
+    def _get_parameters(self, group: str, loss: LossModule) -> dict[str, Iterable]:
         """
         Get the dictionary mapping loss names to the relative parameters to optimize for a given group loss.
 
@@ -397,9 +389,7 @@ class Algorithm(ABC):
                 ):
                     training_tds.append(experiment._optimizer_loop(group))
             training_td = torch.stack(training_tds)
-            experiment.logger.log_training(
-                group, training_td, step=experiment.n_iters_performed
-            )
+            experiment.logger.log_training(group, training_td, step=experiment.n_iters_performed)
 
             experiment._on_train_end(training_td, group)
 
@@ -439,17 +429,14 @@ class AlgorithmConfig:
         )
 
     @staticmethod
-    def _load_from_yaml(name: str) -> Dict[str, Any]:
+    def _load_from_yaml(name: str) -> dict[str, Any]:
         yaml_path = (
-            pathlib.Path(__file__).parent.parent
-            / "conf"
-            / "algorithm"
-            / f"{name.lower()}.yaml"
+            pathlib.Path(__file__).parent.parent / "conf" / "algorithm" / f"{name.lower()}.yaml"
         )
         return _read_yaml_config(str(yaml_path.resolve()))
 
     @classmethod
-    def get_from_yaml(cls, path: Optional[str] = None):
+    def get_from_yaml(cls, path: str | None = None):
         """
         Load the algorithm configuration from yaml
 
@@ -462,9 +449,7 @@ class AlgorithmConfig:
         """
 
         if path is None:
-            config = AlgorithmConfig._load_from_yaml(
-                name=cls.associated_class().__name__
-            )
+            config = AlgorithmConfig._load_from_yaml(name=cls.associated_class().__name__)
 
         else:
             config = _read_yaml_config(path)
@@ -472,7 +457,7 @@ class AlgorithmConfig:
 
     @staticmethod
     @abstractmethod
-    def associated_class() -> Type[Algorithm]:
+    def associated_class() -> type[Algorithm]:
         """
         The algorithm class associated to the config
         """
@@ -521,7 +506,5 @@ class AlgorithmConfig:
         If the algorithm uses a critic
         """
         if self.has_centralized_critic() and self.has_independent_critic():
-            raise ValueError(
-                "Algorithm can either have a centralized critic or an indpendent one"
-            )
+            raise ValueError("Algorithm can either have a centralized critic or an indpendent one")
         return self.has_centralized_critic() or self.has_independent_critic()

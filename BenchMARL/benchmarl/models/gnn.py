@@ -9,14 +9,13 @@ from __future__ import annotations
 import importlib
 import inspect
 import warnings
-from dataclasses import dataclass, MISSING
+from dataclasses import MISSING, dataclass
 from math import prod
-from typing import List, Optional, Type
 
 import torch
 from tensordict import TensorDictBase
-from tensordict.utils import _unravel_key_to_tuple, NestedKey
-from torch import nn, Tensor
+from tensordict.utils import NestedKey, _unravel_key_to_tuple
+from torch import Tensor, nn
 
 from benchmarl.models.common import Model, ModelConfig
 
@@ -124,14 +123,14 @@ class Gnn(Model):
         self,
         topology: str,
         self_loops: bool,
-        gnn_class: Type[torch_geometric.nn.MessagePassing],
-        gnn_kwargs: Optional[dict],
-        position_key: Optional[str],
-        exclude_pos_from_node_features: Optional[bool],
-        velocity_key: Optional[str],
-        edge_radius: Optional[float],
-        pos_features: Optional[int],
-        vel_features: Optional[int],
+        gnn_class: type[torch_geometric.nn.MessagePassing],
+        gnn_kwargs: dict | None,
+        position_key: str | None,
+        exclude_pos_from_node_features: bool | None,
+        velocity_key: str | None,
+        edge_radius: float | None,
+        pos_features: int | None,
+        vel_features: int | None,
         **kwargs,
     ):
         self.topology = topology
@@ -167,9 +166,7 @@ class Gnn(Model):
         gnn_kwargs.update(
             {"in_channels": self.input_features, "out_channels": self.output_features}
         )
-        self.gnn_supports_edge_attrs = (
-            "edge_dim" in inspect.getfullargspec(gnn_class).args
-        )
+        self.gnn_supports_edge_attrs = "edge_dim" in inspect.getfullargspec(gnn_class).args
         if (
             self.position_key is not None or self.velocity_key is not None
         ) and not self.gnn_supports_edge_attrs:
@@ -177,9 +174,7 @@ class Gnn(Model):
                 "Position key or velocity key provided but GNN class does not support edge attributes. "
                 "These keys will not be used for computing edge features."
             )
-        if (
-            position_key is not None or velocity_key is not None
-        ) and self.gnn_supports_edge_attrs:
+        if (position_key is not None or velocity_key is not None) and self.gnn_supports_edge_attrs:
             gnn_kwargs.update({"edge_dim": self.edge_features})
 
         self.gnns = nn.ModuleList(
@@ -206,25 +201,18 @@ class Gnn(Model):
             )
         if self.topology == "from_pos" and self.position_key is None:
             raise ValueError("If topology is from_pos, position_key must be provided")
-        if (
-            self.position_key is not None
-            and self.exclude_pos_from_node_features is None
-        ):
+        if self.position_key is not None and self.exclude_pos_from_node_features is None:
             raise ValueError(
                 "exclude_pos_from_node_features needs to be specified when position_key is provided"
             )
         if self.position_key is not None and self.pos_features <= 0:
-            raise ValueError(
-                f"Position key specified but pos_features is {self.pos_features}"
-            )
+            raise ValueError(f"Position key specified but pos_features is {self.pos_features}")
         elif self.position_key is None and self.pos_features > 0:
             raise ValueError(
                 f"If no position_key is given, pos_features needs to be 0, got: {self.pos_features}"
             )
         if self.velocity_key is not None and self.vel_features <= 0:
-            raise ValueError(
-                f"Velocity key specified but vel_features is {self.vel_features}"
-            )
+            raise ValueError(f"Velocity key specified but vel_features is {self.vel_features}")
         elif self.velocity_key is None and self.vel_features > 0:
             raise ValueError(
                 f"If no velocity_key is given, vel_features needs to be 0, got: {self.vel_features}"
@@ -257,10 +245,7 @@ class Gnn(Model):
             raise ValueError(
                 f"The second to last input spec dimension should be the number of agents, got {self.input_spec}"
             )
-        if (
-            self.output_has_agent_dim
-            and self.output_leaf_spec.shape[-2] != self.n_agents
-        ):
+        if self.output_has_agent_dim and self.output_leaf_spec.shape[-2] != self.n_agents:
             raise ValueError(
                 "If the GNN output has the agent dimension,"
                 " the second to last spec dimension should be the number of agents"
@@ -271,8 +256,7 @@ class Gnn(Model):
         input = [
             tensordict.get(in_key)
             for in_key in self.in_keys
-            if _unravel_key_to_tuple(in_key)[-1]
-            not in (self.position_key, self.velocity_key)
+            if _unravel_key_to_tuple(in_key)[-1] not in (self.position_key, self.velocity_key)
         ]
 
         # Retrieve position
@@ -285,7 +269,7 @@ class Gnn(Model):
                 if pos.shape[-1] != self.pos_features - 1:
                     raise ValueError(
                         f"Position key in tensordict is {pos.shape[-1]}-dimensional, "
-                        f"while model was configured with pos_features={self.pos_features-1}"
+                        f"while model was configured with pos_features={self.pos_features - 1}"
                     )
             else:
                 pos = tensordict.get(self._full_position_key)
@@ -370,14 +354,10 @@ class Gnn(Model):
         tensordict.set(self.out_key, res)
         return tensordict
 
-    def _get_key_terminating_with(self, keys: List[NestedKey], key: str) -> NestedKey:
+    def _get_key_terminating_with(self, keys: list[NestedKey], key: str) -> NestedKey:
         for k in keys:
             k_tuple = _unravel_key_to_tuple(k)
-            if (
-                k_tuple[-1] == key
-                and self.agent_group in k_tuple
-                and not "next" == k_tuple[0]
-            ):
+            if k_tuple[-1] == key and self.agent_group in k_tuple and not k_tuple[0] == "next":
                 return k
         raise KeyError(
             f"Key terminating with {key} and containing {self.agent_group} not found in keys: {keys}. "
@@ -394,9 +374,7 @@ def _get_edge_index(topology: str, self_loops: bool, n_agents: int, device: str)
     elif topology == "empty":
         if self_loops:
             edge_index = (
-                torch.arange(n_agents, device=device, dtype=torch.long)
-                .unsqueeze(0)
-                .repeat(2, 1)
+                torch.arange(n_agents, device=device, dtype=torch.long).unsqueeze(0).repeat(2, 1)
             )
         else:
             edge_index = torch.empty((2, 0), device=device, dtype=torch.long)
@@ -410,11 +388,11 @@ def _get_edge_index(topology: str, self_loops: bool, n_agents: int, device: str)
 
 def _batch_from_dense_to_ptg(
     x: Tensor,
-    edge_index: Optional[Tensor],
+    edge_index: Tensor | None,
     self_loops: bool,
     pos: Tensor = None,
     vel: Tensor = None,
-    edge_radius: Optional[float] = None,
+    edge_radius: float | None = None,
 ) -> torch_geometric.data.Batch:
     batch_size = prod(x.shape[:-2])
     n_agents = x.shape[-2]
@@ -468,15 +446,15 @@ class GnnConfig(ModelConfig):
     topology: str = MISSING
     self_loops: bool = MISSING
 
-    gnn_class: Type[torch_geometric.nn.MessagePassing] = MISSING
-    gnn_kwargs: Optional[dict] = None
+    gnn_class: type[torch_geometric.nn.MessagePassing] = MISSING
+    gnn_kwargs: dict | None = None
 
-    position_key: Optional[str] = None
-    pos_features: Optional[int] = 0
-    velocity_key: Optional[str] = None
-    vel_features: Optional[int] = 0
-    exclude_pos_from_node_features: Optional[bool] = None
-    edge_radius: Optional[float] = None
+    position_key: str | None = None
+    pos_features: int | None = 0
+    velocity_key: str | None = None
+    vel_features: int | None = 0
+    exclude_pos_from_node_features: bool | None = None
+    edge_radius: float | None = None
 
     @staticmethod
     def associated_class():

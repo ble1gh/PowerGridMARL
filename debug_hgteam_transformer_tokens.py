@@ -8,12 +8,11 @@ import torch_geometric.nn as tgnn
 # Ensure BenchMARL import
 sys.path.append(os.path.join(os.getcwd(), "BenchMARL"))
 
-from torchrl.envs.utils import step_mdp
-
 from benchmarl.algorithms import HGTeamConfig
-from benchmarl.experiment import Experiment, ExperimentConfig
 from benchmarl.environments.PowerGridworldVariable.common import PowerGridworldVariableTask
+from benchmarl.experiment import Experiment, ExperimentConfig
 from benchmarl.models import HeteroGnnConfig, TransformerConfig
+from torchrl.envs.utils import step_mdp
 
 
 def patch_tensordict_stack_debug():
@@ -310,7 +309,9 @@ def report_cross_env_dtype_mismatches(per_env_steps):
             for key, dtypes in sorted(mismatched.items()):
                 shapes = shape_map.get(key, {})
                 env_detail = sorted(env_map.get(key, {}))
-                print(f"  {key}: dtypes={sorted(dtypes)}, shapes={sorted(shapes)}, envs={env_detail}")
+                print(
+                    f"  {key}: dtypes={sorted(dtypes)}, shapes={sorted(shapes)}, envs={env_detail}"
+                )
 
 
 def main():

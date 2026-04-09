@@ -6,8 +6,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, MISSING
-from typing import Optional, Sequence, Type
+from collections.abc import Sequence
+from dataclasses import MISSING, dataclass
 
 import torch
 import torch.nn.functional as F
@@ -15,8 +15,7 @@ from tensordict import TensorDict, TensorDictBase
 from tensordict.utils import expand_as_right, unravel_key_list
 from torch import nn
 from torchrl.data.tensor_specs import Composite, Unbounded
-
-from torchrl.modules import GRUCell, MLP, MultiAgentMLP
+from torchrl.modules import MLP, GRUCell, MultiAgentMLP
 
 from benchmarl.models.common import Model, ModelConfig
 from benchmarl.utils import DEVICE_TYPING
@@ -62,9 +61,7 @@ class GRU(torch.nn.Module):
     ):
         hs = []
         h = list(h.unbind(dim=-2))
-        for in_t, init_t in zip(
-            input.unbind(self.time_dim), is_init.unbind(self.time_dim)
-        ):
+        for in_t, init_t in zip(input.unbind(self.time_dim), is_init.unbind(self.time_dim)):
             for layer in range(self.n_layers):
                 h[layer] = torch.where(init_t, 0, h[layer])
 
@@ -150,9 +147,7 @@ class MultiAgentGRU(torch.nn.Module):
                 compile=self.compile,
             )
             # Remove all parameters
-            TensorDict.from_module(self._empty_gru).data.to("meta").to_module(
-                self._empty_gru
-            )
+            TensorDict.from_module(self._empty_gru).data.to("meta").to_module(self._empty_gru)
 
     def forward(
         self,
@@ -168,9 +163,7 @@ class MultiAgentGRU(torch.nn.Module):
         training = h_0 is None
 
         missing_batch = False
-        if (
-            not training and len(input.shape) < 3
-        ):  # In evaluation the batch might be missing
+        if not training and len(input.shape) < 3:  # In evaluation the batch might be missing
             missing_batch = True
             input = input.unsqueeze(0)
             h_0 = h_0.unsqueeze(0)
@@ -187,12 +180,8 @@ class MultiAgentGRU(torch.nn.Module):
         assert input.shape == (batch, seq, self.n_agents, self.input_size)
 
         if not training:  # Collection
-            h_0 = torch.where(
-                expand_as_right(is_init, h_0), 0, h_0
-            )  # Set hidden to 0 when is_init
-            is_init = is_init.unsqueeze(
-                1
-            )  # If in collection emulate the sequence dimension
+            h_0 = torch.where(expand_as_right(is_init, h_0), 0, h_0)  # Set hidden to 0 when is_init
+            is_init = is_init.unsqueeze(1)  # If in collection emulate the sequence dimension
 
         assert is_init.shape == (batch, seq, 1)
         is_init = is_init.unsqueeze(-2).expand(batch, seq, self.n_agents, 1)
@@ -223,9 +212,7 @@ class MultiAgentGRU(torch.nn.Module):
         output, h_n = self.run_net(input, is_init, h_0)
 
         if self.centralised and self.share_params:
-            output = output.unsqueeze(-2).expand(
-                batch, seq, self.n_agents, self.hidden_size
-            )
+            output = output.unsqueeze(-2).expand(batch, seq, self.n_agents, self.hidden_size)
 
         if not training:
             output = output.squeeze(1)
@@ -331,9 +318,7 @@ class Gru(Model):
         self.dropout = dropout
         self.compile = compile
 
-        self.input_features = sum(
-            [spec.shape[-1] for spec in self.input_spec.values(True, True)]
-        )
+        self.input_features = sum([spec.shape[-1] for spec in self.input_spec.values(True, True)])
         self.output_features = self.output_leaf_spec.shape[-1]
 
         if self.input_has_agent_dim:
@@ -366,9 +351,7 @@ class Gru(Model):
             )
 
         mlp_net_kwargs = {
-            "_".join(k.split("_")[1:]): v
-            for k, v in kwargs.items()
-            if k.startswith("mlp_")
+            "_".join(k.split("_")[1:]): v for k, v in kwargs.items() if k.startswith("mlp_")
         }
         if self.output_has_agent_dim:
             self.mlp = MultiAgentMLP(
@@ -418,10 +401,7 @@ class Gru(Model):
                     "If the GRU input has the agent dimension,"
                     f" the second to last spec dimension should be the number of agents, got {self.input_spec}"
                 )
-        if (
-            self.output_has_agent_dim
-            and self.output_leaf_spec.shape[-2] != self.n_agents
-        ):
+        if self.output_has_agent_dim and self.output_leaf_spec.shape[-2] != self.n_agents:
             raise ValueError(
                 "If the GRU output has the agent dimension,"
                 " the second to last spec dimension should be the number of agents"
@@ -430,11 +410,7 @@ class Gru(Model):
     def _forward(self, tensordict: TensorDictBase) -> TensorDictBase:
         # Gather in_key
         input = torch.cat(
-            [
-                tensordict.get(in_key)
-                for in_key in self.in_keys
-                if in_key not in self.rnn_keys
-            ],
+            [tensordict.get(in_key) for in_key in self.in_keys if in_key not in self.rnn_keys],
             dim=-1,
         )
         h_0 = tensordict.get(self.hidden_state_name, None)
@@ -496,12 +472,12 @@ class GruConfig(ModelConfig):
     compile: bool = MISSING
 
     mlp_num_cells: Sequence[int] = MISSING
-    mlp_layer_class: Type[nn.Module] = MISSING
-    mlp_activation_class: Type[nn.Module] = MISSING
+    mlp_layer_class: type[nn.Module] = MISSING
+    mlp_activation_class: type[nn.Module] = MISSING
 
-    mlp_activation_kwargs: Optional[dict] = None
-    mlp_norm_class: Type[nn.Module] = None
-    mlp_norm_kwargs: Optional[dict] = None
+    mlp_activation_kwargs: dict | None = None
+    mlp_norm_class: type[nn.Module] = None
+    mlp_norm_kwargs: dict | None = None
 
     @staticmethod
     def associated_class():
@@ -513,10 +489,6 @@ class GruConfig(ModelConfig):
 
     def get_model_state_spec(self, model_index: int = 0) -> Composite:
         spec = Composite(
-            {
-                f"_hidden_gru_{model_index}": Unbounded(
-                    shape=(self.n_layers, self.hidden_size)
-                )
-            }
+            {f"_hidden_gru_{model_index}": Unbounded(shape=(self.n_layers, self.hidden_size))}
         )
         return spec

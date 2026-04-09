@@ -6,12 +6,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, MISSING
-from typing import Optional, Sequence, Type
+from collections.abc import Sequence
+from dataclasses import MISSING, dataclass
 
 import torch
 from tensordict import TensorDictBase
-from torch import nn, Tensor
+from torch import Tensor, nn
 from torchrl.modules import MLP
 
 from benchmarl.models.common import Model, ModelConfig
@@ -68,10 +68,10 @@ class Deepsets(Model):
         self,
         aggr: str,
         local_nn_num_cells: Sequence[int],
-        local_nn_activation_class: Type[nn.Module],
+        local_nn_activation_class: type[nn.Module],
         out_features_local_nn: int,
         global_nn_num_cells: Sequence[int],
-        global_nn_activation_class: Type[nn.Module],
+        global_nn_activation_class: type[nn.Module],
         **kwargs,
     ):
 
@@ -149,9 +149,9 @@ class Deepsets(Model):
         out_features: int,
         aggr: str,
         local_nn_num_cells: Sequence[int],
-        local_nn_activation_class: Type[nn.Module],
+        local_nn_activation_class: type[nn.Module],
         global_nn_num_cells: Sequence[int],
-        global_nn_activation_class: Type[nn.Module],
+        global_nn_activation_class: type[nn.Module],
         out_features_local_nn: int,
         in_fetures_global_nn: int,
     ) -> _DeepsetsNet:
@@ -219,28 +219,19 @@ class Deepsets(Model):
                 )
 
         # Centralized model not needing any local deepsets
-        if (
-            self.centralised
-            and not len(self.set_in_keys_local)
-            and self.input_has_agent_dim
-        ):
+        if self.centralised and not len(self.set_in_keys_local) and self.input_has_agent_dim:
             self.set_in_keys_global = self.tensor_in_keys_local
             input_shape_set_global = input_shape_tensor_local
             self.tensor_in_keys_local = []
 
         if (not self.centralised and not len(self.set_in_keys_local)) or (
-            self.centralised
-            and not self.input_has_agent_dim
-            and not len(self.set_in_keys_global)
+            self.centralised and not self.input_has_agent_dim and not len(self.set_in_keys_global)
         ):
             raise ValueError("DeepSets found no set inputs, maybe use an MLP?")
 
         if len(self.set_in_keys_local) and input_shape_set_local[-2] != self.n_agents:
             raise ValueError()
-        if (
-            len(self.tensor_in_keys_local)
-            and input_shape_tensor_local[-1] != self.n_agents
-        ):
+        if len(self.tensor_in_keys_local) and input_shape_tensor_local[-1] != self.n_agents:
             raise ValueError()
         if (
             len(self.set_in_keys_global)
@@ -271,9 +262,7 @@ class Deepsets(Model):
                     dim=-1,
                 )
             if self.share_params:
-                local_output = self.local_deepsets[0](
-                    input_local_sets, input_local_tensors
-                )
+                local_output = self.local_deepsets[0](input_local_sets, input_local_tensors)
             else:
                 local_output = torch.stack(
                     [
@@ -300,9 +289,7 @@ class Deepsets(Model):
                     dim=-1,
                 )
             if self.share_params:
-                global_output = self.global_deepsets[0](
-                    local_output, input_global_tensors
-                )
+                global_output = self.global_deepsets[0](local_output, input_global_tensors)
             else:
                 global_output = torch.stack(
                     [
@@ -334,7 +321,7 @@ class _DeepsetsNet(nn.Module):
         self.local_nn = local_nn
         self.global_nn = global_nn
 
-    def forward(self, x: Tensor, extra_global_input: Optional[Tensor]) -> Tensor:
+    def forward(self, x: Tensor, extra_global_input: Tensor | None) -> Tensor:
         x = self.local_nn(x)
         x = self.reduce(x, dim=self.set_dim, aggr=self.aggr)
         if extra_global_input is not None:
@@ -364,10 +351,10 @@ class DeepsetsConfig(ModelConfig):
     out_features_local_nn: int = MISSING
 
     local_nn_num_cells: Sequence[int] = MISSING
-    local_nn_activation_class: Type[nn.Module] = MISSING
+    local_nn_activation_class: type[nn.Module] = MISSING
 
     global_nn_num_cells: Sequence[int] = MISSING
-    global_nn_activation_class: Type[nn.Module] = MISSING
+    global_nn_activation_class: type[nn.Module] = MISSING
 
     @staticmethod
     def associated_class():

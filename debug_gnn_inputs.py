@@ -1,6 +1,8 @@
 """Debug script to inspect GNN inputs and gradient flow."""
-import sys
+
 import os
+import sys
+
 import torch
 import torch_geometric.nn as tgnn
 from torch import nn
@@ -8,43 +10,48 @@ from torch import nn
 sys.path.append(os.path.join(os.getcwd(), "BenchMARL"))
 
 from benchmarl.algorithms import HGTeamConfig
-from benchmarl.models import HeteroGnnConfig, MlpConfig
-from benchmarl.experiment import Experiment, ExperimentConfig
 from benchmarl.environments.PowerGridworldGraph.common import PowerGridworldGraphTask
+from benchmarl.experiment import Experiment, ExperimentConfig
+from benchmarl.models import HeteroGnnConfig, MlpConfig
+
 
 def main():
     print("=" * 70)
     print("GNN INPUT INSPECTION")
     print("=" * 70)
-    
+
     # Minimal config for debugging
     base_actor_config = MlpConfig(
-        num_cells=[128, 128],
-        activation_class=nn.Tanh,
-        layer_class=nn.Linear
+        num_cells=[128, 128], activation_class=nn.Tanh, layer_class=nn.Linear
     )
-    
+
     critic_gnn_config = HeteroGnnConfig(
         topology="adjacency",
-        self_loops=True, 
+        self_loops=True,
         gnn_class=tgnn.TransformerConv,
         gnn_kwargs={"heads": 4, "concat": False, "beta": True},
         grid_edge_keys={
             "line_adjacency": "line_adjacency",
             "transformer_adjacency": "transformer_adjacency",
-            "switch_adjacency": "switch_adjacency"
+            "switch_adjacency": "switch_adjacency",
         },
         edge_features_dims={
-            "line_adjacency": 3, "transformer_adjacency": 3, "switch_adjacency": 1,
-            "interaction": 0, "mapping": 0, "mapping_rev": 0
+            "line_adjacency": 3,
+            "transformer_adjacency": 3,
+            "switch_adjacency": 1,
+            "interaction": 0,
+            "mapping": 0,
+            "mapping_rev": 0,
         },
-        node_features_keys={"grid_node": "grid_node_features"},        
+        node_features_keys={"grid_node": "grid_node_features"},
         node_features_dims={"grid_node": 2},
         agent_node_index_key="agent_grid_edge_index",
         exclude_observations_from_node_features=False,
         cat_observations_to_output=False,
         num_layers=2,
-        pos_features=0, vel_features=0, edge_radius=0
+        pos_features=0,
+        vel_features=0,
+        edge_radius=0,
     )
 
     algorithm_config = HGTeamConfig(
@@ -92,15 +99,15 @@ def main():
         model_config=base_actor_config,
         critic_model_config=critic_gnn_config,
         seed=42,
-        config=experiment_config
+        config=experiment_config,
     )
-    
+
     # Collect data
     batch = next(iter(experiment.collector))
-    
+
     print("\n1. Actor HeteroGNN Config (Parameter Generator):")
     print("-" * 50)
-    
+
     # Find the HeteroGNN in the actor
     actor = experiment.losses["agents"].actor_network
     gnn_module = None
@@ -108,7 +115,9 @@ def main():
         if "HeteroGNN" in type(module).__name__:
             gnn_module = module
             print(f"Found: {name}")
-            print(f"  exclude_observations_from_node_features: {module.exclude_observations_from_node_features}")
+            print(
+                f"  exclude_observations_from_node_features: {module.exclude_observations_from_node_features}"
+            )
             print(f"  cat_observations_to_output: {module.cat_observations_to_output}")
             print(f"  use_dummy_node_features: {module.use_dummy_node_features}")
             print(f"  input_features: {module.input_features}")
@@ -116,7 +125,7 @@ def main():
             print(f"  node_types: {module.node_types}")
             print(f"  edge_types: {module.edge_types}")
             break
-    
+
     print("\n2. Batch observation keys:")
     print("-" * 50)
     for k in batch.keys(True, True):
@@ -124,47 +133,50 @@ def main():
             val = batch.get(k)
             if isinstance(val, torch.Tensor):
                 print(f"  {k}: shape={val.shape}, dtype={val.dtype}")
-    
+
     print("\n3. Tracing GNN forward pass manually:")
     print("-" * 50)
-    
+
     # Hook to capture x_dict
     captured = {}
-    
+
     def hook_fn(module, input, output):
         # Capture the x_dict inside _forward
         pass
-    
+
     # Trace what inputs go to the GNN
     if gnn_module:
         # Direct call
         batch_copy = batch.clone()
-        
+
         # Patch the forward to print x_dict
         original_forward = gnn_module._forward
-        
+
         def patched_forward(tensordict):
             from tensordict.utils import _unravel_key_to_tuple
-            import torch.nn.functional as F
-            
+
             device = "cpu"
             x_dict = {}
-            
+
             # Gather inputs for each agent group
             for group in gnn_module.agent_groups:
                 observations = []
-                if not gnn_module.exclude_observations_from_node_features or gnn_module.cat_observations_to_output:
+                if (
+                    not gnn_module.exclude_observations_from_node_features
+                    or gnn_module.cat_observations_to_output
+                ):
                     observations = [
                         tensordict.get(in_key)
                         for in_key in gnn_module.in_keys
                         if group in _unravel_key_to_tuple(in_key)
-                        and _unravel_key_to_tuple(in_key)[-1] not in (gnn_module.position_key, gnn_module.velocity_key)
+                        and _unravel_key_to_tuple(in_key)[-1]
+                        not in (gnn_module.position_key, gnn_module.velocity_key)
                     ]
-                
+
                 input_list = []
                 if not gnn_module.exclude_observations_from_node_features:
                     input_list.extend(observations)
-                
+
                 if not input_list and gnn_module.use_dummy_node_features:
                     # This is the problem!
                     ref = None
@@ -172,43 +184,53 @@ def main():
                         if group in _unravel_key_to_tuple(k):
                             ref = tensordict.get(k)
                             break
-                    
-                    batch_size = ref.shape[:-2] if hasattr(ref, 'shape') else tensordict.batch_size
-                    n_agents = ref.shape[-2] if hasattr(ref, 'shape') else 1
-                    
+
+                    batch_size = ref.shape[:-2] if hasattr(ref, "shape") else tensordict.batch_size
+                    n_agents = ref.shape[-2] if hasattr(ref, "shape") else 1
+
                     dummy = torch.zeros(*batch_size, n_agents, 1, device=device, dtype=torch.float)
                     print(f"\n  ⚠️  DUMMY NODE FEATURES CREATED for {group}:")
                     print(f"     Shape: {dummy.shape}")
-                    print(f"     Values: all zeros (no gradient flow!)")
+                    print("     Values: all zeros (no gradient flow!)")
                     input_list.append(dummy)
-                
+
                 if input_list:
                     x_group = torch.cat(input_list, dim=-1)
                     x_dict[group] = x_group
-                    print(f"\n  x_dict['{group}']: shape={x_group.shape}, requires_grad={x_group.requires_grad}")
-                    print(f"     min={x_group.min().item():.4f}, max={x_group.max().item():.4f}, std={x_group.std().item():.4f}")
-            
+                    print(
+                        f"\n  x_dict['{group}']: shape={x_group.shape}, requires_grad={x_group.requires_grad}"
+                    )
+                    print(
+                        f"     min={x_group.min().item():.4f}, max={x_group.max().item():.4f}, std={x_group.std().item():.4f}"
+                    )
+
             # Get grid_node features
             if gnn_module.node_features_keys:
                 for node_type, key in gnn_module.node_features_keys.items():
-                    full_key = gnn_module._get_key_terminating_with(list(tensordict.keys(True, True)), key, None)
+                    full_key = gnn_module._get_key_terminating_with(
+                        list(tensordict.keys(True, True)), key, None
+                    )
                     if full_key:
                         val = tensordict.get(full_key)
                         x_dict[node_type] = val
-                        print(f"\n  x_dict['{node_type}']: shape={val.shape}, requires_grad={val.requires_grad}")
-                        print(f"     min={val.min().item():.4f}, max={val.max().item():.4f}, std={val.std().item():.4f}")
-            
+                        print(
+                            f"\n  x_dict['{node_type}']: shape={val.shape}, requires_grad={val.requires_grad}"
+                        )
+                        print(
+                            f"     min={val.min().item():.4f}, max={val.max().item():.4f}, std={val.std().item():.4f}"
+                        )
+
             return original_forward(tensordict)
-        
+
         gnn_module._forward = patched_forward
-        
+
         # Run actor forward
         print("\nRunning actor forward pass...")
         batch_out = actor(batch_copy)
-        
+
         # Restore
         gnn_module._forward = original_forward
-    
+
     print("\n4. ROOT CAUSE ANALYSIS:")
     print("-" * 50)
     print("""
@@ -225,6 +247,7 @@ SOLUTION: Set exclude_observations_from_node_features=False in the
 parameter generator GNN config, OR use a learnable embedding instead
 of dummy zeros.
     """)
+
 
 if __name__ == "__main__":
     main()

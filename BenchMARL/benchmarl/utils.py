@@ -7,7 +7,8 @@ import contextlib
 import importlib
 import random
 import typing
-from typing import Any, Callable, Dict, List, Union
+from collections.abc import Callable
+from typing import Any, Union
 
 import torch
 import yaml
@@ -23,7 +24,7 @@ _has_numpy = importlib.util.find_spec("numpy") is not None
 DEVICE_TYPING = Union[torch.device, str, int]
 
 
-def _read_yaml_config(config_file: str) -> Dict[str, Any]:
+def _read_yaml_config(config_file: str) -> dict[str, Any]:
     with open(config_file) as config:
         yaml_string = config.read()
     config_dict = yaml.safe_load(yaml_string)
@@ -79,7 +80,7 @@ def local_seed():
 
 def _add_rnn_transforms(
     env_fun: Callable[[], EnvBase],
-    group_map: Dict[str, List[str]],
+    group_map: dict[str, list[str]],
     model_config: "ModelConfig",
 ) -> Callable[[], EnvBase]:
     """
@@ -105,8 +106,7 @@ def _add_rnn_transforms(
             {
                 group: Composite(
                     model_config._get_model_state_spec_inner(group=group).expand(
-                        len(agents),
-                        *model_config._get_model_state_spec_inner(group=group).shape
+                        len(agents), *model_config._get_model_state_spec_inner(group=group).shape
                     ),
                     shape=(len(agents),),
                 ).to(device)
@@ -120,11 +120,7 @@ def _add_rnn_transforms(
                 *(
                     [InitTracker(init_key="is_init")]
                     + (
-                        [
-                            TensorDictPrimer(
-                                spec_actor, reset_key="_reset", expand_specs=True
-                            )
-                        ]
+                        [TensorDictPrimer(spec_actor, reset_key="_reset", expand_specs=True)]
                         if len(spec_actor.keys(True, True)) > 0
                         else []
                     )

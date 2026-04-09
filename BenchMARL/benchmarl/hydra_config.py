@@ -8,11 +8,11 @@ from dataclasses import is_dataclass
 from pathlib import Path
 
 from benchmarl.algorithms.common import AlgorithmConfig
-from benchmarl.environments import task_config_registry, TaskClass
+from benchmarl.environments import TaskClass, task_config_registry
 from benchmarl.environments.common import _type_check_task_config
 from benchmarl.experiment import Experiment, ExperimentConfig
 from benchmarl.models import model_config_registry
-from benchmarl.models.common import ModelConfig, parse_model_config, SequenceModelConfig
+from benchmarl.models.common import ModelConfig, SequenceModelConfig, parse_model_config
 
 _has_hydra = importlib.util.find_spec("hydra") is not None
 
@@ -30,9 +30,7 @@ class _HydraMissingMetadataError(FileNotFoundError):
         super().__init__(self.message)
 
 
-def load_experiment_from_hydra(
-    cfg: DictConfig, task_name: str, callbacks=()
-) -> Experiment:
+def load_experiment_from_hydra(cfg: DictConfig, task_name: str, callbacks=()) -> Experiment:
     """Creates an :class:`~benchmarl.experiment.Experiment` from hydra config.
 
     Args:
@@ -119,8 +117,7 @@ def load_model_config_from_hydra(cfg: DictConfig) -> ModelConfig:
     """
     if "layers" in cfg.keys():
         model_configs = [
-            load_model_config_from_hydra(cfg.layers[f"l{i}"])
-            for i in range(1, len(cfg.layers) + 1)
+            load_model_config_from_hydra(cfg.layers[f"l{i}"]) for i in range(1, len(cfg.layers) + 1)
         ]
         return SequenceModelConfig(
             model_configs=model_configs, intermediate_sizes=cfg.intermediate_sizes
@@ -128,9 +125,7 @@ def load_model_config_from_hydra(cfg: DictConfig) -> ModelConfig:
     else:
         model_class = model_config_registry[cfg.name]
         return model_class(
-            **parse_model_config(
-                OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True)
-            )
+            **parse_model_config(OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True))
         )
 
 

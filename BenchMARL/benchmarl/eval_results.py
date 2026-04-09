@@ -9,7 +9,6 @@ import importlib
 import json
 from os import walk
 from pathlib import Path
-from typing import Dict, List, Optional
 
 _has_marl_eval = importlib.util.find_spec("marl_eval") is not None
 if _has_marl_eval:
@@ -27,7 +26,7 @@ if _has_marl_eval:
     from matplotlib import pyplot as plt
 
 
-def get_raw_dict_from_multirun_folder(multirun_folder: str) -> Dict:
+def get_raw_dict_from_multirun_folder(multirun_folder: str) -> dict:
     """Get the ``marl-eval`` input dictionary from the folder of a hydra multirun.
 
     Examples:
@@ -49,7 +48,7 @@ def get_raw_dict_from_multirun_folder(multirun_folder: str) -> Dict:
     return load_and_merge_json_dicts(_get_json_files_from_multirun(multirun_folder))
 
 
-def _get_json_files_from_multirun(multirun_folder: str) -> List[str]:
+def _get_json_files_from_multirun(multirun_folder: str) -> list[str]:
     files = []
     for dirpath, _, filenames in walk(multirun_folder):
         for file_name in filenames:
@@ -59,8 +58,8 @@ def _get_json_files_from_multirun(multirun_folder: str) -> List[str]:
 
 
 def load_and_merge_json_dicts(
-    json_input_files: List[str], json_output_file: Optional[str] = None
-) -> Dict:
+    json_input_files: list[str], json_output_file: str | None = None
+) -> dict:
     """Loads and merges json dictionaries to form the ``marl-eval`` input dictionary .
 
     Args:
@@ -83,7 +82,7 @@ def load_and_merge_json_dicts(
 
     dicts = []
     for file in json_input_files:
-        with open(file, "r") as f:
+        with open(file) as f:
             dicts.append(json.load(f))
     full_dict = {}
     for single_dict in dicts:
@@ -130,9 +129,9 @@ class Plotting:
 
     @staticmethod
     def process_data(
-        raw_data: Dict,
-        metrics_to_normalize: Optional[List[str]] = METRICS_TO_NORMALIZE,
-    ) -> Dict:
+        raw_data: dict,
+        metrics_to_normalize: list[str] | None = METRICS_TO_NORMALIZE,
+    ) -> dict:
         """Call ``data_process_pipeline`` to normalize the chosen metrics and to clean the data
 
         Args:
@@ -153,7 +152,7 @@ class Plotting:
     def create_matrices(
         processed_data,
         env_name: str,
-        metrics_to_normalize: Optional[List[str]] = METRICS_TO_NORMALIZE,
+        metrics_to_normalize: list[str] | None = METRICS_TO_NORMALIZE,
     ):
         return create_matrices_for_rliable(
             data_dictionary=processed_data,
@@ -168,9 +167,9 @@ class Plotting:
     @staticmethod
     def performance_profile_figure(
         environment_comparison_matrix,
-        metric_name: Optional[str] = METRIC_TO_PLOT,
-        metrics_to_normalize: Optional[List[str]] = METRICS_TO_NORMALIZE,
-        **kwargs
+        metric_name: str | None = METRIC_TO_PLOT,
+        metrics_to_normalize: list[str] | None = METRICS_TO_NORMALIZE,
+        **kwargs,
     ):
         return performance_profiles(
             environment_comparison_matrix,
@@ -182,10 +181,10 @@ class Plotting:
     @staticmethod
     def aggregate_scores(
         environment_comparison_matrix,
-        metric_name: Optional[str] = METRIC_TO_PLOT,
-        metrics_to_normalize: Optional[List[str]] = METRICS_TO_NORMALIZE,
+        metric_name: str | None = METRIC_TO_PLOT,
+        metrics_to_normalize: list[str] | None = METRICS_TO_NORMALIZE,
         save_tabular_as_latex: bool = True,
-        **kwargs
+        **kwargs,
     ):
         return aggregate_scores(
             dictionary=environment_comparison_matrix,
@@ -198,10 +197,10 @@ class Plotting:
     @staticmethod
     def probability_of_improvement(
         environment_comparison_matrix,
-        algorithms_to_compare: List[List[str]],
-        metric_name: Optional[str] = METRIC_TO_PLOT,
-        metrics_to_normalize: Optional[List[str]] = METRICS_TO_NORMALIZE,
-        **kwargs
+        algorithms_to_compare: list[list[str]],
+        metric_name: str | None = METRIC_TO_PLOT,
+        metrics_to_normalize: list[str] | None = METRICS_TO_NORMALIZE,
+        **kwargs,
     ):
         return probability_of_improvement(
             environment_comparison_matrix,
@@ -214,9 +213,9 @@ class Plotting:
     @staticmethod
     def environemnt_sample_efficiency_curves(
         sample_effeciency_matrix,
-        metric_name: Optional[str] = METRIC_TO_PLOT,
-        metrics_to_normalize: Optional[List[str]] = METRICS_TO_NORMALIZE,
-        **kwargs
+        metric_name: str | None = METRIC_TO_PLOT,
+        metrics_to_normalize: list[str] | None = METRICS_TO_NORMALIZE,
+        **kwargs,
     ):
         return sample_efficiency_curves(
             dictionary=sample_effeciency_matrix,
@@ -234,9 +233,9 @@ class Plotting:
         processed_data,
         task,
         env,
-        metric_name: Optional[str] = METRIC_TO_PLOT,
-        metrics_to_normalize: Optional[List[str]] = METRICS_TO_NORMALIZE,
-        **kwargs
+        metric_name: str | None = METRIC_TO_PLOT,
+        metrics_to_normalize: list[str] | None = METRICS_TO_NORMALIZE,
+        **kwargs,
     ):
         return plot_single_task(
             processed_data=processed_data,
@@ -258,15 +257,9 @@ if __name__ == "__main__":
         sample_efficiency_matrix,
     ) = Plotting.create_matrices(processed_data, env_name="vmas")
 
-    Plotting.performance_profile_figure(
-        environment_comparison_matrix=environment_comparison_matrix
-    )
-    Plotting.aggregate_scores(
-        environment_comparison_matrix=environment_comparison_matrix
-    )
-    Plotting.environemnt_sample_efficiency_curves(
-        sample_effeciency_matrix=sample_efficiency_matrix
-    )
+    Plotting.performance_profile_figure(environment_comparison_matrix=environment_comparison_matrix)
+    Plotting.aggregate_scores(environment_comparison_matrix=environment_comparison_matrix)
+    Plotting.environemnt_sample_efficiency_curves(sample_effeciency_matrix=sample_efficiency_matrix)
 
     Plotting.task_sample_efficiency_curves(
         processed_data=processed_data, env="vmas", task="navigation"

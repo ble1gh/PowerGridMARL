@@ -4,7 +4,7 @@
 #  LICENSE file in the root directory of this source tree.
 #
 import copy
-from typing import Callable, Dict, List, Optional
+from collections.abc import Callable
 
 from torchrl.data import Composite
 from torchrl.envs import EnvBase
@@ -19,7 +19,7 @@ class VmasClass(TaskClass):
         self,
         num_envs: int,
         continuous_actions: bool,
-        seed: Optional[int],
+        seed: int | None,
         device: DEVICE_TYPING,
     ) -> Callable[[], EnvBase]:
         config = copy.deepcopy(self.config)
@@ -46,15 +46,15 @@ class VmasClass(TaskClass):
     def max_steps(self, env: EnvBase) -> int:
         return self.config["max_steps"]
 
-    def group_map(self, env: EnvBase) -> Dict[str, List[str]]:
+    def group_map(self, env: EnvBase) -> dict[str, list[str]]:
         if hasattr(env, "group_map"):
             return env.group_map
         return {"agents": [agent.name for agent in env.agents]}
 
-    def state_spec(self, env: EnvBase) -> Optional[Composite]:
+    def state_spec(self, env: EnvBase) -> Composite | None:
         return None
 
-    def action_mask_spec(self, env: EnvBase) -> Optional[Composite]:
+    def action_mask_spec(self, env: EnvBase) -> Composite | None:
         return None
 
     def observation_spec(self, env: EnvBase) -> Composite:
@@ -64,7 +64,7 @@ class VmasClass(TaskClass):
                 del observation_spec[(group, "info")]
         return observation_spec
 
-    def info_spec(self, env: EnvBase) -> Optional[Composite]:
+    def info_spec(self, env: EnvBase) -> Composite | None:
         info_spec = env.full_observation_spec_unbatched.clone()
         for group in self.group_map(env):
             del info_spec[(group, "observation")]

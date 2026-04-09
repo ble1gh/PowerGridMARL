@@ -7,15 +7,16 @@
 import pathlib
 import warnings
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any
 
 from tensordict import TensorDictBase
 from tensordict.nn import TensorDictModuleBase, TensorDictSequential
 from tensordict.utils import NestedKey
 from torchrl.data import Composite, TensorSpec, Unbounded
 
-from benchmarl.utils import _class_from_name, _read_yaml_config, DEVICE_TYPING
+from benchmarl.utils import DEVICE_TYPING, _class_from_name, _read_yaml_config
 
 
 def _check_spec(tensordict, spec):
@@ -23,7 +24,7 @@ def _check_spec(tensordict, spec):
         raise ValueError(f"TensorDict {tensordict} not in spec {spec}")
 
 
-def parse_model_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
+def parse_model_config(cfg: dict[str, Any]) -> dict[str, Any]:
     del cfg["name"]
     kwargs = {}
     for key, value in cfg.items():
@@ -213,7 +214,7 @@ class SequenceModel(Model):
 
     def __init__(
         self,
-        models: List[Model],
+        models: list[Model],
     ):
         super().__init__(
             n_agents=models[0].n_agents,
@@ -349,13 +350,11 @@ class ModelConfig(ABC):
         """
         return Composite()
 
-    def _get_model_state_spec_inner(
-        self, model_index: int = 0, group: str = None
-    ) -> Composite:
+    def _get_model_state_spec_inner(self, model_index: int = 0, group: str = None) -> Composite:
         return self.get_model_state_spec(model_index)
 
     @staticmethod
-    def _load_from_yaml(name: str) -> Dict[str, Any]:
+    def _load_from_yaml(name: str) -> dict[str, Any]:
         yaml_path = (
             pathlib.Path(__file__).parent.parent
             / "conf"
@@ -366,7 +365,7 @@ class ModelConfig(ABC):
         return _read_yaml_config(str(yaml_path.resolve()))
 
     @classmethod
-    def get_from_yaml(cls, path: Optional[str] = None):
+    def get_from_yaml(cls, path: str | None = None):
         """
         Load the model configuration from yaml
 
@@ -448,9 +447,7 @@ class SequenceModelConfig(ModelConfig):
     ) -> Model:
         n_models = len(self.model_configs)
         if not n_models > 0:
-            raise ValueError(
-                f"SequenceModelConfig expects n_models > 0, got {n_models}"
-            )
+            raise ValueError(f"SequenceModelConfig expects n_models > 0, got {n_models}")
         if len(self.intermediate_sizes) != n_models - 1:
             raise ValueError(
                 f"SequenceModelConfig intermediate_sizes len should be {n_models - 1}, got {len(self.intermediate_sizes)}"
@@ -532,23 +529,20 @@ class SequenceModelConfig(ModelConfig):
         return is_rnn
 
     @classmethod
-    def get_from_yaml(cls, path: Optional[str] = None):
+    def get_from_yaml(cls, path: str | None = None):
         raise NotImplementedError
 
 
 @dataclass
 class EnsembleModelConfig(ModelConfig):
-
-    model_configs_map: Dict[str, ModelConfig]
+    model_configs_map: dict[str, ModelConfig]
 
     def get_model(self, agent_group: str, **kwargs) -> Model:
         if agent_group not in self.model_configs_map.keys():
             raise ValueError(
                 f"Environment contains agent group '{agent_group}' not present in the EnsembleModelConfig configuration."
             )
-        return self.model_configs_map[agent_group].get_model(
-            **kwargs, agent_group=agent_group
-        )
+        return self.model_configs_map[agent_group].get_model(**kwargs, agent_group=agent_group)
 
     @staticmethod
     def associated_class():
@@ -569,12 +563,8 @@ class EnsembleModelConfig(ModelConfig):
         for model_config in self.model_configs_map.values():
             model_config.is_critic = value
 
-    def _get_model_state_spec_inner(
-        self, model_index: int = 0, group: str = None
-    ) -> Composite:
-        return self.model_configs_map[group].get_model_state_spec(
-            model_index=model_index
-        )
+    def _get_model_state_spec_inner(self, model_index: int = 0, group: str = None) -> Composite:
+        return self.model_configs_map[group].get_model_state_spec(model_index=model_index)
 
     @property
     def is_rnn(self) -> bool:
@@ -584,5 +574,5 @@ class EnsembleModelConfig(ModelConfig):
         return is_rnn
 
     @classmethod
-    def get_from_yaml(cls, path: Optional[str] = None):
+    def get_from_yaml(cls, path: str | None = None):
         raise NotImplementedError

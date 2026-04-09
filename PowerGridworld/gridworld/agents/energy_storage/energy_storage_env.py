@@ -1,20 +1,16 @@
+import gymnasium as gym
 import numpy as np
 import pandas as pd
-
 from scipy.stats import truncnorm
-
-import gymnasium as gym
 
 from gridworld import ComponentEnv
 from gridworld.utils import maybe_rescale_box_space, to_raw, to_scaled
 
-from gridworld.log import logger
-
 
 class EnergyStorageEnv(ComponentEnv):
-    """Simple model of energy storage device that has (separate) linear models 
+    """Simple model of energy storage device that has (separate) linear models
     for charging and discharging.  Gym specs:
-    
+
         - Observation space:  State of charge (energy stored).
         - Action space:  [-1, 1] for fully charging / discharging, resp.
         - Reward:  0. (reimplement to have a non-trivial reward).
@@ -32,7 +28,7 @@ class EnergyStorageEnv(ComponentEnv):
         max_episode_steps: int = 288,
         control_timedelta: pd.Timedelta = pd.Timedelta(300, "s"),
         rescale_spaces: bool = True,
-        **kwargs
+        **kwargs,
     ):
 
         super().__init__(name=name)
@@ -61,23 +57,14 @@ class EnergyStorageEnv(ComponentEnv):
         self._obs_labels = ["stage_of_charge"]
 
         self._observation_space = gym.spaces.Box(
-            shape=(1,),
-            low=self.storage_range[0],
-            high=self.storage_range[1],
-            dtype=np.float64
+            shape=(1,), low=self.storage_range[0], high=self.storage_range[1], dtype=np.float64
         )
         self.observation_space = maybe_rescale_box_space(
-            self._observation_space, rescale=self.rescale_spaces)
-
-        self._action_space = gym.spaces.Box(
-            shape=(1,),
-            low=-1.0,
-            high=1.0,
-            dtype=np.float64
+            self._observation_space, rescale=self.rescale_spaces
         )
-        self.action_space = maybe_rescale_box_space(
-            self._action_space, rescale=self.rescale_spaces)
 
+        self._action_space = gym.spaces.Box(shape=(1,), low=-1.0, high=1.0, dtype=np.float64)
+        self.action_space = maybe_rescale_box_space(self._action_space, rescale=self.rescale_spaces)
 
     @property
     def participation_score(self) -> float:
@@ -90,39 +77,37 @@ class EnergyStorageEnv(ComponentEnv):
         return float(self.storage_range[1])
 
     def reset(self, **kwargs):
-        """ Reset the battery storage at the beginning of an episode.
-        """
+        """Reset the battery storage at the beginning of an episode."""
 
         self.simulation_step = 0
 
-        init_storage = kwargs['init_storage'] if 'init_storage' in kwargs.keys() else None
+        init_storage = kwargs["init_storage"] if "init_storage" in kwargs else None
 
         if init_storage is None:
             # Initial battery storage is sampled from a truncated normal distribution.
-            self.current_storage =\
-                float(truncnorm(-1, 1).rvs(random_state=self.rng) *\
-                self.initial_storage_std + self.initial_storage_mean)
+            self.current_storage = float(
+                truncnorm(-1, 1).rvs(random_state=self.rng) * self.initial_storage_std
+                + self.initial_storage_mean
+            )
         else:
             try:
                 init_storage = float(init_storage)
-                init_storage = np.clip(
-                    init_storage, self.storage_range[0], self.storage_range[1])
+                init_storage = np.clip(init_storage, self.storage_range[0], self.storage_range[1])
             except (TypeError, ValueError) as e:
                 print(e)
                 print("init_storage value needs to be a float, use default value instead")
                 init_storage = self.initial_storage_mean
 
             self.current_storage = init_storage
-        
+
         return self.get_obs(**kwargs)
-            
 
     def validate_power(self, power):
-        """ Sanity check if the battery can provide such power given its current 
+        """Sanity check if the battery can provide such power given its current
             SOC, e.g., cannot discharge when SOC is at minimum.
 
         Args:
-          power: A float, the controlled power to the storage. It discharges if 
+          power: A float, the controlled power to the storage. It discharges if
             the value is positive, else it is negative.
 
         Return:
@@ -131,26 +116,31 @@ class EnergyStorageEnv(ComponentEnv):
 
         if power > 0:
             # ensure the discharging power is within the range.
-            if self.current_storage - \
-                    power * self.control_interval_in_hr / self.discharge_efficiency <\
-                    self.storage_range[0]:
-                power = max(self.current_storage - self.storage_range[0], 0.0) /\
-                    self.control_interval_in_hr
+            if (
+                self.current_storage
+                - power * self.control_interval_in_hr / self.discharge_efficiency
+                < self.storage_range[0]
+            ):
+                power = (
+                    max(self.current_storage - self.storage_range[0], 0.0)
+                    / self.control_interval_in_hr
+                )
 
         elif power < 0:
             # ensure charging does not exceed the limit
-            if self.current_storage - \
-                    self.charge_efficiency * power * self.control_interval_in_hr >\
-                    self.storage_range[1]:
-                power = - max(self.storage_range[1] - self.current_storage, 0.0) /\
-                    self.control_interval_in_hr
+            if (
+                self.current_storage - self.charge_efficiency * power * self.control_interval_in_hr
+                > self.storage_range[1]
+            ):
+                power = (
+                    -max(self.storage_range[1] - self.current_storage, 0.0)
+                    / self.control_interval_in_hr
+                )
 
         return power
 
-
     def step(self, action: np.ndarray, **kwargs):
-        """ Implement control to the storage.
-        """
+        """Implement control to the storage."""
 
         if self.rescale_spaces:
             action = to_raw(action, self._action_space.low, self._action_space.high)
@@ -184,8 +174,7 @@ class EnergyStorageEnv(ComponentEnv):
         return es_reward, reward_meta
 
     def get_obs(self, **kwargs):
-        """ The only observation for the energy storage is its SOC.
-        """
+        """The only observation for the energy storage is its SOC."""
 
         raw_obs = np.array([self.current_storage])
         if self.rescale_spaces:
@@ -199,9 +188,8 @@ class EnergyStorageEnv(ComponentEnv):
         return self.simulation_step >= self.max_episode_steps
 
 
-if __name__ == '__main__':
-
-    env = EnergyStorageEnv('ES')
+if __name__ == "__main__":
+    env = EnergyStorageEnv("ES")
     state = env.reset()
     done = False
 
@@ -221,4 +209,3 @@ if __name__ == '__main__':
     plt.plot(power_history)
     plt.plot(soc_history)
     plt.show()
-

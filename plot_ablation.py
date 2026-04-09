@@ -5,19 +5,23 @@ Usage:
     python plot_ablation.py --project HGTeam_CDC_Ablation --groups physical_graph no_gnn
     python plot_ablation.py --project HGTeam_CDC_Ablation --groups physical_graph no_gnn --metric eval/reward/EV_mean
 """
+
 import argparse
+
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 
-plt.rcParams.update({
-    "font.size": 12,
-    "axes.labelsize": 14,
-    "axes.titlesize": 14,
-    "legend.fontsize": 11,
-    "figure.figsize": (8, 5),
-    "figure.dpi": 150,
-})
+plt.rcParams.update(
+    {
+        "font.size": 12,
+        "axes.labelsize": 14,
+        "axes.titlesize": 14,
+        "legend.fontsize": 11,
+        "figure.figsize": (8, 5),
+        "figure.dpi": 150,
+    }
+)
 
 LABELS = {
     "physical_graph": "HGTeam (Physics-Informed GNN)",
@@ -32,6 +36,7 @@ COLORS = {
 def fetch_group_runs(project, group):
     """Fetch all runs in a WandB group, return list of (steps, values) arrays."""
     import wandb
+
     api = wandb.Api()
     runs = api.runs(project, filters={"group": group, "state": "finished"})
     series = []
@@ -70,10 +75,16 @@ def align_and_aggregate(series_list, metric, x_key="_step"):
     return x_common, mat.mean(axis=0), mat.std(axis=0)
 
 
-def plot_ablation(project, groups, metric="eval/reward/episode_reward_mean",
-                  xlabel="Environment Frames", ylabel="Evaluation Return",
-                  title="GNN Ablation", output="ablation_gnn.pdf",
-                  smooth=5):
+def plot_ablation(
+    project,
+    groups,
+    metric="eval/reward/episode_reward_mean",
+    xlabel="Environment Frames",
+    ylabel="Evaluation Return",
+    title="GNN Ablation",
+    output="ablation_gnn.pdf",
+    smooth=5,
+):
     fig, ax = plt.subplots()
 
     for group in groups:
@@ -95,7 +106,7 @@ def plot_ablation(project, groups, metric="eval/reward/episode_reward_mean",
             std = pd.Series(std).rolling(smooth, min_periods=1).mean().values
 
         label = LABELS.get(group, group)
-        color = COLORS.get(group, None)
+        color = COLORS.get(group)
         ax.plot(x, mean, label=label, color=color, linewidth=2)
         ax.fill_between(x, mean - std, mean + std, alpha=0.2, color=color)
 
@@ -122,5 +133,13 @@ if __name__ == "__main__":
     parser.add_argument("--smooth", type=int, default=5)
     args = parser.parse_args()
 
-    plot_ablation(args.project, args.groups, args.metric,
-                  args.xlabel, args.ylabel, args.title, args.output, args.smooth)
+    plot_ablation(
+        args.project,
+        args.groups,
+        args.metric,
+        args.xlabel,
+        args.ylabel,
+        args.title,
+        args.output,
+        args.smooth,
+    )

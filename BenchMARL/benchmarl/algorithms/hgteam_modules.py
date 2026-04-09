@@ -8,13 +8,13 @@ This module contains:
 """
 
 import torch
-from torch import nn
 from tensordict import TensorDictBase
-
+from torch import nn
 
 # ======================================================================
 # Shared primitive
 # ======================================================================
+
 
 def reparameterize(
     embedding: torch.Tensor,
@@ -44,6 +44,7 @@ def reparameterize(
 # EmbeddingProcessor
 # ======================================================================
 
+
 class EmbeddingProcessor(nn.Module):
     """Process GNN embeddings — handles optional split-z and stochastic sampling.
 
@@ -70,7 +71,18 @@ class EmbeddingProcessor(nn.Module):
         z_token_dim: int = 32,
         z_query_dim: int = 32,
         stochastic_query: bool = True,
-    ):
+    ) -> None:
+        """Initialise the embedding post-processor.
+
+        Args:
+            embedding_dim: Raw GNN output dimension.
+            stochastic: If True (legacy mode), apply reparameterised Gaussian
+                sampling to produce z.
+            split_z: If True, split GNN output into z_token + z_query.
+            z_token_dim: Width of the deterministic z_token vector.
+            z_query_dim: Width of the z_query latent vector.
+            stochastic_query: If True (and split_z), reparameterise z_query.
+        """
         super().__init__()
         self.split_z = split_z
         self.stochastic = stochastic
@@ -86,14 +98,32 @@ class EmbeddingProcessor(nn.Module):
         else:
             self.latent_dim = embedding_dim
 
-    def forward(self, embedding: torch.Tensor):
+    def forward(
+        self,
+        embedding: torch.Tensor,
+    ) -> (
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]
+        | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]
+    ):
+        """Process a raw GNN embedding.
+
+        Args:
+            embedding: ``[..., n_agents, embedding_dim]`` raw GNN output.
+
+        Returns:
+            Legacy mode: ``(z, mean, log_var)``.
+            Split-z mode: ``(z_token, z_query, query_mean, query_logvar)``.
+        """
         # embedding: (..., n_agents, embedding_dim)
         if self.split_z:
             return self._forward_split(embedding)
         return self._forward_legacy(embedding)
 
     # -- Legacy (single-z) path ------------------------------------------
-    def _forward_legacy(self, embedding: torch.Tensor):
+    def _forward_legacy(
+        self,
+        embedding: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Returns ``(z, mean, log_var)``."""
         if self.stochastic:
             z, mean, log_var = reparameterize(embedding)
@@ -104,15 +134,18 @@ class EmbeddingProcessor(nn.Module):
         return z, mean, log_var
 
     # -- Split-z path ----------------------------------------------------
-    def _forward_split(self, embedding: torch.Tensor):
+    def _forward_split(
+        self,
+        embedding: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Returns ``(z_token, z_query, query_mean, query_logvar)``.
 
         * ``z_token`` is always deterministic (first ``z_token_dim`` dims).
         * ``z_query`` is reparameterized-sampled when ``stochastic_query``.
         * ``query_mean`` is the pre-noise mean (needed for VIB KL computation).
         """
-        z_token = embedding[..., :self.z_token_dim]
-        remainder = embedding[..., self.z_token_dim:]
+        z_token = embedding[..., : self.z_token_dim]
+        remainder = embedding[..., self.z_token_dim :]
 
         if self.stochastic_query:
             z_query, mean, log_var = reparameterize(remainder)
@@ -128,7 +161,15 @@ class EmbeddingProcessor(nn.Module):
 # HyperNetworkJoiner
 # ======================================================================
 
+
 class HyperNetworkJoiner(nn.Module):
+    """Generate per-agent action-head weights from GNN embeddings.
+
+    The actor MLP outputs ``feature_dim``-dimensional features per agent.
+    This module uses the GNN embedding to produce per-agent weight matrices
+    and biases that map features → logits: ``logits = features @ W + b``.
+    """
+
     def __init__(
         self,
         embedding_dim: int,
@@ -136,7 +177,17 @@ class HyperNetworkJoiner(nn.Module):
         output_dim: int,
         device: torch.device,
         stochastic_embedding: bool = False,
-    ):
+    ) -> None:
+        """Initialise the hypernetwork weight generator.
+
+        Args:
+            embedding_dim: Dimensionality of the GNN embedding input.
+            feature_dim: Dimensionality of the actor MLP feature output.
+            output_dim: Number of action logits per agent.
+            device: Torch device for parameter allocation.
+            stochastic_embedding: If True, apply reparameterised sampling
+                to the embedding before weight generation.
+        """
         super().__init__()
         self.embedding_dim = embedding_dim
         self.feature_dim = feature_dim
@@ -151,20 +202,28 @@ class HyperNetworkJoiner(nn.Module):
             self.latent_dim = embedding_dim
 
         # Generators (operate on latent_dim, not raw embedding_dim)
-        self.weight_generator = nn.Linear(
-            self.latent_dim, feature_dim * output_dim, device=device
-        )
+        self.weight_generator = nn.Linear(self.latent_dim, feature_dim * output_dim, device=device)
         self.bias_generator = nn.Linear(self.latent_dim, output_dim, device=device)
 
-    def forward(self, features: torch.Tensor, embedding: torch.Tensor):
-        # features: (..., n_agents, feature_dim)
-        # embedding: (..., n_agents, embedding_dim)
-        # Returns: (logits, z, log_var)
+    def forward(
+        self,
+        features: torch.Tensor,
+        embedding: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """Generate per-agent logits from features and GNN embedding.
+
+        Args:
+            features: ``[..., n_agents, feature_dim]`` actor MLP output.
+            embedding: ``[..., n_agents, embedding_dim]`` GNN embedding.
+
+        Returns:
+            ``(logits, z, log_var)`` where logits is
+            ``[..., n_agents, output_dim]``.
+        """
 
         if self.stochastic_embedding:
-            z, mean, log_var = reparameterize(embedding)
+            z, _mean, log_var = reparameterize(embedding)
         else:
-            mean = embedding
             log_var = None
             z = embedding
 
@@ -182,8 +241,9 @@ class HyperNetworkJoiner(nn.Module):
 # Loss helper
 # ======================================================================
 
+
 def merge_embedding_losses(
-    algorithm,
+    algorithm: "HGTeamBase",  # noqa: F821
     group: str,
     tensordict: TensorDictBase,
     out: TensorDictBase,
@@ -207,7 +267,7 @@ def merge_embedding_losses(
 
     for k, v in embedding_losses.items():
         out.set(k, v)
-        if k.startswith("loss_") and target_loss_key in out.keys():
+        if k.startswith("loss_") and target_loss_key in out:
             out.set(target_loss_key, out.get(target_loss_key) + v)
 
     return out

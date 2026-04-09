@@ -16,8 +16,10 @@ NOT necessarily on the nn.Module's .parameters().  The old script therefore
 reported ~half the params as "no grad" even though they were receiving
 gradients perfectly fine during real training.
 """
-import sys
+
 import os
+import sys
+
 import torch
 import torch_geometric.nn as tgnn
 from torch import nn
@@ -25,18 +27,18 @@ from torch import nn
 sys.path.append(os.path.join(os.getcwd(), "BenchMARL"))
 
 from benchmarl.algorithms import HGTeamConfig
-from benchmarl.models import HeteroGnnConfig, MlpConfig
-from benchmarl.experiment import Experiment, ExperimentConfig
 from benchmarl.environments.PowerGridworldVariable.common import PowerGridworldVariableTask
-
+from benchmarl.experiment import Experiment, ExperimentConfig
+from benchmarl.models import HeteroGnnConfig, MlpConfig
 
 # ── helpers ──────────────────────────────────────────────────────────────
 
+
 def check_gradient_flow_module(model, name="Model"):
     """Check .grad on nn.Module parameters (standard PyTorch)."""
-    print(f"\n{'='*70}")
+    print(f"\n{'=' * 70}")
     print(f"Gradient Analysis (module .grad) for: {name}")
-    print(f"{'='*70}")
+    print(f"{'=' * 70}")
     total = with_grad = zero = no_grad = frozen = 0
     for pname, param in model.named_parameters():
         total += 1
@@ -52,18 +54,22 @@ def check_gradient_flow_module(model, name="Model"):
             zero += 1
             print(f"  ⚠️  ZERO GRAD: {pname} | {tuple(param.shape)}")
         else:
-            print(f"  ✓  OK:        {pname} | grad_norm={param.grad.norm().item():.6f} | {tuple(param.shape)}")
+            print(
+                f"  ✓  OK:        {pname} | grad_norm={param.grad.norm().item():.6f} | {tuple(param.shape)}"
+            )
     ok = with_grad - no_grad - zero
-    print(f"\n  Summary: {total} total | {with_grad} trainable | "
-          f"{ok} ok | {no_grad} no-grad-attr | {zero} zero-grad | {frozen} frozen")
+    print(
+        f"\n  Summary: {total} total | {with_grad} trainable | "
+        f"{ok} ok | {no_grad} no-grad-attr | {zero} zero-grad | {frozen} frozen"
+    )
     return no_grad + zero
 
 
 def check_gradient_flow_tensordict(td_params, name="Params"):
     """Check .grad on TensorDict parameter leaves (how TorchRL stores them)."""
-    print(f"\n{'='*70}")
+    print(f"\n{'=' * 70}")
     print(f"Gradient Analysis (TensorDict leaves) for: {name}")
-    print(f"{'='*70}")
+    print(f"{'=' * 70}")
     total = zero = no_grad = ok = 0
     for key, param in td_params.items(True, True):
         if not isinstance(param, torch.Tensor):
@@ -77,7 +83,9 @@ def check_gradient_flow_tensordict(td_params, name="Params"):
             print(f"  ⚠️  ZERO GRAD: {key} | {tuple(param.shape)}")
         else:
             ok += 1
-            print(f"  ✓  OK:        {key} | grad_norm={param.grad.norm().item():.6f} | {tuple(param.shape)}")
+            print(
+                f"  ✓  OK:        {key} | grad_norm={param.grad.norm().item():.6f} | {tuple(param.shape)}"
+            )
     print(f"\n  Summary: {total} total | {ok} ok | {no_grad} no-grad-attr | {zero} zero-grad")
     return no_grad + zero
 
@@ -90,9 +98,9 @@ def check_identity(module, td_params, label="actor"):
         if isinstance(val, torch.Tensor):
             td_flat[str(key)] = val
 
-    print(f"\n{'='*70}")
+    print(f"\n{'=' * 70}")
     print(f"Identity check: {label}")
-    print(f"{'='*70}")
+    print(f"{'=' * 70}")
     print(f"  Module params: {len(mod_params)}")
     print(f"  TensorDict leaves: {len(td_flat)}")
 
@@ -106,7 +114,9 @@ def check_identity(module, td_params, label="actor"):
             shared += 1
         else:
             td_only += 1
-            print(f"  ⚠️  TD-only (not same object as module param): {td_key} | {tuple(td_val.shape)}")
+            print(
+                f"  ⚠️  TD-only (not same object as module param): {td_key} | {tuple(td_val.shape)}"
+            )
     print(f"  Shared (same tensor object): {shared}")
     print(f"  TD-only (different tensor):  {td_only}")
     if td_only > 0:
@@ -118,9 +128,9 @@ def check_gnn_per_layer(actor):
     """Print per-layer, per-edge-type gradient breakdown for every HeteroGNN."""
     from benchmarl.models.heterognn import HeteroGNN
 
-    print(f"\n{'='*70}")
+    print(f"\n{'=' * 70}")
     print("PER-LAYER / PER-EDGE-TYPE GNN PARAMETER BREAKDOWN")
-    print(f"{'='*70}")
+    print(f"{'=' * 70}")
 
     for mod_name, mod in actor.named_modules():
         if not isinstance(mod, HeteroGNN):
@@ -136,13 +146,15 @@ def check_gnn_per_layer(actor):
             for edge_key, sub_conv in conv.convs.items():
                 src, rel, dst = edge_key
                 params = list(sub_conv.named_parameters())
-                n_ok = sum(1 for _, p in params
-                           if p.grad is not None and p.grad.norm().item() > 0)
-                n_zero = sum(1 for _, p in params
-                             if p.grad is not None and p.grad.norm().item() == 0)
+                n_ok = sum(1 for _, p in params if p.grad is not None and p.grad.norm().item() > 0)
+                n_zero = sum(
+                    1 for _, p in params if p.grad is not None and p.grad.norm().item() == 0
+                )
                 n_none = sum(1 for _, p in params if p.grad is None)
-                print(f"    ({src}, {rel}, {dst}): "
-                      f"{len(params)} params | {n_ok} ok | {n_zero} zero | {n_none} none")
+                print(
+                    f"    ({src}, {rel}, {dst}): "
+                    f"{len(params)} params | {n_ok} ok | {n_zero} zero | {n_none} none"
+                )
                 for pn, p in params:
                     if p.grad is not None and p.grad.norm().item() > 0:
                         tag = f"✓ ({p.grad.norm().item():.6f})"
@@ -153,7 +165,7 @@ def check_gnn_per_layer(actor):
                     print(f"      {pn}: {tuple(p.shape)} → {tag}")
 
         if mod.output_proj is not None:
-            print(f"\n  --- output_proj ---")
+            print("\n  --- output_proj ---")
             for nt, proj in mod.output_proj.items():
                 for pn, p in proj.named_parameters():
                     if p.grad is not None and p.grad.norm().item() > 0:
@@ -166,6 +178,7 @@ def check_gnn_per_layer(actor):
 
 
 # ── main ─────────────────────────────────────────────────────────────────
+
 
 def main():
     print("=" * 70)
@@ -190,9 +203,12 @@ def main():
             "switch_adjacency": "switch_adjacency",
         },
         edge_features_dims={
-            "line_adjacency": 3, "transformer_adjacency": 3,
-            "switch_adjacency": 1, "interaction": 0,
-            "mapping": 0, "mapping_rev": 0,
+            "line_adjacency": 3,
+            "transformer_adjacency": 3,
+            "switch_adjacency": 1,
+            "interaction": 0,
+            "mapping": 0,
+            "mapping_rev": 0,
         },
         node_features_keys={"grid_node": "grid_node_features"},
         node_features_dims={"grid_node": 2},
@@ -201,7 +217,9 @@ def main():
         cat_observations_to_output=False,
         num_layers=3,
         gnn_hidden_dim=32,
-        pos_features=0, vel_features=0, edge_radius=0,
+        pos_features=0,
+        vel_features=0,
+        edge_radius=0,
     )
 
     algorithm_config = HGTeamConfig(
@@ -273,10 +291,18 @@ def main():
     print("\n=== Key tensors in batch ===")
     for key in sorted(str(k) for k in batch.keys(True, True)):
         key_lower = key.lower()
-        if any(tok in key_lower for tok in [
-            "adjacency", "grid_node", "participation", "observation",
-            "agent_grid", "action", "log_prob",
-        ]):
+        if any(
+            tok in key_lower
+            for tok in [
+                "adjacency",
+                "grid_node",
+                "participation",
+                "observation",
+                "agent_grid",
+                "action",
+                "log_prob",
+            ]
+        ):
             val = batch.get(key)
             if isinstance(val, torch.Tensor):
                 nz = (val.abs() > 0).sum().item() if val.is_floating_point() else "N/A"
@@ -365,8 +391,10 @@ def main():
             break
 
     if logits is not None:
-        print(f"  Output tensor: shape={tuple(logits.shape)}, "
-              f"mean={logits.mean().item():.6f}, std={logits.std().item():.6f}")
+        print(
+            f"  Output tensor: shape={tuple(logits.shape)}, "
+            f"mean={logits.mean().item():.6f}, std={logits.std().item():.6f}"
+        )
         dummy_loss = logits.mean()
         dummy_loss.backward()
         print(f"  Dummy loss: {dummy_loss.item():.6f}")
@@ -401,8 +429,7 @@ def main():
             break
 
     if value is not None:
-        print(f"  Output tensor: shape={tuple(value.shape)}, "
-              f"mean={value.mean().item():.6f}")
+        print(f"  Output tensor: shape={tuple(value.shape)}, mean={value.mean().item():.6f}")
         dummy_loss_c = value.mean()
         dummy_loss_c.backward()
     else:

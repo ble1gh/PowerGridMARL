@@ -9,23 +9,24 @@ Usage:
 """
 
 import argparse
-import sys
 import os
+import sys
+
 import torch
 import torch_geometric.nn as tgnn
 
 # Ensure BenchMARL is in path
 sys.path.append(os.path.join(os.getcwd(), "BenchMARL"))
 
-from benchmarl.algorithms import HGTeamConfig, HGTeamSACConfig, HGTeamHAPPOConfig
-from benchmarl.models import HeteroGnnConfig, MlpConfig, SequenceModelConfig, TransformerConfig
-from benchmarl.experiment import Experiment, ExperimentConfig
+from benchmarl.algorithms import HGTeamConfig, HGTeamHAPPOConfig, HGTeamSACConfig
 from benchmarl.environments.PowerGridworldVariable.common import PowerGridworldVariableTask
-
+from benchmarl.experiment import Experiment, ExperimentConfig
+from benchmarl.models import HeteroGnnConfig, TransformerConfig
 
 # ------------------------------------------------------------------
 # Shared helpers
 # ------------------------------------------------------------------
+
 
 def _device():
     return "cuda" if torch.cuda.is_available() else "cpu"
@@ -45,7 +46,7 @@ def _critic_gnn_config():
         grid_edge_keys={
             "line_adjacency": "line_adjacency",
             "transformer_adjacency": "transformer_adjacency",
-            "switch_adjacency": "switch_adjacency"
+            "switch_adjacency": "switch_adjacency",
         },
         edge_features_dims={
             "line_adjacency": 3,
@@ -53,7 +54,7 @@ def _critic_gnn_config():
             "switch_adjacency": 1,
             "interaction": 0,
             "mapping": 0,
-            "mapping_rev": 0
+            "mapping_rev": 0,
         },
         node_features_keys={
             "grid_node": "grid_node_features",
@@ -68,7 +69,9 @@ def _critic_gnn_config():
         cat_observations_to_output=False,
         num_layers=2,
         gnn_hidden_dim=32,
-        pos_features=0, vel_features=0, edge_radius=0
+        pos_features=0,
+        vel_features=0,
+        edge_radius=0,
     )
 
 
@@ -90,6 +93,7 @@ def _actor_model_config():
 # ------------------------------------------------------------------
 # HGTeam PPO test
 # ------------------------------------------------------------------
+
 
 def run_ppo_test():
     print("=" * 60)
@@ -146,6 +150,7 @@ def run_ppo_test():
 # ------------------------------------------------------------------
 # HGTeamSAC test
 # ------------------------------------------------------------------
+
 
 def run_sac_test():
     print("=" * 60)
@@ -213,6 +218,7 @@ def run_sac_test():
 # HGTeamHAPPO test
 # ------------------------------------------------------------------
 
+
 def run_happo_test():
     print("=" * 60)
     print("  HGTeamHAPPO — DEBUG smoke test")
@@ -271,10 +277,13 @@ def run_happo_test():
 # Main
 # ------------------------------------------------------------------
 
+
 def main():
     parser = argparse.ArgumentParser(description="HGTeam debug smoke tests")
     parser.add_argument(
-        "mode", nargs="?", default="both",
+        "mode",
+        nargs="?",
+        default="both",
         choices=["ppo", "sac", "happo", "both", "all"],
         help="Which algorithm to test (default: both = ppo+sac; all = ppo+sac+happo)",
     )

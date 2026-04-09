@@ -56,7 +56,7 @@ max_charge_duration_min: 720     # Maximum charging stay (minutes)
 
 # Global reward penalty scaling parameters
 power_loss_penalty: 0   # Scaling factor for power loss reward (higher = more penalty)
-voltage_penalty: 50      # Scaling factor for voltage violation reward (reduced from 1e3 to let VPP signal through)
+voltage_penalty: 10      # Scaling factor for voltage violation reward (reduced from 50 to let VPP dominate)
 cooperative_voltage: False # If True, voltage penalty is applied to all agents. If False, only to agents at violating node.
 load_2norm_penalty: 0         # Scaling factor for load penalty (higher = more penalty)
 tracking_reward_penalty: 0    # Scaling factor for tracking reward (disabled for VPP task)
@@ -89,5 +89,5 @@ setpoint: 0.
 # PV/Storage contribution = net injection (-real_power). EV contribution = demand response (max_draw - actual_draw).
 vpp_reward: True
 vpp_setpoint: 25.0    # Target VPP production (kW)
-vpp_reward_penalty: 1e-1  # Scaling factor for quadratic VPP tracking penalty
-vpp_reward_linear_penalty: 0.5  # Scaling factor for linear VPP tracking term (persistent gradient near setpoint)
+vpp_reward_penalty: 1.0  # Scaling factor for quadratic VPP tracking penalty (10x increase to dominate reward)
+vpp_reward_linear_penalty: 5.0  # Scaling factor for linear VPP tracking term (10x increase for strong gradient near setpoint)

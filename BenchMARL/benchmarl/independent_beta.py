@@ -2,27 +2,26 @@
 
 import torch
 from torch.distributions import Beta, Independent
-from typing import Optional
 
 
 class IndependentBeta(Independent):
     """Independent Beta distribution with optional affine rescaling.
-    
+
     Samples natively in [0, 1] via Beta(alpha, beta), then rescales to
     [low, high] if bounds are provided.  When low=0 and high=1 (or bounds
     are omitted) the behaviour is identical to a plain Beta distribution.
-    
+
     The log_prob accounts for the change-of-variable Jacobian so that
     gradient estimates remain correct.
     """
-    
+
     def __init__(
         self,
         alpha: torch.Tensor,
         beta: torch.Tensor,
-        low: Optional[torch.Tensor] = None,
-        high: Optional[torch.Tensor] = None,
-        validate_args: Optional[bool] = None,
+        low: torch.Tensor | None = None,
+        high: torch.Tensor | None = None,
+        validate_args: bool | None = None,
     ):
         base_dist = Beta(alpha, beta, validate_args=validate_args)
         super().__init__(base_dist, 1)  # Independent over last dimension
@@ -86,7 +85,7 @@ class IndependentBeta(Independent):
 
     @property
     def variance(self):
-        return self.base_dist.variance * (self._range ** 2)
+        return self.base_dist.variance * (self._range**2)
 
     @property
     def support(self):

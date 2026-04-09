@@ -1,4 +1,5 @@
-from dataclasses import dataclass, MISSING
+from dataclasses import MISSING, dataclass
+
 
 @dataclass
 class TaskConfig:
@@ -16,7 +17,7 @@ class TaskConfig:
     feeder_file: str = MISSING
     loadshape_file: str = MISSING
     system_load_rescale_factor: float = MISSING
-    
+
     # EV agent parameters
     num_vehicles: int = MISSING
     minutes_per_step: int = MISSING
@@ -32,12 +33,12 @@ class TaskConfig:
     voltage_penalty: float = MISSING
     load_2norm_penalty: float = MISSING
     tracking_reward_penalty: float = MISSING
-    
+
     # PV agent parameters
     pv_profile_csv: str = MISSING
     pv_scaling_factor: float = MISSING
     pv_grid_aware: bool = MISSING
-    
+
     # Energy Storage agent parameters
     storage_range_min: float = MISSING
     storage_range_max: float = MISSING

@@ -16,6 +16,7 @@
 #   gpu:h200          — 141 GB full card (grn027-032, 8 each) — long queue
 #   gpu:1             — any available GPU (risky: may get 18 GB slice)
 #SBATCH --gres=gpu:h200_2g.35gb:1
+# #SBATCH --gres=gpu:h200
 
 #SBATCH -o /uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/results/slurm/HGTeamHAslurmjob-%j.out-%N
 #SBATCH -e /uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/results/slurm/HGTeamHAslurmjob-%j.err-%N
@@ -98,7 +99,7 @@ nvidia-smi
 echo "CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES"
 
 # Check if PyTorch can see GPU
-python -c "import torch; print(f'PyTorch version: {torch.__version__}'); print(f'CUDA available: {torch.cuda.is_available()}'); print(f'CUDA devices: {torch.cuda.device_count()}'); print(f'GPU Memory: {torch.cuda.get_device_properties(0).total_mem / 1024**3:.1f} GB')"
+python -c "import torch; print(f'PyTorch version: {torch.__version__}'); print(f'CUDA available: {torch.cuda.is_available()}'); print(f'CUDA devices: {torch.cuda.device_count()}'); print(f'GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB')"
 
 # Start background GPU monitoring
 nvidia-smi dmon -d 10 -s pucvmet -f $SCRDIR/gpu_usage.log &
@@ -108,19 +109,18 @@ GPU_MONITOR_PID=$!
 python run_hgteam_mlp.py \
     --seed 20 \
     --project-name "PowerGridworldVariable_VPP" \
-    --wandb-name "HGTeamHA_$(date +%Y%m%d)_${SLURM_JOB_ID}_lr1e-4_cc2_8ep_fixscalelb" \
+    --wandb-name "HGTeamHA_$(date +%Y%m%d)_${SLURM_JOB_ID}_vppboost_lmbda0.95_separate_forward" \
     --results-dir "$RESULTS_DIR" \
     --max-n-frames 10000000 \
     --lr 1e-4 \
     --evaluation-interval 24576 \
-    --evaluation-episodes 10 \
+    --evaluation-episodes 20 \
     --n-envs-per-worker 32 \
     --frames-per-batch 12288 \
-    --minibatch-size 512 \
-    --n-minibatch-iters 8 \
+    --minibatch-size 1024 \
+    --n-minibatch-iters 4 \
     --entropy-coef 0.01 \
     --algorithm happo \
-    --encoder-update-mode accumulated \
     --fixed-order false \
     --gnn-mode concat \
     --embedding-entropy-coef 0 \
@@ -138,6 +138,9 @@ python run_hgteam_mlp.py \
     --use-vib true \
     --vib-warmup-frames 500000 \
     --embedding-viz-interval 5 \
+    --lmbda 0.95 \
+    --critic-use-other-actions true \
+    --encoder-update-mode separate_forward \
 
 # Stop GPU monitoring
 kill $GPU_MONITOR_PID 2>/dev/null || true

@@ -9,9 +9,9 @@ sys.path.append(os.path.join(ROOT, "BenchMARL"))
 sys.path.append(os.path.join(ROOT, "PowerGridworld"))
 
 from benchmarl.algorithms import HGTeamSACConfig
+from benchmarl.environments.PowerGridworldVariable.common import PowerGridworldVariableTask
 from benchmarl.experiment import Experiment, ExperimentConfig
 from benchmarl.models import HeteroGnnConfig, TransformerConfig
-from benchmarl.environments.PowerGridworldVariable.common import PowerGridworldVariableTask
 
 
 def build_experiment() -> Experiment:

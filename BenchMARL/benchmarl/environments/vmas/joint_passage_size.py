@@ -4,7 +4,7 @@
 #  LICENSE file in the root directory of this source tree.
 #
 
-from dataclasses import dataclass, MISSING
+from dataclasses import MISSING, dataclass
 
 
 @dataclass

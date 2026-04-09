@@ -1,24 +1,21 @@
 import os
 
+import gymnasium as gym
 import numpy as np
 import pandas as pd
 
-import gymnasium as gym
-
-from gridworld.log import logger
 from gridworld import ComponentEnv
 from gridworld.utils import maybe_rescale_box_space, to_raw, to_scaled
-
 
 THIS_DIR = os.path.abspath(os.path.dirname(__file__))
 PROFILE_DIR = os.path.join(THIS_DIR, "profiles")
 
 
 class PVEnv(ComponentEnv):
-    """Simple control model for pv that is driven by a static profile for the 
+    """Simple control model for pv that is driven by a static profile for the
     maximum real power injection.  See the ComponentEnv class for the required
     API.
-    
+
     The profile CSV is treated as a 24-hour curve.  On each step the current
     time of day (passed as ``current_time`` from :class:`MultiAgentEnv`) is
     used to interpolate the profile, so the PV output correctly tracks the
@@ -30,25 +27,24 @@ class PVEnv(ComponentEnv):
         name: str,
         profile_csv: str,
         profile_path: str = None,
-        scaling_factor: float = 1.,
+        scaling_factor: float = 1.0,
         profile_noise_std: float = 0.0,
         rescale_spaces: bool = True,
         grid_aware: bool = False,
         max_episode_steps: int = None,
-        **kwargs
+        **kwargs,
     ):
-
         """
         Args:
             name:  Component name.
 
-            profile_csv:  Relative path from ./profiles for CSV file containing 
+            profile_csv:  Relative path from ./profiles for CSV file containing
                 the maximum real power profile that the device can generate.
-                We assume the first column of this file contains these values 
+                We assume the first column of this file contains these values
                 and discard the rest.  The file is interpreted as a **full
                 24-hour** curve starting at midnight, sampled at uniform
                 intervals (e.g. 288 rows → 5-minute resolution).
-                
+
             profile_path:  Full path to profile csv.  If provided, this overrides
                 the profile_csv argument.
 
@@ -72,17 +68,15 @@ class PVEnv(ComponentEnv):
         self.profile_noise_std = profile_noise_std
         self.rescale_spaces = rescale_spaces
         self.grid_aware = grid_aware
-        self.pv_curtailment_reward_penalty = float(
-            kwargs.get("pv_curtailment_reward_penalty", 0.1)
-        )
+        self.pv_curtailment_reward_penalty = float(kwargs.get("pv_curtailment_reward_penalty", 0.1))
 
-        # Read csv file.  If a full path is provide, that overrides reference to 
+        # Read csv file.  If a full path is provide, that overrides reference to
         # names of csv files stored locally in the `profiles` directory.
         profile_csv = os.path.join(PROFILE_DIR, profile_csv)
         if profile_path is not None:
             profile_csv = profile_path
         self.profile_csv = profile_csv
-        
+
         # Read the base profile data (normalized 0-1 values).
         # Interpret it as a 24-hour curve starting at midnight.
         self.base_data = pd.read_csv(self.profile_csv).values[:, 0].squeeze()
@@ -91,7 +85,7 @@ class PVEnv(ComponentEnv):
         # Build a corresponding array of fractional-hours-since-midnight for
         # each row, e.g. 288 rows → [0, 5/60, 10/60, …, 23.9167].
         self._profile_hours = np.linspace(0.0, 24.0, n_points, endpoint=False)
-        
+
         # Apply noise and scaling to create working data
         # Noise is applied to normalized data, then scaled
         self._apply_noise_and_scale()
@@ -102,7 +96,7 @@ class PVEnv(ComponentEnv):
         self._current_pv_base = 0.0
         # One-step-ahead PV base forecast (for participation_score)
         self._next_pv_base = 0.0
-        
+
         # Fallback index for standalone usage (no current_time provided).
         # When current_time is supplied, this is ignored.
         self._index = 0
@@ -115,27 +109,23 @@ class PVEnv(ComponentEnv):
         self._obs_labels = ["real_power"]
         self._obs_labels += ["min_voltage"] if grid_aware else []
 
-        obs_bounds = {
-            "real_power": (-np.max(self.data), 0.),
-            "min_voltage": (0.9, 1.1)
-        }
+        obs_bounds = {"real_power": (-np.max(self.data), 0.0), "min_voltage": (0.9, 1.1)}
 
         # Create the optionally rescaled gym spaces.
         self._observation_space = gym.spaces.Box(
             shape=(len(self.obs_labels),),
             low=np.array([v[0] for k, v in obs_bounds.items() if k in self.obs_labels]),
             high=np.array([v[1] for k, v in obs_bounds.items() if k in self.obs_labels]),
-            dtype=np.float64)
+            dtype=np.float64,
+        )
 
         self.observation_space = maybe_rescale_box_space(
-            self._observation_space, rescale=self.rescale_spaces)
+            self._observation_space, rescale=self.rescale_spaces
+        )
 
-        self._action_space = gym.spaces.Box(
-            shape=(1,), low=0., high=1., dtype=np.float64)
+        self._action_space = gym.spaces.Box(shape=(1,), low=0.0, high=1.0, dtype=np.float64)
 
-        self.action_space = maybe_rescale_box_space(
-            self._action_space, rescale=self.rescale_spaces)
-
+        self.action_space = maybe_rescale_box_space(self._action_space, rescale=self.rescale_spaces)
 
     @property
     def participation_score(self) -> float:
@@ -159,17 +149,12 @@ class PVEnv(ComponentEnv):
             self._current_pv = 0.0
             self._current_pv_base = 0.0
             return
-        hour_of_day = (
-            current_time.hour
-            + current_time.minute / 60.0
-            + current_time.second / 3600.0
-        )
+        hour_of_day = current_time.hour + current_time.minute / 60.0 + current_time.second / 3600.0
         # Linear interpolation with wrap-around (np.interp handles ascending x)
         self._current_pv = float(np.interp(hour_of_day, self._profile_hours, self.data))
         # Pre-noise scaled value for participation score
         self._current_pv_base = float(
-            np.interp(hour_of_day, self._profile_hours,
-                      self.base_data * self.scaling_factor)
+            np.interp(hour_of_day, self._profile_hours, self.base_data * self.scaling_factor)
         )
 
     def _lookup_next_pv_base(self, next_time):
@@ -177,14 +162,9 @@ class PVEnv(ComponentEnv):
         if next_time is None:
             self._next_pv_base = self._current_pv_base
             return
-        hour_of_day = (
-            next_time.hour
-            + next_time.minute / 60.0
-            + next_time.second / 3600.0
-        )
+        hour_of_day = next_time.hour + next_time.minute / 60.0 + next_time.second / 3600.0
         self._next_pv_base = float(
-            np.interp(hour_of_day, self._profile_hours,
-                      self.base_data * self.scaling_factor)
+            np.interp(hour_of_day, self._profile_hours, self.base_data * self.scaling_factor)
         )
 
     def get_obs(self, **kwargs):
@@ -212,7 +192,6 @@ class PVEnv(ComponentEnv):
             obs = raw_obs
         return obs, {"real_power": raw_obs[0]}
 
-
     def _apply_noise_and_scale(self):
         """Apply Gaussian noise to base profile and scale to get working data."""
         if self.profile_noise_std > 0:
@@ -222,7 +201,7 @@ class PVEnv(ComponentEnv):
             noisy_data = np.clip(noisy_data, 0, 1)
         else:
             noisy_data = self.base_data.copy()
-        
+
         self.data = noisy_data * self.scaling_factor
 
     def is_terminal(self):
@@ -231,7 +210,6 @@ class PVEnv(ComponentEnv):
         if self._use_time_lookup:
             return False
         return self._index >= (self._episode_length - 1)
-
 
     def step_reward(self, **kwargs):
         """Reward PV utilization to discourage curtailment.
@@ -253,7 +231,6 @@ class PVEnv(ComponentEnv):
             "pv_utilization": utilization,
         }
 
-
     def reset(self, **kwargs):
         """Re-apply noise and look up the initial PV value for the current time."""
         self._index = 0
@@ -268,9 +245,8 @@ class PVEnv(ComponentEnv):
             self._current_pv = self.data[0]
             self._current_pv_base = self.base_data[0] * self.scaling_factor
         # Initialize next-step forecast for participation_score
-        self._lookup_next_pv_base(kwargs.get("next_time", None))
+        self._lookup_next_pv_base(kwargs.get("next_time"))
         self.get_obs(**kwargs)
-
 
     def step(self, action, **kwargs):
         """Look up the PV profile for the current time of day and apply the
@@ -282,14 +258,14 @@ class PVEnv(ComponentEnv):
         # Update PV value from time of day, then get observation
         obs, obs_meta = self.get_obs(**kwargs)
         # Compute one-step-ahead PV base for participation_score forecast
-        self._lookup_next_pv_base(kwargs.get("next_time", None))
+        self._lookup_next_pv_base(kwargs.get("next_time"))
         self._real_power = np.float64((action * obs_meta["real_power"]).squeeze())
         obs_meta["real_power"] = float(self._real_power)
-        
+
         # Advance fallback index for standalone (non-time-based) usage
         if not self._use_time_lookup:
             self._index += 1
-        
+
         rew, rew_meta = self.step_reward(**kwargs)
         if isinstance(rew_meta, dict):
             obs_meta.update(rew_meta)

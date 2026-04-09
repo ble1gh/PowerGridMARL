@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """Diagnostic: verify _sample_active_agents + _reset produce correct PV counts
 using the REAL environment (not a simulation)."""
-import sys, os
+
+import os
+import sys
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "BenchMARL"))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "PowerGridworld"))
 
-import torch, yaml
+import torch
+import yaml
 from benchmarl.environments.PowerGridworldVariable.common import (
     PowerGridworldVariableClass,
 )
@@ -22,7 +26,7 @@ raw.pop("defaults", None)
 task = PowerGridworldVariableClass.__new__(PowerGridworldVariableClass)
 task.config = raw
 
-print(f"=== Raw config values ===")
+print("=== Raw config values ===")
 print(f"min_PVs={raw.get('min_PVs')}, max_PVs={raw.get('max_PVs')}")
 print(f"min_EVs={raw.get('min_EVs')}, max_EVs={raw.get('max_EVs')}")
 print(f"min_Storage={raw.get('min_Storage')}, max_Storage={raw.get('max_Storage')}")
@@ -51,11 +55,13 @@ for _ in range(50):
     n_ev = sum(1 for n, i in env._agent_name_to_idx.items() if n.startswith("EV-") and m[i])
     n_pv = sum(1 for n, i in env._agent_name_to_idx.items() if n.startswith("PV-") and m[i])
     n_st = sum(1 for n, i in env._agent_name_to_idx.items() if n.startswith("Storage-") and m[i])
-    ev_c.append(n_ev); pv_c.append(n_pv); st_c.append(n_st)
+    ev_c.append(n_ev)
+    pv_c.append(n_pv)
+    st_c.append(n_st)
 
-print(f"EV   min={min(ev_c)} max={max(ev_c)} mean={sum(ev_c)/len(ev_c):.1f}  (config 10-20)")
-print(f"PV   min={min(pv_c)} max={max(pv_c)} mean={sum(pv_c)/len(pv_c):.1f}  (config 12-12)")
-print(f"Stor min={min(st_c)} max={max(st_c)} mean={sum(st_c)/len(st_c):.1f}  (config 5-8)")
+print(f"EV   min={min(ev_c)} max={max(ev_c)} mean={sum(ev_c) / len(ev_c):.1f}  (config 10-20)")
+print(f"PV   min={min(pv_c)} max={max(pv_c)} mean={sum(pv_c) / len(pv_c):.1f}  (config 12-12)")
+print(f"Stor min={min(st_c)} max={max(st_c)} mean={sum(st_c) / len(st_c):.1f}  (config 5-8)")
 if any(c != 12 for c in pv_c):
     print("*** BUG: PV count != 12 in _sample_active_agents! ***")
 
@@ -84,6 +90,6 @@ for step in range(5):
     n_ev = sum(1 for n, i in env._agent_name_to_idx.items() if n.startswith("EV-") and m[i])
     n_pv = sum(1 for n, i in env._agent_name_to_idx.items() if n.startswith("PV-") and m[i])
     n_st = sum(1 for n, i in env._agent_name_to_idx.items() if n.startswith("Storage-") and m[i])
-    print(f"  Step {step}: EV={n_ev:2d}  PV={n_pv:2d}  Stor={n_st}  total={n_ev+n_pv+n_st}")
+    print(f"  Step {step}: EV={n_ev:2d}  PV={n_pv:2d}  Stor={n_st}  total={n_ev + n_pv + n_st}")
 
 print("\nDone.")

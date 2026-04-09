@@ -32,11 +32,7 @@ def get_version():
 CWD = pathlib.Path(__file__).absolute().parent
 
 extra_files = package_files(
-    str(
-        Path(os.path.dirname(os.path.realpath(__file__)))
-        / Path("benchmarl")
-        / Path("conf")
-    )
+    str(Path(os.path.dirname(os.path.realpath(__file__))) / Path("benchmarl") / Path("conf"))
 )
 
 setup(

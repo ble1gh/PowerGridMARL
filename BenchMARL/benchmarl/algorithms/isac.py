@@ -4,8 +4,8 @@
 #  LICENSE file in the root directory of this source tree.
 #
 
-from dataclasses import dataclass, MISSING
-from typing import Dict, Iterable, Optional, Tuple, Type, Union
+from collections.abc import Iterable
+from dataclasses import MISSING, dataclass
 
 from tensordict import TensorDictBase
 from tensordict.nn import NormalParamExtractor, TensorDictModule, TensorDictSequential
@@ -56,15 +56,15 @@ class Isac(Algorithm):
         num_qvalue_nets: int,
         loss_function: str,
         delay_qvalue: bool,
-        target_entropy: Union[float, str],
+        target_entropy: float | str,
         discrete_target_entropy_weight: float,
         alpha_init: float,
-        min_alpha: Optional[float],
-        max_alpha: Optional[float],
+        min_alpha: float | None,
+        max_alpha: float | None,
         fixed_alpha: bool,
         scale_mapping: str,
         use_tanh_normal: bool,
-        **kwargs
+        **kwargs,
     ):
         super().__init__(**kwargs)
 
@@ -87,7 +87,7 @@ class Isac(Algorithm):
 
     def _get_loss(
         self, group: str, policy_for_loss: TensorDictModule, continuous: bool
-    ) -> Tuple[LossModule, bool]:
+    ) -> tuple[LossModule, bool]:
         if continuous:
             # Loss
             loss_module = SACLoss(
@@ -137,12 +137,10 @@ class Isac(Algorithm):
                 terminated=(group, "terminated"),
             )
 
-        loss_module.make_value_estimator(
-            ValueEstimators.TD0, gamma=self.experiment_config.gamma
-        )
+        loss_module.make_value_estimator(ValueEstimators.TD0, gamma=self.experiment_config.gamma)
         return loss_module, True
 
-    def _get_parameters(self, group: str, loss: LossModule) -> Dict[str, Iterable]:
+    def _get_parameters(self, group: str, loss: LossModule) -> dict[str, Iterable]:
         items = {
             "loss_actor": list(loss.actor_network_params.flatten_keys().values()),
             "loss_qvalue": list(loss.qvalue_network_params.flatten_keys().values()),
@@ -164,9 +162,7 @@ class Isac(Algorithm):
                 self.action_spec[group, "action"].space.n,
             ]
 
-        actor_input_spec = Composite(
-            {group: self.observation_spec[group].clone().to(self.device)}
-        )
+        actor_input_spec = Composite({group: self.observation_spec[group].clone().to(self.device)})
 
         actor_output_spec = Composite(
             {
@@ -199,9 +195,7 @@ class Isac(Algorithm):
                 spec=self.action_spec[group, "action"],
                 in_keys=[(group, "loc"), (group, "scale")],
                 out_keys=[(group, "action")],
-                distribution_class=(
-                    IndependentNormal if not self.use_tanh_normal else TanhNormal
-                ),
+                distribution_class=(IndependentNormal if not self.use_tanh_normal else TanhNormal),
                 distribution_kwargs=(
                     {
                         "low": self.action_spec[(group, "action")].space.low,
@@ -262,9 +256,7 @@ class Isac(Algorithm):
         if nested_terminated_key not in keys:
             batch.set(
                 nested_terminated_key,
-                batch.get(("next", "terminated"))
-                .unsqueeze(-1)
-                .expand((*group_shape, 1)),
+                batch.get(("next", "terminated")).unsqueeze(-1).expand((*group_shape, 1)),
             )
 
         if nested_reward_key not in keys:
@@ -283,9 +275,7 @@ class Isac(Algorithm):
         n_agents = len(self.group_map[group])
         n_actions = self.action_spec[group, "action"].space.n
 
-        critic_input_spec = Composite(
-            {group: self.observation_spec[group].clone().to(self.device)}
-        )
+        critic_input_spec = Composite({group: self.observation_spec[group].clone().to(self.device)})
 
         critic_output_spec = Composite(
             {
@@ -314,11 +304,7 @@ class Isac(Algorithm):
         modules = []
 
         critic_input_spec = Composite(
-            {
-                group: self.observation_spec[group]
-                .clone()
-                .update(self.action_spec[group])
-            }
+            {group: self.observation_spec[group].clone().update(self.action_spec[group])}
         )
 
         critic_output_spec = Composite(
@@ -356,18 +342,18 @@ class IsacConfig(AlgorithmConfig):
     num_qvalue_nets: int = MISSING
     loss_function: str = MISSING
     delay_qvalue: bool = MISSING
-    target_entropy: Union[float, str] = MISSING
+    target_entropy: float | str = MISSING
     discrete_target_entropy_weight: float = MISSING
 
     alpha_init: float = MISSING
-    min_alpha: Optional[float] = MISSING
-    max_alpha: Optional[float] = MISSING
+    min_alpha: float | None = MISSING
+    max_alpha: float | None = MISSING
     fixed_alpha: bool = MISSING
     scale_mapping: str = MISSING
     use_tanh_normal: bool = MISSING
 
     @staticmethod
-    def associated_class() -> Type[Algorithm]:
+    def associated_class() -> type[Algorithm]:
         return Isac
 
     @staticmethod

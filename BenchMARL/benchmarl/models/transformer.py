@@ -6,18 +6,16 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, MISSING
-from typing import Optional
+from dataclasses import MISSING, dataclass
 
 import torch
-from torch import nn
 from tensordict import TensorDictBase
 from tensordict.utils import unravel_key_list
+from torch import nn
 from torchrl.data import Composite, Unbounded
 from torchrl.modules import MLP, MultiAgentMLP
 
 from benchmarl.models.common import Model, ModelConfig
-from benchmarl.utils import DEVICE_TYPING
 
 
 class PositionalEncoding(nn.Module):
@@ -92,9 +90,7 @@ class Transformer(Model):
             self.agent_group,
             f"_hidden_transformer_len_{self.model_index}",
         )
-        self.rnn_keys = unravel_key_list(
-            ["is_init", self.history_name, self.history_len_name]
-        )
+        self.rnn_keys = unravel_key_list(["is_init", self.history_name, self.history_len_name])
         self.in_keys += self.rnn_keys
 
         self.d_model = d_model
@@ -110,7 +106,9 @@ class Transformer(Model):
         self.z_token_proj = None  # lazily initialized on first use once z dim is known
 
         self.input_features = sum(
-            [spec.shape[-1] for spec in self.input_spec.values(True, True)]
+            spec.shape[-1]
+            for key, spec in self.input_spec.items(True, True)
+            if (key if isinstance(key, str) else key[-1]) != "active_mask"
         )
         self.output_features = self.output_leaf_spec.shape[-1]
 
@@ -198,6 +196,8 @@ class Transformer(Model):
                 tensordict.get(in_key)
                 for in_key in self.in_keys
                 if in_key not in self.rnn_keys
+                and (in_key if isinstance(in_key, str) else in_key[-1])
+                != "active_mask"
             ],
             dim=-1,
         )
@@ -205,8 +205,8 @@ class Transformer(Model):
     def _build_token_sequence(
         self,
         obs_emb: torch.Tensor,
-        action: Optional[torch.Tensor],
-        z_emb: Optional[torch.Tensor] = None,
+        action: torch.Tensor | None,
+        z_emb: torch.Tensor | None = None,
     ):
         """Build interleaved token sequence from obs, action, and optional z embeddings.
 
@@ -277,7 +277,9 @@ class Transformer(Model):
             obs_offset = 0
 
         tokens = stacked.reshape(b, t * tokens_per_step, a, self.d_model)
-        obs_positions = torch.arange(obs_offset, t * tokens_per_step, tokens_per_step, device=obs_emb.device)
+        obs_positions = torch.arange(
+            obs_offset, t * tokens_per_step, tokens_per_step, device=obs_emb.device
+        )
         return tokens, obs_positions
 
     def _reshape_for_encoder(self, tokens: torch.Tensor):
@@ -291,8 +293,8 @@ class Transformer(Model):
     def _apply_encoder(
         self,
         tokens: torch.Tensor,
-        key_padding_mask: Optional[torch.Tensor],
-        causal_mask: Optional[torch.Tensor],
+        key_padding_mask: torch.Tensor | None,
+        causal_mask: torch.Tensor | None,
     ):
         tokens = self.pos_encoder(tokens)
         encoded = self.encoder(
@@ -363,11 +365,11 @@ class Transformer(Model):
         # Legacy mode: single z serves both roles
         if z_token_vec is None:
             # No split — fall back to single embedding_z for both
-            z_for_token = z_query_vec   # may be None (no GNN)
+            z_for_token = z_query_vec  # may be None (no GNN)
             z_for_query = z_query_vec
         else:
             z_for_token = z_token_vec
-            z_for_query = z_query_vec   # z_query (alias of embedding_z)
+            z_for_query = z_query_vec  # z_query (alias of embedding_z)
 
         is_init = tensordict.get("is_init", None)
         history = tensordict.get(self.history_name, None)
@@ -474,9 +476,7 @@ class Transformer(Model):
                 if history is not None:
                     history = torch.where(reset_mask, 0, history)
                 if history_len is not None:
-                    history_len = torch.where(
-                        reset_mask.view(tokens.shape[0], 1), 0, history_len
-                    )
+                    history_len = torch.where(reset_mask.view(tokens.shape[0], 1), 0, history_len)
             new_tokens = tokens
             if new_tokens.dim() == 3:
                 new_tokens = new_tokens.unsqueeze(2)
@@ -486,9 +486,7 @@ class Transformer(Model):
                     (b, self.n_agents, self.max_seq_len, self.d_model),
                     device=self.device,
                 )
-                history_len = torch.zeros(
-                    (b, self.n_agents), device=self.device, dtype=torch.long
-                )
+                history_len = torch.zeros((b, self.n_agents), device=self.device, dtype=torch.long)
             history = history.to(new_tokens.device)
             history_len = history_len.to(new_tokens.device).long()
 
@@ -565,7 +563,9 @@ class Transformer(Model):
                 )
         else:
             if not self.share_params:
-                raise ValueError("Transformer without agent dimension currently expects shared parameters")
+                raise ValueError(
+                    "Transformer without agent dimension currently expects shared parameters"
+                )
 
     @property
     def is_rnn(self) -> bool:
@@ -577,9 +577,7 @@ class Transformer(Model):
                 f"_hidden_transformer_history_{model_index}": Unbounded(
                     shape=(self.max_seq_len, self.d_model)
                 ),
-                f"_hidden_transformer_len_{model_index}": Unbounded(
-                    shape=(), dtype=torch.long
-                ),
+                f"_hidden_transformer_len_{model_index}": Unbounded(shape=(), dtype=torch.long),
             }
         )
         return spec
@@ -614,9 +612,7 @@ class TransformerConfig(ModelConfig):
                 f"_hidden_transformer_history_{model_index}": Unbounded(
                     shape=(self.max_seq_len, self.d_model)
                 ),
-                f"_hidden_transformer_len_{model_index}": Unbounded(
-                    shape=(), dtype=torch.long
-                ),
+                f"_hidden_transformer_len_{model_index}": Unbounded(shape=(), dtype=torch.long),
             }
         )
         return spec

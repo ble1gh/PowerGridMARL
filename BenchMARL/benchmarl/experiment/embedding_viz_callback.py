@@ -11,9 +11,9 @@ All plots are logged to wandb under the ``embeddings/`` key prefix.
 from __future__ import annotations
 
 import io
-from typing import Optional
 
 import matplotlib
+
 matplotlib.use("Agg")  # non-interactive backend for headless servers
 import matplotlib.pyplot as plt
 import numpy as np
@@ -127,8 +127,13 @@ class EmbeddingVizCallback(Callback):
         for g_idx, name in enumerate(group_order):
             mask = labels == g_idx
             ax.scatter(
-                proj[mask, 0], proj[mask, 1],
-                c=[cmap(g_idx)], label=name, alpha=0.6, s=12, edgecolors="none",
+                proj[mask, 0],
+                proj[mask, 1],
+                c=[cmap(g_idx)],
+                label=name,
+                alpha=0.6,
+                s=12,
+                edgecolors="none",
             )
         ax.legend(fontsize=8)
         ax.set_title(f"t-SNE  (iter {self.experiment.n_iters_performed})")
@@ -156,8 +161,13 @@ class EmbeddingVizCallback(Callback):
         for g_idx, name in enumerate(group_order):
             mask = labels == g_idx
             ax.scatter(
-                proj[mask, 0], proj[mask, 1],
-                c=[cmap(g_idx)], label=name, alpha=0.6, s=12, edgecolors="none",
+                proj[mask, 0],
+                proj[mask, 1],
+                c=[cmap(g_idx)],
+                label=name,
+                alpha=0.6,
+                s=12,
+                edgecolors="none",
             )
         ax.legend(fontsize=8)
         ax.set_xlabel(f"PC1 ({var[0]:.1%} var)")
@@ -194,7 +204,12 @@ class EmbeddingVizCallback(Callback):
             boundaries.append(end)
             mid = (start + end) / 2
             ax.text(
-                -0.5, mid, name, ha="right", va="center", fontsize=7,
+                -0.5,
+                mid,
+                name,
+                ha="right",
+                va="center",
+                fontsize=7,
                 transform=ax.get_yaxis_transform(),
             )
             if g_idx > 0:
@@ -226,9 +241,7 @@ class EmbeddingVizCallback(Callback):
 
                 img = Image.open(buf)
                 buf.seek(0)
-                logger.experiment.log(
-                    {key: wandb.Image(img)}, commit=False
-                )
+                logger.experiment.log({key: wandb.Image(img)}, commit=False)
 
         buf.close()
         plt.close(fig)

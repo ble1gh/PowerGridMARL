@@ -4,13 +4,12 @@
 #  LICENSE file in the root directory of this source tree.
 #
 import copy
-from typing import Callable, Dict, List, Optional
+from collections.abc import Callable
 
 from torchrl.data import Composite
 from torchrl.envs import EnvBase, PettingZooWrapper
 
 from benchmarl.environments.common import Task, TaskClass
-
 from benchmarl.utils import DEVICE_TYPING
 
 
@@ -19,7 +18,7 @@ class MAgentClass(TaskClass):
         self,
         num_envs: int,
         continuous_actions: bool,
-        seed: Optional[int],
+        seed: int | None,
         device: DEVICE_TYPING,
     ) -> Callable[[], EnvBase]:
         config = copy.deepcopy(self.config)
@@ -44,9 +43,7 @@ class MAgentClass(TaskClass):
                 # tiger_deer_v4
             )
         except ImportError:
-            raise ImportError(
-                "Module `magent2` not found, install it using `pip install magent2`"
-            )
+            raise ImportError("Module `magent2` not found, install it using `pip install magent2`")
 
         envs = {
             "ADVERSARIAL_PURSUIT": adversarial_pursuit_v4,
@@ -75,13 +72,13 @@ class MAgentClass(TaskClass):
     def max_steps(self, env: EnvBase) -> int:
         return self.config["max_cycles"]
 
-    def group_map(self, env: EnvBase) -> Dict[str, List[str]]:
+    def group_map(self, env: EnvBase) -> dict[str, list[str]]:
         return env.group_map
 
-    def state_spec(self, env: EnvBase) -> Optional[Composite]:
+    def state_spec(self, env: EnvBase) -> Composite | None:
         return Composite({"state": env.observation_spec["state"].clone()})
 
-    def action_mask_spec(self, env: EnvBase) -> Optional[Composite]:
+    def action_mask_spec(self, env: EnvBase) -> Composite | None:
         observation_spec = env.observation_spec.clone()
         for group in self.group_map(env):
             group_obs_spec = observation_spec[group]
@@ -105,7 +102,7 @@ class MAgentClass(TaskClass):
         del observation_spec["state"]
         return observation_spec
 
-    def info_spec(self, env: EnvBase) -> Optional[Composite]:
+    def info_spec(self, env: EnvBase) -> Composite | None:
         observation_spec = env.observation_spec.clone()
         for group in self.group_map(env):
             group_obs_spec = observation_spec[group]

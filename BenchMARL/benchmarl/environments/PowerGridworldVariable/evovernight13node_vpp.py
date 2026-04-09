@@ -1,4 +1,5 @@
-from dataclasses import dataclass, MISSING
+from dataclasses import MISSING, dataclass
+
 
 @dataclass
 class TaskConfig:
@@ -6,7 +7,7 @@ class TaskConfig:
     start_time: str = MISSING
     end_time: str = MISSING
     control_timedelta: int = MISSING
-    
+
     # Variable agent configuration
     min_EVs: int = MISSING
     max_EVs: int = MISSING
@@ -14,15 +15,15 @@ class TaskConfig:
     max_PVs: int = MISSING
     min_Storage: int = MISSING
     max_Storage: int = MISSING
-    
+
     # Possible buses for each agent type
     EV_busses: list = MISSING
     PV_busses: list = MISSING
     Storage_busses: list = MISSING
-    
+
     # Whether multiple agents can be at same node
     allow_multiple_agents_per_node: bool = MISSING
-    
+
     # Grid Model Parameters
     cls: str = MISSING
     feeder_file: str = MISSING
@@ -31,7 +32,9 @@ class TaskConfig:
     load_noise_std: float = MISSING  # DEPRECATED legacy noise param
     load_forecast_noise_std: float = MISSING  # Per-node forecast noise std
     load_actual_noise_std: float = MISSING  # Per-node actual noise std (on top of forecast)
-    include_load_in_agent_obs: bool = MISSING  # If True, append normalized load coefficient to agent obs
+    include_load_in_agent_obs: bool = (
+        MISSING  # If True, append normalized load coefficient to agent obs
+    )
 
     # EV agent parameters
     num_vehicles: int = MISSING
@@ -49,7 +52,7 @@ class TaskConfig:
     arrival_probability: float = MISSING
     min_charge_duration_min: int = MISSING
     max_charge_duration_min: int = MISSING
-    
+
     # Global reward penalty scaling parameters
     power_loss_penalty: float = MISSING
     voltage_penalty: float = MISSING
@@ -64,7 +67,7 @@ class TaskConfig:
     pv_grid_aware: bool = MISSING
     min_pv_scaling_factor: float = MISSING
     max_pv_scaling_factor: float = MISSING
-    
+
     # Energy Storage agent parameters
     storage_range_min: float = MISSING
     storage_range_max: float = MISSING

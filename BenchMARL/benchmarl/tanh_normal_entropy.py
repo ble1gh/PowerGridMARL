@@ -12,7 +12,6 @@ import math
 import torch
 from torchrl.modules.distributions import TanhNormal
 
-
 _NORMAL_ENTROPY_CONST = 0.5 * (1.0 + math.log(2.0 * math.pi))
 
 
@@ -32,9 +31,9 @@ class TanhNormalWithEntropy(TanhNormal):
 
     def entropy(self) -> torch.Tensor:
         # --- 1. Analytical Normal entropy: 0.5*(1 + ln 2pi) + ln(sigma) per dim
-        scale = self.scale                         # (..., action_dim)
+        scale = self.scale  # (..., action_dim)
         normal_entropy = _NORMAL_ENTROPY_CONST + scale.log()  # per-dim
-        normal_entropy = normal_entropy.sum(-1)    # sum over action dims
+        normal_entropy = normal_entropy.sum(-1)  # sum over action dims
 
         # --- 2. MC estimate of tanh Jacobian: E[sum log(1 - tanh^2(x))]
         #     Sample from the *base* Normal (before any transforms).
@@ -54,7 +53,9 @@ class TanhNormalWithEntropy(TanhNormal):
         # = log4 - 2|x| - 2*log(1+exp(-2|x|))
         # Use: log(1 - tanh^2(x)) = 2*log(2) - 2*abs(x) - 2*torch.nn.functional.softplus(-2*abs(x))
         abs_x = x.abs()
-        log_dtanh = 2.0 * math.log(2.0) - 2.0 * abs_x - 2.0 * torch.nn.functional.softplus(-2.0 * abs_x)
+        log_dtanh = (
+            2.0 * math.log(2.0) - 2.0 * abs_x - 2.0 * torch.nn.functional.softplus(-2.0 * abs_x)
+        )
         # Sum over action dims, mean over MC samples
         tanh_correction = log_dtanh.sum(-1).mean(0)
 

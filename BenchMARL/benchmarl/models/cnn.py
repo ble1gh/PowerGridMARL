@@ -4,24 +4,23 @@
 #  LICENSE file in the root directory of this source tree.
 #
 
-from dataclasses import dataclass, MISSING
-from typing import List, Optional, Sequence, Tuple, Type, Union
+from collections.abc import Sequence
+from dataclasses import MISSING, dataclass
 
 import torch
-
 from tensordict import TensorDictBase
 from torch import nn
-from torchrl.modules import ConvNet, MLP, MultiAgentConvNet, MultiAgentMLP
+from torchrl.modules import MLP, ConvNet, MultiAgentConvNet, MultiAgentMLP
 
 from benchmarl.models.common import Model, ModelConfig
 
 
 def _number_conv_outputs(
-    n_conv_inputs: Union[int, Tuple[int, int]],
-    paddings: List[Union[int, Tuple[int, int]]],
-    kernel_sizes: List[Union[int, Tuple[int, int]]],
-    strides: List[Union[int, Tuple[int, int]]],
-) -> Tuple[int, int]:
+    n_conv_inputs: int | tuple[int, int],
+    paddings: list[int | tuple[int, int]],
+    kernel_sizes: list[int | tuple[int, int]],
+    strides: list[int | tuple[int, int]],
+) -> tuple[int, int]:
     if not isinstance(n_conv_inputs, int):
         n_conv_inputs_x, n_conv_inputs_y = n_conv_inputs
     else:
@@ -40,12 +39,8 @@ def _number_conv_outputs(
         else:
             stride_x = stride_y = stride
 
-        n_conv_inputs_x = (
-            n_conv_inputs_x + 2 * padding_x - kernel_size_x
-        ) // stride_x + 1
-        n_conv_inputs_y = (
-            n_conv_inputs_y + 2 * padding_y - kernel_size_y
-        ) // stride_y + 1
+        n_conv_inputs_x = (n_conv_inputs_x + 2 * padding_x - kernel_size_x) // stride_x + 1
+        n_conv_inputs_y = (n_conv_inputs_y + 2 * padding_y - kernel_size_y) // stride_y + 1
 
     return n_conv_inputs_x, n_conv_inputs_y
 
@@ -133,14 +128,10 @@ class Cnn(Model):
         self.output_features = self.output_leaf_spec.shape[-1]
 
         mlp_net_kwargs = {
-            "_".join(k.split("_")[1:]): v
-            for k, v in kwargs.items()
-            if k.startswith("mlp_")
+            "_".join(k.split("_")[1:]): v for k, v in kwargs.items() if k.startswith("mlp_")
         }
         cnn_net_kwargs = {
-            "_".join(k.split("_")[1:]): v
-            for k, v in kwargs.items()
-            if k.startswith("cnn_")
+            "_".join(k.split("_")[1:]): v for k, v in kwargs.items() if k.startswith("cnn_")
         }
 
         if self.input_has_agent_dim:
@@ -247,10 +238,7 @@ class Cnn(Model):
                 "If the CNN input has the agent dimension,"
                 " the second to last spec dimension of tensor inputs should be the number of agents"
             )
-        if (
-            self.output_has_agent_dim
-            and self.output_leaf_spec.shape[-2] != self.n_agents
-        ):
+        if self.output_has_agent_dim and self.output_leaf_spec.shape[-2] != self.n_agents:
             raise ValueError(
                 "If the CNN output has the agent dimension,"
                 " the second to last spec dimension should be the number of agents"
@@ -258,9 +246,9 @@ class Cnn(Model):
 
     def _forward(self, tensordict: TensorDictBase) -> TensorDictBase:
         # Gather images
-        input = torch.cat(
-            [tensordict.get(in_key) for in_key in self.image_in_keys], dim=-1
-        ).to(torch.float)
+        input = torch.cat([tensordict.get(in_key) for in_key in self.image_in_keys], dim=-1).to(
+            torch.float
+        )
         # BenchMARL images are X,Y,C -> we convert them to C, X, Y for processing in TorchRL models
         input = input.transpose(-3, -1).transpose(-2, -1)
 
@@ -319,22 +307,22 @@ class CnnConfig(ModelConfig):
     """Dataclass config for a :class:`~benchmarl.models.Cnn`."""
 
     cnn_num_cells: Sequence[int] = MISSING
-    cnn_kernel_sizes: Union[Sequence[int], int] = MISSING
-    cnn_strides: Union[Sequence[int], int] = MISSING
-    cnn_paddings: Union[Sequence[int], int] = MISSING
-    cnn_activation_class: Type[nn.Module] = MISSING
+    cnn_kernel_sizes: Sequence[int] | int = MISSING
+    cnn_strides: Sequence[int] | int = MISSING
+    cnn_paddings: Sequence[int] | int = MISSING
+    cnn_activation_class: type[nn.Module] = MISSING
 
     mlp_num_cells: Sequence[int] = MISSING
-    mlp_layer_class: Type[nn.Module] = MISSING
-    mlp_activation_class: Type[nn.Module] = MISSING
+    mlp_layer_class: type[nn.Module] = MISSING
+    mlp_activation_class: type[nn.Module] = MISSING
 
-    cnn_activation_kwargs: Optional[dict] = None
-    cnn_norm_class: Type[nn.Module] = None
-    cnn_norm_kwargs: Optional[dict] = None
+    cnn_activation_kwargs: dict | None = None
+    cnn_norm_class: type[nn.Module] = None
+    cnn_norm_kwargs: dict | None = None
 
-    mlp_activation_kwargs: Optional[dict] = None
-    mlp_norm_class: Type[nn.Module] = None
-    mlp_norm_kwargs: Optional[dict] = None
+    mlp_activation_kwargs: dict | None = None
+    mlp_norm_class: type[nn.Module] = None
+    mlp_norm_kwargs: dict | None = None
 
     @staticmethod
     def associated_class():

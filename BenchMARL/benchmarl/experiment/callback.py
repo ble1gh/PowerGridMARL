@@ -6,8 +6,6 @@
 
 from __future__ import annotations
 
-from typing import List
-
 from tensordict import TensorDictBase
 
 
@@ -63,7 +61,7 @@ class Callback:
         """
         pass
 
-    def on_evaluation_end(self, rollouts: List[TensorDictBase]):
+    def on_evaluation_end(self, rollouts: list[TensorDictBase]):
         """
         A callback called at the end of every training step.
 
@@ -75,7 +73,7 @@ class Callback:
 
 
 class CallbackNotifier:
-    def __init__(self, experiment, callbacks: List[Callback]):
+    def __init__(self, experiment, callbacks: list[Callback]):
         self.callbacks = callbacks
         for callback in self.callbacks:
             callback.experiment = experiment
@@ -103,6 +101,6 @@ class CallbackNotifier:
         for callback in self.callbacks:
             callback.on_train_end(training_td, group)
 
-    def _on_evaluation_end(self, rollouts: List[TensorDictBase]):
+    def _on_evaluation_end(self, rollouts: list[TensorDictBase]):
         for callback in self.callbacks:
             callback.on_evaluation_end(rollouts)

@@ -14,8 +14,8 @@ from .common import (
 )
 from .deepsets import Deepsets, DeepsetsConfig
 from .gnn import Gnn, GnnConfig
-from .heterognn import HeteroGNN, HeteroGnnConfig
 from .gru import Gru, GruConfig
+from .heterognn import HeteroGNN, HeteroGnnConfig
 from .lstm import Lstm, LstmConfig
 from .mlp import Mlp, MlpConfig
 from .transformer import Transformer, TransformerConfig

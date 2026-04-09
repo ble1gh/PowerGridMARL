@@ -1,47 +1,35 @@
-import logging
-
-import numpy as np
-
 import gymnasium as gym
+import numpy as np
 
 from gridworld.log import logger
 
 
-def to_scaled(
-    x: np.ndarray,
-    low: np.ndarray,
-    high: np.ndarray
-) -> np.ndarray:
+def to_scaled(x: np.ndarray, low: np.ndarray, high: np.ndarray) -> np.ndarray:
     """Scale the input arr in [low, high] to [-1, 1]"""
 
     # Warn the user if the arguments are out of bounds, this shouldn't happen.
     if not (np.all(x >= low) and np.all(x <= high)):
         logger.warning(f"argument out of bounds, {x}, {low}, {high}")
-    
+
     # Clip the values (in case the above warning is ignored).
     x = np.clip(x, low, high)
-    
+
     # Transform the input to [-1, 1].
-    return (2*x - (low + high)) / (high - low)
+    return (2 * x - (low + high)) / (high - low)
 
 
-def to_raw(
-    y: np.ndarray,
-    low: np.ndarray,
-    high: np.ndarray,
-    eps: float = 1e-4
-) -> np.ndarray:
+def to_raw(y: np.ndarray, low: np.ndarray, high: np.ndarray, eps: float = 1e-4) -> np.ndarray:
     """Scale the input y in [-1, 1] to [low, high]"""
 
     # Warn the user if the arguments are out of bounds, this shouldn't happend.""""
     if not (np.all(y >= -np.ones_like(y) - eps) and np.all(y <= np.ones_like(y) + eps)):
         logger.warning(f"argument out of bounds, {y}, {low}, {high}")
-    
+
     # Clip the values (in case the above warning is ignored).
     y = np.clip(y, -np.ones_like(y), np.ones_like(y))
-    
+
     # Transform the input to [low, high].
-    return (y * (high - low) + (high + low)) / 2.
+    return (y * (high - low) + (high + low)) / 2.0
 
 
 def maybe_rescale_box_space(box, rescale=True):
@@ -49,8 +37,8 @@ def maybe_rescale_box_space(box, rescale=True):
     space.  Allow calling as a pass-through with rescale=False."""
 
     if rescale:
-        return gym.spaces.Box(low=-1., high=1., shape=box.shape, dtype=box.dtype)
-    
+        return gym.spaces.Box(low=-1.0, high=1.0, shape=box.shape, dtype=box.dtype)
+
     return box
 
 
@@ -69,7 +57,3 @@ def maybe_rescale_box_space(box, rescale=True):
 #                 _env._action_space.low,
 #                 _env._action_space.high)
 #     return rescaled_action
-
-
-
-

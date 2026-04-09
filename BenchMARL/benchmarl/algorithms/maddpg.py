@@ -4,8 +4,8 @@
 #  LICENSE file in the root directory of this source tree.
 #
 
-from dataclasses import dataclass, MISSING
-from typing import Dict, Iterable, Tuple, Type
+from collections.abc import Iterable
+from dataclasses import MISSING, dataclass
 
 from tensordict import TensorDictBase
 from tensordict.nn import TensorDictModule, TensorDictSequential
@@ -50,7 +50,7 @@ class Maddpg(Algorithm):
 
     def _get_loss(
         self, group: str, policy_for_loss: TensorDictModule, continuous: bool
-    ) -> Tuple[LossModule, bool]:
+    ) -> tuple[LossModule, bool]:
         if continuous:
             # Loss
             loss_module = DDPGLoss(
@@ -73,11 +73,9 @@ class Maddpg(Algorithm):
 
             return loss_module, True
         else:
-            raise NotImplementedError(
-                "MADDPG is not compatible with discrete actions yet"
-            )
+            raise NotImplementedError("MADDPG is not compatible with discrete actions yet")
 
-    def _get_parameters(self, group: str, loss: LossModule) -> Dict[str, Iterable]:
+    def _get_parameters(self, group: str, loss: LossModule) -> dict[str, Iterable]:
         return {
             "loss_actor": list(loss.actor_network_params.flatten_keys().values()),
             "loss_value": list(loss.value_network_params.flatten_keys().values()),
@@ -131,9 +129,7 @@ class Maddpg(Algorithm):
             )
             return policy
         else:
-            raise NotImplementedError(
-                "MADDPG is not compatible with discrete actions yet"
-            )
+            raise NotImplementedError("MADDPG is not compatible with discrete actions yet")
 
     def _get_policy_for_collection(
         self, policy_for_loss: TensorDictModule, group: str, continuous: bool
@@ -166,9 +162,7 @@ class Maddpg(Algorithm):
         if nested_terminated_key not in keys:
             batch.set(
                 nested_terminated_key,
-                batch.get(("next", "terminated"))
-                .unsqueeze(-1)
-                .expand((*group_shape, 1)),
+                batch.get(("next", "terminated")).unsqueeze(-1).expand((*group_shape, 1)),
             )
 
         if nested_reward_key not in keys:
@@ -188,9 +182,7 @@ class Maddpg(Algorithm):
         modules = []
 
         if self.share_param_critic:
-            critic_output_spec = Composite(
-                {"state_action_value": Unbounded(shape=(1,))}
-            )
+            critic_output_spec = Composite({"state_action_value": Unbounded(shape=(1,))})
         else:
             critic_output_spec = Composite(
                 {
@@ -221,11 +213,7 @@ class Maddpg(Algorithm):
 
         else:
             critic_input_spec = Composite(
-                {
-                    group: self.observation_spec[group]
-                    .clone()
-                    .update(self.action_spec[group])
-                }
+                {group: self.observation_spec[group].clone().update(self.action_spec[group])}
             )
             input_has_agent_dim = True
 
@@ -246,9 +234,7 @@ class Maddpg(Algorithm):
         if self.share_param_critic:
             modules.append(
                 TensorDictModule(
-                    lambda value: value.unsqueeze(-2).expand(
-                        *value.shape[:-1], n_agents, 1
-                    ),
+                    lambda value: value.unsqueeze(-2).expand(*value.shape[:-1], n_agents, 1),
                     in_keys=["state_action_value"],
                     out_keys=[(group, "state_action_value")],
                 )
@@ -268,7 +254,7 @@ class MaddpgConfig(AlgorithmConfig):
     use_tanh_mapping: bool = MISSING
 
     @staticmethod
-    def associated_class() -> Type[Algorithm]:
+    def associated_class() -> type[Algorithm]:
         return Maddpg
 
     @staticmethod

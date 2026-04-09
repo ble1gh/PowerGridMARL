@@ -8,23 +8,19 @@ from __future__ import annotations
 
 import copy
 import importlib
-
 import os
 import pickle
 import shutil
 import time
 import warnings
-from collections import deque, OrderedDict
-from dataclasses import dataclass, MISSING
+from collections import OrderedDict, deque
+from dataclasses import MISSING, dataclass
 from pathlib import Path
-
-from typing import Any, Dict, List, Optional, Union
+from typing import Any
 
 import torch
 from tensordict import TensorDictBase
-from tensordict.nn import TensorDictSequential
 from torchrl.collectors import SyncDataCollector
-
 from torchrl.envs import ParallelEnv, SerialEnv, TransformedEnv
 from torchrl.envs.transforms import Compose
 from torchrl.envs.utils import ExplorationType, set_exploration_type, step_mdp
@@ -32,7 +28,6 @@ from torchrl.record.loggers import generate_exp_name
 from tqdm import tqdm
 
 from benchmarl.algorithms import IppoConfig, MappoConfig
-
 from benchmarl.algorithms.common import AlgorithmConfig
 from benchmarl.environments import Task, TaskClass
 from benchmarl.experiment.callback import Callback, CallbackNotifier
@@ -64,7 +59,9 @@ class ExperimentConfig:
     sampling_device: str = MISSING
     train_device: str = MISSING
     buffer_device: str = MISSING
-    collection_policy_device: Optional[str] = MISSING  # Device for policy during collection (defaults to sampling_device)
+    collection_policy_device: str | None = (
+        MISSING  # Device for policy during collection (defaults to sampling_device)
+    )
 
     share_policy_params: bool = MISSING
     prefer_continuous_actions: bool = MISSING
@@ -75,7 +72,7 @@ class ExperimentConfig:
     lr: float = MISSING
     adam_eps: float = MISSING
     clip_grad_norm: bool = MISSING
-    clip_grad_val: Optional[float] = MISSING
+    clip_grad_val: float | None = MISSING
 
     soft_target_update: bool = MISSING
     polyak_tau: float = MISSING
@@ -83,10 +80,10 @@ class ExperimentConfig:
 
     exploration_eps_init: float = MISSING
     exploration_eps_end: float = MISSING
-    exploration_anneal_frames: Optional[int] = MISSING
+    exploration_anneal_frames: int | None = MISSING
 
-    max_n_iters: Optional[int] = MISSING
-    max_n_frames: Optional[int] = MISSING
+    max_n_iters: int | None = MISSING
+    max_n_frames: int | None = MISSING
 
     on_policy_collected_frames_per_batch: int = MISSING
     on_policy_n_envs_per_worker: int = MISSING
@@ -110,17 +107,17 @@ class ExperimentConfig:
     evaluation_deterministic_actions: bool = MISSING
     evaluation_static: bool = MISSING
 
-    loggers: List[str] = MISSING
+    loggers: list[str] = MISSING
     project_name: str = MISSING
-    wandb_extra_kwargs: Dict[str, Any] = MISSING
+    wandb_extra_kwargs: dict[str, Any] = MISSING
     create_json: bool = MISSING
 
-    save_folder: Optional[str] = MISSING
-    restore_file: Optional[str] = MISSING
-    restore_map_location: Optional[Any] = MISSING
+    save_folder: str | None = MISSING
+    restore_file: str | None = MISSING
+    restore_map_location: Any | None = MISSING
     checkpoint_interval: int = MISSING
     checkpoint_at_end: bool = MISSING
-    keep_checkpoints_num: Optional[int] = MISSING
+    keep_checkpoints_num: int | None = MISSING
 
     def train_batch_size(self, on_policy: bool) -> int:
         """
@@ -145,11 +142,7 @@ class ExperimentConfig:
         Args:
             on_policy (bool): is the algorithms on_policy
         """
-        return (
-            self.on_policy_minibatch_size
-            if on_policy
-            else self.train_batch_size(on_policy)
-        )
+        return self.on_policy_minibatch_size if on_policy else self.train_batch_size(on_policy)
 
     def n_optimizer_steps(self, on_policy: bool) -> int:
         """
@@ -159,11 +152,7 @@ class ExperimentConfig:
             on_policy (bool): is the algorithms on_policy
 
         """
-        return (
-            self.on_policy_n_minibatch_iters
-            if on_policy
-            else self.off_policy_n_optimizer_steps
-        )
+        return self.on_policy_n_minibatch_iters if on_policy else self.off_policy_n_optimizer_steps
 
     def replay_buffer_memory_size(self, on_policy: bool) -> int:
         """
@@ -174,9 +163,7 @@ class ExperimentConfig:
 
         """
         return (
-            self.collected_frames_per_batch(on_policy)
-            if on_policy
-            else self.off_policy_memory_size
+            self.collected_frames_per_batch(on_policy) if on_policy else self.off_policy_memory_size
         )
 
     def collected_frames_per_batch(self, on_policy: bool) -> int:
@@ -205,11 +192,7 @@ class ExperimentConfig:
 
 
         """
-        return (
-            self.on_policy_n_envs_per_worker
-            if on_policy
-            else self.off_policy_n_envs_per_worker
-        )
+        return self.on_policy_n_envs_per_worker if on_policy else self.off_policy_n_envs_per_worker
 
     def get_max_n_frames(self, on_policy: bool) -> int:
         """
@@ -235,10 +218,7 @@ class ExperimentConfig:
         Args:
             on_policy (bool): is the algorithms on_policy
         """
-        return -(
-            -self.get_max_n_frames(on_policy)
-            // self.collected_frames_per_batch(on_policy)
-        )
+        return -(-self.get_max_n_frames(on_policy) // self.collected_frames_per_batch(on_policy))
 
     def get_exploration_anneal_frames(self, on_policy: bool):
         """
@@ -255,7 +235,7 @@ class ExperimentConfig:
         )
 
     @staticmethod
-    def get_from_yaml(path: Optional[str] = None):
+    def get_from_yaml(path: str | None = None):
         """
         Load the experiment configuration from yaml
 
@@ -269,10 +249,7 @@ class ExperimentConfig:
         """
         if path is None:
             yaml_path = (
-                Path(__file__).parent.parent
-                / "conf"
-                / "experiment"
-                / "base_experiment.yaml"
+                Path(__file__).parent.parent / "conf" / "experiment" / "base_experiment.yaml"
             )
             return ExperimentConfig(**_read_yaml_config(str(yaml_path.resolve())))
         else:
@@ -288,8 +265,7 @@ class ExperimentConfig:
         """
         if (
             self.evaluation
-            and self.evaluation_interval % self.collected_frames_per_batch(on_policy)
-            != 0
+            and self.evaluation_interval % self.collected_frames_per_batch(on_policy) != 0
         ):
             raise ValueError(
                 f"evaluation_interval ({self.evaluation_interval}) "
@@ -297,8 +273,7 @@ class ExperimentConfig:
             )
         if (
             self.checkpoint_interval != 0
-            and self.checkpoint_interval % self.collected_frames_per_batch(on_policy)
-            != 0
+            and self.checkpoint_interval % self.collected_frames_per_batch(on_policy) != 0
         ):
             raise ValueError(
                 f"checkpoint_interval ({self.checkpoint_interval}) "
@@ -335,17 +310,15 @@ class Experiment(CallbackNotifier):
 
     def __init__(
         self,
-        task: Union[Task, TaskClass],
+        task: Task | TaskClass,
         algorithm_config: AlgorithmConfig,
         model_config: ModelConfig,
         seed: int,
         config: ExperimentConfig,
-        critic_model_config: Optional[ModelConfig] = None,
-        callbacks: Optional[List[Callback]] = None,
+        critic_model_config: ModelConfig | None = None,
+        callbacks: list[Callback] | None = None,
     ):
-        super().__init__(
-            experiment=self, callbacks=callbacks if callbacks is not None else []
-        )
+        super().__init__(experiment=self, callbacks=callbacks if callbacks is not None else [])
 
         self.config = config
 
@@ -358,9 +331,7 @@ class Experiment(CallbackNotifier):
         self.task = task
         self.model_config = model_config
         self.critic_model_config = (
-            critic_model_config
-            if critic_model_config is not None
-            else copy.deepcopy(model_config)
+            critic_model_config if critic_model_config is not None else copy.deepcopy(model_config)
         )
         self.critic_model_config.is_critic = True
 
@@ -459,9 +430,7 @@ class Experiment(CallbackNotifier):
         )
 
         transforms_env = self.task.get_env_transforms(test_env)
-        transforms_training = transforms_env + [
-            self.task.get_reward_sum_transform(test_env)
-        ]
+        transforms_training = transforms_env + [self.task.get_reward_sum_transform(test_env)]
         transforms_env = Compose(*transforms_env)
         transforms_training = Compose(*transforms_training)
 
@@ -489,18 +458,14 @@ class Experiment(CallbackNotifier):
         # Initialize train env
         if self.test_env.batch_size == ():
             # If the environment is not vectorized, we simulate vectorization using parallel or serial environments
-            env_class = (
-                SerialEnv if not self.config.parallel_collection else ParallelEnv
-            )
+            env_class = SerialEnv if not self.config.parallel_collection else ParallelEnv
             self.env_func = lambda: TransformedEnv(
                 env_class(self.config.n_envs_per_worker(self.on_policy), env_func),
                 transforms_training.clone(),
             )
         else:
             # Otherwise it is already vectorized
-            self.env_func = lambda: TransformedEnv(
-                env_func(), transforms_training.clone()
-            )
+            self.env_func = lambda: TransformedEnv(env_func(), transforms_training.clone())
 
     def _setup_algorithm(self):
         self.algorithm = self.algorithm_config.get_algorithm(experiment=self)
@@ -516,18 +481,14 @@ class Experiment(CallbackNotifier):
             for group in self.group_map.keys()
         }
         self.losses = {
-            group: self.algorithm.get_loss_and_updater(group)[0]
-            for group in self.group_map.keys()
+            group: self.algorithm.get_loss_and_updater(group)[0] for group in self.group_map.keys()
         }
         self.target_updaters = {
-            group: self.algorithm.get_loss_and_updater(group)[1]
-            for group in self.group_map.keys()
+            group: self.algorithm.get_loss_and_updater(group)[1] for group in self.group_map.keys()
         }
         self.optimizers = {
             group: {
-                loss_name: torch.optim.Adam(
-                    params, lr=self.config.lr, eps=self.config.adam_eps
-                )
+                loss_name: torch.optim.Adam(params, lr=self.config.lr, eps=self.config.adam_eps)
                 for loss_name, params in self.algorithm.get_parameters(group).items()
             }
             for group in self.group_map.keys()
@@ -547,9 +508,7 @@ class Experiment(CallbackNotifier):
                 frames_per_batch=self.config.collected_frames_per_batch(self.on_policy),
                 total_frames=self.config.get_max_n_frames(self.on_policy),
                 init_random_frames=(
-                    self.config.off_policy_init_random_frames
-                    if not self.on_policy
-                    else 0
+                    self.config.off_policy_init_random_frames if not self.on_policy else 0
                 ),
                 storing_device=self.config.sampling_device,
             )
@@ -574,9 +533,7 @@ class Experiment(CallbackNotifier):
     def _setup_name(self):
         self.algorithm_name = self.algorithm_config.associated_class().__name__.lower()
         self.model_name = self.model_config.associated_class().__name__.lower()
-        self.critic_model_name = (
-            self.critic_model_config.associated_class().__name__.lower()
-        )
+        self.critic_model_name = self.critic_model_config.associated_class().__name__.lower()
         self.environment_name = self.task.env_name().lower()
         self.task_name = self.task.name.lower()
         self._checkpointed_files = deque([])
@@ -587,9 +544,7 @@ class Experiment(CallbackNotifier):
         else:
             # Otherwise, if the user is restoring from a folder, we will save in the folder they are restoring from
             if self.config.restore_file is not None:
-                save_folder = Path(
-                    self.config.restore_file
-                ).parent.parent.parent.resolve()
+                save_folder = Path(self.config.restore_file).parent.parent.parent.resolve()
             # Otherwise, the user is not restoring and did not specify a save_folder so we save in the hydra directory
             # of the experiment or in the directory where the experiment was run (if hydra is not used)
             else:
@@ -682,9 +637,7 @@ class Experiment(CallbackNotifier):
             reset_batch = self.rollout_env.reset()
 
         # Training/collection iterations
-        for _ in range(
-            self.n_iters_performed, self.config.get_max_n_iters(self.on_policy)
-        ):
+        for _ in range(self.n_iters_performed, self.config.get_max_n_iters(self.on_policy)):
             iteration_start = time.time()
             if not self.config.collect_with_grad:
                 batch = next(iterator)
@@ -795,12 +748,8 @@ class Experiment(CallbackNotifier):
         excluded_keys = []
         # When the critic is shared across groups, or the actor uses a shared
         # GNN encoder, we need observations from ALL agent types in the batch.
-        share_critic = getattr(
-            self.algorithm, "share_critic_across_groups", False
-        )
-        shared_actor_gnn = getattr(
-            self.algorithm, "gnn_mode", "none"
-        ) != "none"
+        share_critic = getattr(self.algorithm, "share_critic_across_groups", False)
+        shared_actor_gnn = getattr(self.algorithm, "gnn_mode", "none") != "none"
         if not (share_critic or shared_actor_gnn):
             for other_group in self.group_map.keys():
                 if other_group != group:
@@ -825,13 +774,8 @@ class Experiment(CallbackNotifier):
                 # We log directly to the logger (not training_td) because
                 # training_tds get torch.stack'd and not all will have these keys.
                 gh_key = f"{group}/{loss_name}"
-                if (
-                    self.n_iters_performed % 10 == 0
-                    and gh_key not in self._grad_health_logged
-                ):
-                    grad_stats = self._compute_grad_health(
-                        optimizer, prefix=f"{group}/{loss_name}"
-                    )
+                if self.n_iters_performed % 10 == 0 and gh_key not in self._grad_health_logged:
+                    grad_stats = self._compute_grad_health(optimizer, prefix=f"{group}/{loss_name}")
                     self.logger.log(
                         {k: v.item() for k, v in grad_stats.items()},
                         step=self.n_iters_performed,
@@ -844,13 +788,13 @@ class Experiment(CallbackNotifier):
                     f"grad_norm_{loss_name}",
                     torch.tensor(grad_norm, device=self.config.train_device),
                 )
-                
+
                 # Extract gradient norms from retain_grad() refs stored by HGTeamLoss.
                 # Only after loss_objective backward, since that's the actor loss
                 # whose graph flows through embedding_z and participation scores.
                 if loss_name == "loss_objective":
                     loss_module = self.losses[group]
-                    if hasattr(loss_module, '_grad_embedding_z_ref'):
+                    if hasattr(loss_module, "_grad_embedding_z_ref"):
                         z = loss_module._grad_embedding_z_ref
                         if z is not None and z.grad is not None:
                             training_td.set(
@@ -858,7 +802,7 @@ class Experiment(CallbackNotifier):
                                 z.grad.norm().detach(),
                             )
                         loss_module._grad_embedding_z_ref = None
-                    if hasattr(loss_module, '_grad_participation_ref'):
+                    if hasattr(loss_module, "_grad_participation_ref"):
                         p = loss_module._grad_participation_ref
                         if p is not None and p.grad is not None:
                             training_td.set(
@@ -885,15 +829,11 @@ class Experiment(CallbackNotifier):
             params += param_group["params"]
 
         if self.config.clip_grad_norm and self.config.clip_grad_val is not None:
-            total_norm = torch.nn.utils.clip_grad_norm_(
-                params, self.config.clip_grad_val
-            )
+            total_norm = torch.nn.utils.clip_grad_norm_(params, self.config.clip_grad_val)
         else:
             norm_type = 2.0
             norms = [
-                torch.linalg.vector_norm(p.grad, norm_type)
-                for p in params
-                if p.grad is not None
+                torch.linalg.vector_norm(p.grad, norm_type) for p in params if p.grad is not None
             ]
             total_norm = torch.linalg.vector_norm(torch.stack(norms), norm_type)
             if self.config.clip_grad_val is not None:
@@ -902,9 +842,7 @@ class Experiment(CallbackNotifier):
         return float(total_norm)
 
     @torch.no_grad()
-    def _compute_grad_health(
-        self, optimizer: torch.optim.Optimizer, prefix: str = ""
-    ) -> dict:
+    def _compute_grad_health(self, optimizer: torch.optim.Optimizer, prefix: str = "") -> dict:
         """Count trainable params with zero / non-zero / missing gradients.
 
         Runs between backward() and zero_grad() so grads are still alive.
@@ -927,24 +865,12 @@ class Experiment(CallbackNotifier):
                     total_norm_sq += p.grad.norm().item() ** 2
 
         return {
-            f"grad_health/{prefix}/total_params": torch.tensor(
-                float(total), device=dev
-            ),
-            f"grad_health/{prefix}/nonzero_grad": torch.tensor(
-                float(ok), device=dev
-            ),
-            f"grad_health/{prefix}/zero_grad": torch.tensor(
-                float(zero), device=dev
-            ),
-            f"grad_health/{prefix}/no_grad_attr": torch.tensor(
-                float(none), device=dev
-            ),
-            f"grad_health/{prefix}/frac_alive": torch.tensor(
-                float(ok) / max(total, 1), device=dev
-            ),
-            f"grad_health/{prefix}/total_grad_norm": torch.tensor(
-                total_norm_sq**0.5, device=dev
-            ),
+            f"grad_health/{prefix}/total_params": torch.tensor(float(total), device=dev),
+            f"grad_health/{prefix}/nonzero_grad": torch.tensor(float(ok), device=dev),
+            f"grad_health/{prefix}/zero_grad": torch.tensor(float(zero), device=dev),
+            f"grad_health/{prefix}/no_grad_attr": torch.tensor(float(none), device=dev),
+            f"grad_health/{prefix}/frac_alive": torch.tensor(float(ok) / max(total, 1), device=dev),
+            f"grad_health/{prefix}/total_grad_norm": torch.tensor(total_norm_sq**0.5, device=dev),
         }
 
     @local_seed()
@@ -969,9 +895,7 @@ class Experiment(CallbackNotifier):
                 video_frames = []
 
                 def callback(env, td):
-                    video_frames.append(
-                        self.task.__class__.render_callback(self, env, td)
-                    )
+                    video_frames.append(self.task.__class__.render_callback(self, env, td))
 
             else:
                 video_frames = None
@@ -1013,9 +937,7 @@ class Experiment(CallbackNotifier):
                 )
 
         evaluation_time = time.time() - evaluation_start
-        self.logger.log(
-            {"timers/evaluation_time": evaluation_time}, step=self.n_iters_performed
-        )
+        self.logger.log({"timers/evaluation_time": evaluation_time}, step=self.n_iters_performed)
         self.logger.log_evaluation(
             rollouts,
             video_frames=video_frames,
@@ -1047,7 +969,7 @@ class Experiment(CallbackNotifier):
             state_dict.update({"collector": self.collector.state_dict()})
         return state_dict
 
-    def load_state_dict(self, state_dict: Dict) -> None:
+    def load_state_dict(self, state_dict: dict) -> None:
         """Load the state_dict for the experiment.
 
         Args:
@@ -1057,9 +979,7 @@ class Experiment(CallbackNotifier):
         for group in self.group_map.keys():
             self.losses[group].load_state_dict(state_dict[f"loss_{group}"])
             if state_dict[f"buffer_{group}"] is not None:
-                self.replay_buffers[group].load_state_dict(
-                    state_dict[f"buffer_{group}"]
-                )
+                self.replay_buffers[group].load_state_dict(state_dict[f"buffer_{group}"])
         if not self.config.collect_with_grad:
             self.collector.load_state_dict(state_dict["collector"])
         self.total_time = state_dict["state"]["total_time"]

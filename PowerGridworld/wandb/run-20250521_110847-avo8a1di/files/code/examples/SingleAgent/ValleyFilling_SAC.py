@@ -1,47 +1,43 @@
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-
-from gridworld import ComponentEnv
-from gridworld import MultiAgentEnv
-from gridworld.distribution_system import OpenDSSSolver
-from gridworld.agents.vehicles import EVChargingEnv
-from mpl_toolkits.mplot3d import Axes3D
-
 import plotting_mine
+from gridworld import MultiAgentEnv
+from gridworld.agents.vehicles import EVChargingEnv
+from gridworld.distribution_system import OpenDSSSolver
 from plotting_mine import plot_2x2_nodal_voltages_and_load_profiles
 
-
-busses = ['634a', '634b', '634c', '645', '675a', '675b', '675c', '670a', '670b', '670c', '684c']
+busses = ["634a", "634b", "634c", "645", "675a", "675b", "675c", "670a", "670b", "670c", "684c"]
 # busses = ['633.1', '634.1', '634.2', '634.3', '645.3', '646.2', '675.2', '675.3', '680.1', '692.2', '611.3', '652.1']
 
 agents = [
     {
-        "name": "ev-charging-{}".format(i),
+        "name": f"ev-charging-{i}",
         "bus": busses[i],
         "cls": EVChargingEnv,
         "config": {
             "num_vehicles": 70,
             "minutes_per_step": 15,
-            "max_charge_rate_kw": 7.,
-            "peak_threshold": 700.,
-            "vehicle_multiplier": 1.,
+            "max_charge_rate_kw": 7.0,
+            "peak_threshold": 700.0,
+            "vehicle_multiplier": 1.0,
             "rescale_spaces": False,
             "unserved_penalty": 0.0,
-        }
-    } for i in range(len(busses))
+        },
+    }
+    for i in range(len(busses))
 ]
 
 
 # Bare minimum common config specifies start and stop times, and control
-# timedelta.  
+# timedelta.
 common_config = {
     "start_time": "08-12-2020 20:00:00",
     "end_time": "08-13-2020 08:00:00",
-    "control_timedelta": pd.Timedelta(900, "s")
+    "control_timedelta": pd.Timedelta(900, "s"),
 }
 
-# PowerFlow configuration.  Note that file paths are relative to 
+# PowerFlow configuration.  Note that file paths are relative to
 # "gridworld/distribution_system/data" by default.
 pf_config = {
     "cls": OpenDSSSolver,
@@ -49,15 +45,11 @@ pf_config = {
         "feeder_file": "ieee_13_dss/IEEE13Nodeckt.dss",
         "loadshape_file": "ieee_13_dss/annual_hourly_load_profile.csv",
         "system_load_rescale_factor": 0.9,
-    }
+    },
 }
 
 # Configuration of the multi-agent environment.
-env_config = {
-    "common_config": common_config,
-    "pf_config": pf_config,
-    "agents": agents
-}
+env_config = {"common_config": common_config, "pf_config": pf_config, "agents": agents}
 
 # docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/sac/#sac_continuous_actionpy
 import os
@@ -66,16 +58,15 @@ import time
 from dataclasses import dataclass
 
 import gymnasium as gym
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import tyro
+import wandb
+from gymnasium.spaces import Box, flatten_space
 from stable_baselines3.common.buffers import ReplayBuffer
 from torch.utils.tensorboard import SummaryWriter
-from gymnasium.spaces import Box, Dict, flatten_space, flatten
-import wandb
 
 
 @dataclass
@@ -127,17 +118,18 @@ class Args:
     autotune: bool = True
     """automatic tuning of the entropy coefficient"""
 
-from gymnasium import Env
 
-class MultiAgentEnvWrapper(MultiAgentEnv,gym.Env):
+class MultiAgentEnvWrapper(MultiAgentEnv, gym.Env):
     def __init__(self, multi_agent_env):
         self.multi_agent_env = multi_agent_env
 
         # Combine observation and action spaces
-        #self.observation_space = Dict(multi_agent_env.observation_space)
+        # self.observation_space = Dict(multi_agent_env.observation_space)
         self.observation_space = Box(
             low=np.concatenate([space.low for space in multi_agent_env.observation_space.values()]),
-            high=np.concatenate([space.high for space in multi_agent_env.observation_space.values()]),
+            high=np.concatenate(
+                [space.high for space in multi_agent_env.observation_space.values()]
+            ),
             dtype=np.float32,  # Ensure float32 for compatibility
         )
         self.action_space = Box(
@@ -173,7 +165,7 @@ class MultiAgentEnvWrapper(MultiAgentEnv,gym.Env):
         start_idx = 0
         for agent, space in self.multi_agent_env.action_space.items():
             action_size = space.shape[0]
-            split_actions[agent] = action[start_idx:start_idx + action_size]
+            split_actions[agent] = action[start_idx : start_idx + action_size]
             start_idx += action_size
 
         obs, self.agent_rewards, dones, truncated, infos = self.multi_agent_env.step(split_actions)
@@ -214,6 +206,7 @@ class MultiAgentEnvWrapper(MultiAgentEnv,gym.Env):
     def close(self):
         return self.multi_agent_env.close()
 
+
 def render(rend_env, actor, device, run_name=None):
     """
     Renders the environment by plotting:
@@ -221,9 +214,7 @@ def render(rend_env, actor, device, run_name=None):
     2. Rewards per agent over time.
     Saves the plots to WandB under the `videos/{run_name}` directory.
     """
-    import matplotlib.pyplot as plt
     import os
-    from plotting_mine import plot_2x2_nodal_voltages_and_load_profiles
 
     if run_name is None:
         run_name = "default_run"
@@ -254,7 +245,6 @@ def render(rend_env, actor, device, run_name=None):
         obs, rew, done, truncated, info = rend_env.step(actions)
         agent_reward_dict = rend_env.agent_rewards  # Access self.agent_rewards within rend_env
 
-
         if info is None:
             print("Warning: info is None at this timestep.")
 
@@ -279,7 +269,9 @@ def render(rend_env, actor, device, run_name=None):
     plt.close()
 
     # Plot 2x2 nodal voltages and load profiles
-    plot_2x2_nodal_voltages_and_load_profiles(rend_env.multi_agent_env, charging_rates, ev_load_df, power_losses_df)
+    plot_2x2_nodal_voltages_and_load_profiles(
+        rend_env.multi_agent_env, charging_rates, ev_load_df, power_losses_df
+    )
     plt.savefig(f"{video_dir}/nodal_voltages_and_load_profiles.png")
     plt.close()
 
@@ -299,12 +291,17 @@ def render(rend_env, actor, device, run_name=None):
 
     # Log the plots to WandB
     if run_name:
-        wandb.log({
-            "nodal_voltages_and_load_profiles": wandb.Image(f"{video_dir}/nodal_voltages_and_load_profiles.png"),
-            "rewards_per_agent": wandb.Image(f"{video_dir}/rewards_per_agent.png"),
-            "charging_rates": wandb.Image(f"{video_dir}/charging_rates.png"),   
-        })
+        wandb.log(
+            {
+                "nodal_voltages_and_load_profiles": wandb.Image(
+                    f"{video_dir}/nodal_voltages_and_load_profiles.png"
+                ),
+                "rewards_per_agent": wandb.Image(f"{video_dir}/rewards_per_agent.png"),
+                "charging_rates": wandb.Image(f"{video_dir}/charging_rates.png"),
+            }
+        )
         print(f"Plots saved to {video_dir} and logged to WandB.")
+
 
 def power_losses_to_dataframe(env):
     """
@@ -330,13 +327,16 @@ def power_losses_to_dataframe(env):
     time = [start_time + i * timestep_delta for i in range(len(real_power_losses))]
 
     # Create the DataFrame
-    power_losses_df = pd.DataFrame({
-        "time": time,
-        "real_power_loss": real_power_losses,
-        "reactive_power_loss": reactive_power_losses
-    }).set_index("time")
+    power_losses_df = pd.DataFrame(
+        {
+            "time": time,
+            "real_power_loss": real_power_losses,
+            "reactive_power_loss": reactive_power_losses,
+        }
+    ).set_index("time")
 
     return power_losses_df
+
 
 def make_env():
     def thunk():
@@ -347,7 +347,9 @@ def make_env():
         env = gym.wrappers.RecordEpisodeStatistics(env)
         # env.action_space.seed(seed)
         return env
+
     return thunk
+
 
 def plot_3d_charging_rates(charging_rates, video_dir):
     """
@@ -356,13 +358,11 @@ def plot_3d_charging_rates(charging_rates, video_dir):
     Args:
         charging_rates (dict): A dictionary where keys are agent names and values are lists of actions (charging rates) over timesteps.
     """
-    import matplotlib.pyplot as plt
-    from mpl_toolkits.mplot3d import Axes3D
     import numpy as np
 
     # Create a 3D plot
     fig = plt.figure(figsize=(12, 8))
-    ax = fig.add_subplot(111, projection='3d')
+    ax = fig.add_subplot(111, projection="3d")
 
     # Create a 2D plot for EV charging rates over time
     plt.figure(figsize=(12, 8))
@@ -383,6 +383,7 @@ def plot_3d_charging_rates(charging_rates, video_dir):
     plt.grid(True)
 
     return fig
+
 
 # # Create the multi-agent environment
 # multi_agent_env = MultiAgentEnv(**env_config)
@@ -407,7 +408,8 @@ class SoftQNetwork(nn.Module):
     def __init__(self, env):
         super().__init__()
         self.fc1 = nn.Linear(
-            np.array(env.single_observation_space.shape).prod() + np.prod(env.single_action_space.shape),
+            np.array(env.single_observation_space.shape).prod()
+            + np.prod(env.single_action_space.shape),
             256,
         )
         self.fc2 = nn.Linear(256, 256)
@@ -455,7 +457,9 @@ class Actor(nn.Module):
         mean = self.fc_mean(x)
         log_std = self.fc_logstd(x)
         log_std = torch.tanh(log_std)
-        log_std = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (log_std + 1)  # From SpinUp / Denis Yarats
+        log_std = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (
+            log_std + 1
+        )  # From SpinUp / Denis Yarats
 
         return mean, log_std
 
@@ -501,7 +505,8 @@ poetry run pip install "stable_baselines3==2.0.0a1"
     writer = SummaryWriter(f"runs/{run_name}")
     writer.add_text(
         "hyperparameters",
-        "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
+        "|param|value|\n|-|-|\n%s"
+        % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
     )
 
     # TRY NOT TO MODIFY: seeding
@@ -514,10 +519,10 @@ poetry run pip install "stable_baselines3==2.0.0a1"
     print("Using device:", device)
 
     # env setup
-    envs = gym.vector.SyncVectorEnv(
-        [make_env() for i in range(args.num_envs)]
+    envs = gym.vector.SyncVectorEnv([make_env() for i in range(args.num_envs)])
+    assert isinstance(envs.single_action_space, gym.spaces.Box), (
+        "only continuous action space is supported"
     )
-    assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
     rend_env = MultiAgentEnv(**env_config)
     rend_env = MultiAgentEnvWrapper(rend_env)
@@ -577,9 +582,15 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                 # print(f"Structure of final_info at global_step={global_step}: {infos['episode']['r']}")
                 if infos is not None:
                     # print(f"global_step={global_step}, episodic_return={infos['episode']['r']}, episodic_length={infos['episode']['l']}")
-                    writer.add_scalar("charts/episodic_return", np.mean(infos["episode"]["r"]), global_step)
-                    writer.add_scalar("charts/episodic_length", np.mean(infos["episode"]["l"]), global_step)
-                    print(f"global_step={global_step}, episodic_return={infos['episode']['r']}, episodic_length={infos['episode']['l']}")
+                    writer.add_scalar(
+                        "charts/episodic_return", np.mean(infos["episode"]["r"]), global_step
+                    )
+                    writer.add_scalar(
+                        "charts/episodic_length", np.mean(infos["episode"]["l"]), global_step
+                    )
+                    print(
+                        f"global_step={global_step}, episodic_return={infos['episode']['r']}, episodic_length={infos['episode']['l']}"
+                    )
                     # print("Final Info:", infos["final_info"])
                 else:
                     print(f"Warning: 'final_info' is None at global_step={global_step}.")
@@ -603,8 +614,12 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                 next_state_actions, next_state_log_pi, _ = actor.get_action(data.next_observations)
                 qf1_next_target = qf1_target(data.next_observations, next_state_actions)
                 qf2_next_target = qf2_target(data.next_observations, next_state_actions)
-                min_qf_next_target = torch.min(qf1_next_target, qf2_next_target) - alpha * next_state_log_pi
-                next_q_value = data.rewards.flatten() + (1 - data.dones.flatten()) * args.gamma * (min_qf_next_target).view(-1)
+                min_qf_next_target = (
+                    torch.min(qf1_next_target, qf2_next_target) - alpha * next_state_log_pi
+                )
+                next_q_value = data.rewards.flatten() + (1 - data.dones.flatten()) * args.gamma * (
+                    min_qf_next_target
+                ).view(-1)
 
             qf1_a_values = qf1(data.observations, data.actions).view(-1)
             qf2_a_values = qf2(data.observations, data.actions).view(-1)
@@ -644,9 +659,13 @@ poetry run pip install "stable_baselines3==2.0.0a1"
             # update the target networks
             if global_step % args.target_network_frequency == 0:
                 for param, target_param in zip(qf1.parameters(), qf1_target.parameters()):
-                    target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
+                    target_param.data.copy_(
+                        args.tau * param.data + (1 - args.tau) * target_param.data
+                    )
                 for param, target_param in zip(qf2.parameters(), qf2_target.parameters()):
-                    target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
+                    target_param.data.copy_(
+                        args.tau * param.data + (1 - args.tau) * target_param.data
+                    )
 
             if global_step % 100 == 0:
                 writer.add_scalar("losses/qf1_values", qf1_a_values.mean().item(), global_step)
@@ -669,24 +688,21 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                 # deterministic rollout
                 with torch.no_grad():
                     deterministic_actions, _, _ = actor.get_action(torch.Tensor(obs).to(device))
-                
 
-            #if global_step % 1000 == 0:
-                # # Ensure the 'models/' directory exists
-                # os.makedirs("models", exist_ok=True)
-                # # Save model parameters
-                # torch.save({'actor_state_dict': actor.state_dict(),
-                #     'qf1_state_dict': qf1.state_dict(),
-                #     'qf2_state_dict': qf2.state_dict(),
-                #     'qf1_target_state_dict': qf1_target.state_dict(),
-                #     'qf2_target_state_dict': qf2_target.state_dict(),
-                #     'actor_optimizer_state_dict': actor_optimizer.state_dict(),
-                #     'q_optimizer_state_dict': q_optimizer.state_dict(),
-                #     'log_alpha': log_alpha if args.autotune else None,
-                #     'a_optimizer_state_dict': a_optimizer.state_dict() if args.autotune else None,
-                # }, f"models/{run_name}.pth")
-                
-
+            # if global_step % 1000 == 0:
+            # # Ensure the 'models/' directory exists
+            # os.makedirs("models", exist_ok=True)
+            # # Save model parameters
+            # torch.save({'actor_state_dict': actor.state_dict(),
+            #     'qf1_state_dict': qf1.state_dict(),
+            #     'qf2_state_dict': qf2.state_dict(),
+            #     'qf1_target_state_dict': qf1_target.state_dict(),
+            #     'qf2_target_state_dict': qf2_target.state_dict(),
+            #     'actor_optimizer_state_dict': actor_optimizer.state_dict(),
+            #     'q_optimizer_state_dict': q_optimizer.state_dict(),
+            #     'log_alpha': log_alpha if args.autotune else None,
+            #     'a_optimizer_state_dict': a_optimizer.state_dict() if args.autotune else None,
+            # }, f"models/{run_name}.pth")
 
     envs.close()
     writer.close()

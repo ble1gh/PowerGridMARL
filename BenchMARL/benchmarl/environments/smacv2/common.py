@@ -4,7 +4,7 @@
 #  LICENSE file in the root directory of this source tree.
 #
 import copy
-from typing import Callable, Dict, List, Optional
+from collections.abc import Callable
 
 import torch
 from tensordict import TensorDictBase
@@ -21,13 +21,11 @@ class Smacv2Class(TaskClass):
         self,
         num_envs: int,
         continuous_actions: bool,
-        seed: Optional[int],
+        seed: int | None,
         device: DEVICE_TYPING,
     ) -> Callable[[], EnvBase]:
         config = copy.deepcopy(self.config)
-        return lambda: SMACv2Env(
-            categorical_actions=True, seed=seed, device=device, **config
-        )
+        return lambda: SMACv2Env(categorical_actions=True, seed=seed, device=device, **config)
 
     def supports_continuous_actions(self) -> bool:
         return False
@@ -41,16 +39,16 @@ class Smacv2Class(TaskClass):
     def max_steps(self, env: EnvBase) -> int:
         return env.episode_limit
 
-    def group_map(self, env: EnvBase) -> Dict[str, List[str]]:
+    def group_map(self, env: EnvBase) -> dict[str, list[str]]:
         return env.group_map
 
-    def state_spec(self, env: EnvBase) -> Optional[Composite]:
+    def state_spec(self, env: EnvBase) -> Composite | None:
         observation_spec = env.observation_spec.clone()
         del observation_spec["info"]
         del observation_spec["agents"]
         return observation_spec
 
-    def action_mask_spec(self, env: EnvBase) -> Optional[Composite]:
+    def action_mask_spec(self, env: EnvBase) -> Composite | None:
         observation_spec = env.observation_spec.clone()
         del observation_spec["info"]
         del observation_spec["state"]
@@ -64,7 +62,7 @@ class Smacv2Class(TaskClass):
         del observation_spec[("agents", "action_mask")]
         return observation_spec
 
-    def info_spec(self, env: EnvBase) -> Optional[Composite]:
+    def info_spec(self, env: EnvBase) -> Composite | None:
         observation_spec = env.observation_spec.clone()
         del observation_spec["state"]
         del observation_spec["agents"]
@@ -74,16 +72,14 @@ class Smacv2Class(TaskClass):
         return env.full_action_spec
 
     @staticmethod
-    def log_info(batch: TensorDictBase) -> Dict[str, float]:
+    def log_info(batch: TensorDictBase) -> dict[str, float]:
         done = batch.get(("next", "done")).squeeze(-1)
         return {
             "collection/info/win_rate": batch.get(("next", "info", "battle_won"))[done]
             .to(torch.float)
             .mean()
             .item(),
-            "collection/info/episode_limit_rate": batch.get(
-                ("next", "info", "episode_limit")
-            )[done]
+            "collection/info/episode_limit_rate": batch.get(("next", "info", "episode_limit"))[done]
             .to(torch.float)
             .mean()
             .item(),

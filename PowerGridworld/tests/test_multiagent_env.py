@@ -1,8 +1,8 @@
-from tests.conftest import multi_agent_episode_runner
-
 from gridworld import MultiAgentEnv, MultiComponentEnv
-from gridworld.agents.vehicles import EVChargingEnv
 from gridworld.agents.pv import PVEnv
+from gridworld.agents.vehicles import EVChargingEnv
+
+from tests.conftest import multi_agent_episode_runner
 
 
 def test_ev_charging_multiagent_env(common_config, ev_charging_config, pf_config):
@@ -10,44 +10,39 @@ def test_ev_charging_multiagent_env(common_config, ev_charging_config, pf_config
 
     agents = [
         {
-            "name": "ev-charging-{}".format(i),
+            "name": f"ev-charging-{i}",
             "bus": "675c",
             "cls": EVChargingEnv,
-            "config": ev_charging_config
-        } for i in range(3)
+            "config": ev_charging_config,
+        }
+        for i in range(3)
     ]
 
     # Configuration of the multi-agent environment.
-    env_config = {
-        "common_config": common_config,
-        "pf_config": pf_config,
-        "agents": agents
-    }
+    env_config = {"common_config": common_config, "pf_config": pf_config, "agents": agents}
 
     env = MultiAgentEnv(**env_config)
 
     assert multi_agent_episode_runner(env)
 
 
-
-def test_multi_component_building_multiagent_env(common_config, pf_config, multicomponent_building_config):
+def test_multi_component_building_multiagent_env(
+    common_config, pf_config, multicomponent_building_config
+):
     """Test multiagent env with three multi-component building agents."""
 
     agents = [
         {
-            "name": "building-{}".format(i),
+            "name": f"building-{i}",
             "bus": "675c",
             "cls": MultiComponentEnv,
             "config": {"components": multicomponent_building_config},
-        } for i in range(3)
+        }
+        for i in range(3)
     ]
 
     # Configuration of the multi-agent environment.
-    env_config = {
-        "common_config": common_config,
-        "pf_config": pf_config,
-        "agents": agents
-    }
+    env_config = {"common_config": common_config, "pf_config": pf_config, "agents": agents}
 
     env = MultiAgentEnv(**env_config)
 
@@ -63,11 +58,11 @@ def test_heterogeneous_multiagent_env(
 ):
     """Test multiagent env with three heterogeneous agents."""
 
-    building_agent ={
+    building_agent = {
         "name": "building",
         "bus": "675c",
         "cls": MultiComponentEnv,
-        "config": {"components": multicomponent_building_config}
+        "config": {"components": multicomponent_building_config},
     }
 
     # Next, build the PV and EV charging envs
@@ -75,23 +70,14 @@ def test_heterogeneous_multiagent_env(
         "name": "ev-charging",
         "bus": "675c",
         "cls": EVChargingEnv,
-        "config": ev_charging_config
+        "config": ev_charging_config,
     }
 
-    pv_agent = {
-        "name": "pv",
-        "bus": "675c",
-        "cls": PVEnv,
-        "config": pv_array_config
-    }
+    pv_agent = {"name": "pv", "bus": "675c", "cls": PVEnv, "config": pv_array_config}
 
     agents = [building_agent, ev_agent, pv_agent]
 
-    env_config = {
-        "common_config": common_config,
-        "pf_config": pf_config,
-        "agents": agents
-    }
+    env_config = {"common_config": common_config, "pf_config": pf_config, "agents": agents}
 
     env = MultiAgentEnv(**env_config)
 

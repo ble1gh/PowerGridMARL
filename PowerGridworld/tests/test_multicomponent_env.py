@@ -1,6 +1,6 @@
-from tests.conftest import multi_agent_episode_runner
-
 from gridworld import MultiComponentEnv
+
+from tests.conftest import multi_agent_episode_runner
 
 
 def test_default_multicomponent_env(multicomponent_building_config):

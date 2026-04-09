@@ -4,8 +4,8 @@
 #  LICENSE file in the root directory of this source tree.
 #
 
-from dataclasses import dataclass, MISSING
-from typing import Dict, Iterable, Tuple, Type
+from collections.abc import Iterable
+from dataclasses import MISSING, dataclass
 
 from tensordict import TensorDictBase
 from tensordict.nn import TensorDictModule, TensorDictSequential
@@ -39,7 +39,7 @@ class Vdn(Algorithm):
 
     def _get_loss(
         self, group: str, policy_for_loss: TensorDictModule, continuous: bool
-    ) -> Tuple[LossModule, bool]:
+    ) -> tuple[LossModule, bool]:
         if continuous:
             raise NotImplementedError("Vdn is not compatible with continuous actions.")
         else:
@@ -67,7 +67,7 @@ class Vdn(Algorithm):
 
             return loss_module, True
 
-    def _get_parameters(self, group: str, loss: LossModule) -> Dict[str, Iterable]:
+    def _get_parameters(self, group: str, loss: LossModule) -> dict[str, Iterable]:
         return {
             "loss": loss.parameters(),
         }
@@ -81,9 +81,7 @@ class Vdn(Algorithm):
             self.action_spec[group, "action"].space.n,
         ]
 
-        actor_input_spec = Composite(
-            {group: self.observation_spec[group].clone().to(self.device)}
-        )
+        actor_input_spec = Composite({group: self.observation_spec[group].clone().to(self.device)})
 
         actor_output_spec = Composite(
             {
@@ -196,7 +194,7 @@ class VdnConfig(AlgorithmConfig):
     loss_function: str = MISSING
 
     @staticmethod
-    def associated_class() -> Type[Algorithm]:
+    def associated_class() -> type[Algorithm]:
         return Vdn
 
     @staticmethod

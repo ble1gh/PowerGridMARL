@@ -1,4 +1,5 @@
-from dataclasses import dataclass, MISSING
+from dataclasses import MISSING, dataclass
+
 
 @dataclass
 class TaskConfig:
@@ -19,7 +20,9 @@ class TaskConfig:
     load_noise_std: float = MISSING  # DEPRECATED legacy noise param
     load_forecast_noise_std: float = MISSING  # Per-node forecast noise std
     load_actual_noise_std: float = MISSING  # Per-node actual noise std (on top of forecast)
-    include_load_in_agent_obs: bool = MISSING  # If True, append normalized load coefficient to agent obs
+    include_load_in_agent_obs: bool = (
+        MISSING  # If True, append normalized load coefficient to agent obs
+    )
     variable_agent_count: bool = MISSING
 
     # EV agent parameters
@@ -31,7 +34,7 @@ class TaskConfig:
     rescale_spaces: bool = MISSING
     unserved_penalty: float = MISSING
     reward_scale: float = MISSING
-    
+
     # Global reward penalty scaling parameters
     power_loss_penalty: float = MISSING
     voltage_penalty: float = MISSING
@@ -44,7 +47,7 @@ class TaskConfig:
     pv_scaling_factor: float = MISSING
     pv_profile_noise_std: float = MISSING  # Std dev of Gaussian noise on PV profile
     pv_grid_aware: bool = MISSING
-    
+
     # Energy Storage agent parameters
     storage_range_min: float = MISSING
     storage_range_max: float = MISSING

@@ -4,8 +4,8 @@
 #  LICENSE file in the root directory of this source tree.
 #
 
-from dataclasses import dataclass, MISSING
-from typing import Dict, Iterable, Tuple, Type
+from collections.abc import Iterable
+from dataclasses import MISSING, dataclass
 
 import torch
 from tensordict import TensorDictBase
@@ -57,7 +57,7 @@ class Mappo(Algorithm):
         scale_mapping: str,
         use_tanh_normal: bool,
         minibatch_advantage: bool,
-        **kwargs
+        **kwargs,
     ):
         super().__init__(**kwargs)
 
@@ -77,7 +77,7 @@ class Mappo(Algorithm):
 
     def _get_loss(
         self, group: str, policy_for_loss: TensorDictModule, continuous: bool
-    ) -> Tuple[LossModule, bool]:
+    ) -> tuple[LossModule, bool]:
         # Loss
         loss_module = ClipPPOLoss(
             actor=policy_for_loss,
@@ -103,7 +103,7 @@ class Mappo(Algorithm):
         )
         return loss_module, False
 
-    def _get_parameters(self, group: str, loss: ClipPPOLoss) -> Dict[str, Iterable]:
+    def _get_parameters(self, group: str, loss: ClipPPOLoss) -> dict[str, Iterable]:
         return {
             "loss_objective": list(loss.actor_network_params.flatten_keys().values()),
             "loss_critic": list(loss.critic_network_params.flatten_keys().values()),
@@ -122,9 +122,7 @@ class Mappo(Algorithm):
                 self.action_spec[group, "action"].space.n,
             ]
 
-        actor_input_spec = Composite(
-            {group: self.observation_spec[group].clone().to(self.device)}
-        )
+        actor_input_spec = Composite({group: self.observation_spec[group].clone().to(self.device)})
 
         actor_output_spec = Composite(
             {
@@ -157,9 +155,7 @@ class Mappo(Algorithm):
                 spec=self.action_spec[group, "action"],
                 in_keys=[(group, "loc"), (group, "scale")],
                 out_keys=[(group, "action")],
-                distribution_class=(
-                    IndependentNormal if not self.use_tanh_normal else TanhNormal
-                ),
+                distribution_class=(IndependentNormal if not self.use_tanh_normal else TanhNormal),
                 distribution_kwargs=(
                     {
                         "low": self.action_spec[(group, "action")].space.low,
@@ -221,9 +217,7 @@ class Mappo(Algorithm):
         if nested_terminated_key not in keys:
             batch.set(
                 nested_terminated_key,
-                batch.get(("next", "terminated"))
-                .unsqueeze(-1)
-                .expand((*group_shape, 1)),
+                batch.get(("next", "terminated")).unsqueeze(-1).expand((*group_shape, 1)),
             )
 
         if nested_reward_key not in keys:
@@ -235,8 +229,7 @@ class Mappo(Algorithm):
         loss = self.get_loss_and_updater(group)[0]
         if self.minibatch_advantage:
             increment = -(
-                -self.experiment.config.train_minibatch_size(self.on_policy)
-                // batch.shape[1]
+                -self.experiment.config.train_minibatch_size(self.on_policy) // batch.shape[1]
             )
         else:
             increment = batch.batch_size[0] + 1
@@ -258,12 +251,8 @@ class Mappo(Algorithm):
         batch = torch.cat(minibatches, dim=0)
         return batch
 
-    def process_loss_vals(
-        self, group: str, loss_vals: TensorDictBase
-    ) -> TensorDictBase:
-        loss_vals.set(
-            "loss_objective", loss_vals["loss_objective"] + loss_vals["loss_entropy"]
-        )
+    def process_loss_vals(self, group: str, loss_vals: TensorDictBase) -> TensorDictBase:
+        loss_vals.set("loss_objective", loss_vals["loss_objective"] + loss_vals["loss_entropy"])
         del loss_vals["loss_entropy"]
         return loss_vals
 
@@ -308,9 +297,7 @@ class Mappo(Algorithm):
         )
         if self.share_param_critic:
             expand_module = TensorDictModule(
-                lambda value: value.unsqueeze(-2).expand(
-                    *value.shape[:-1], n_agents, 1
-                ),
+                lambda value: value.unsqueeze(-2).expand(*value.shape[:-1], n_agents, 1),
                 in_keys=["state_value"],
                 out_keys=[(group, "state_value")],
             )
@@ -334,7 +321,7 @@ class MappoConfig(AlgorithmConfig):
     minibatch_advantage: bool = MISSING
 
     @staticmethod
-    def associated_class() -> Type[Algorithm]:
+    def associated_class() -> type[Algorithm]:
         return Mappo
 
     @staticmethod

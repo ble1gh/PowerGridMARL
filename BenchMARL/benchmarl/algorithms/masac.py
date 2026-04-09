@@ -4,15 +4,15 @@
 #  LICENSE file in the root directory of this source tree.
 #
 import warnings
-from dataclasses import dataclass, MISSING
-from typing import Dict, Iterable, Optional, Tuple, Type, Union
+from collections.abc import Iterable
+from dataclasses import MISSING, dataclass
 
 import torch
 import torch.nn.functional
 from tensordict import TensorDictBase
 from tensordict.nn import NormalParamExtractor, TensorDictModule, TensorDictSequential
 from tensordict.utils import _unravel_key_to_tuple, unravel_key
-from torch.distributions import Categorical, Beta, Independent
+from torch.distributions import Categorical
 from torchrl.data import Composite, Unbounded
 from torchrl.modules import (
     IndependentNormal,
@@ -23,9 +23,9 @@ from torchrl.modules import (
 from torchrl.objectives import DiscreteSACLoss, LossModule, SACLoss, ValueEstimators
 
 from benchmarl.algorithms.common import Algorithm, AlgorithmConfig
-from benchmarl.models.common import ModelConfig
 from benchmarl.beta_param_extractor import BetaParamExtractor
 from benchmarl.independent_beta import IndependentBeta
+from benchmarl.models.common import ModelConfig
 
 
 class Masac(Algorithm):
@@ -67,11 +67,11 @@ class Masac(Algorithm):
         num_qvalue_nets: int,
         loss_function: str,
         delay_qvalue: bool,
-        target_entropy: Union[float, str],
+        target_entropy: float | str,
         discrete_target_entropy_weight: float,
         alpha_init: float,
-        min_alpha: Optional[float],
-        max_alpha: Optional[float],
+        min_alpha: float | None,
+        max_alpha: float | None,
         fixed_alpha: bool,
         scale_mapping: str,
         use_tanh_normal: bool,
@@ -104,7 +104,7 @@ class Masac(Algorithm):
 
     def _get_loss(
         self, group: str, policy_for_loss: TensorDictModule, continuous: bool
-    ) -> Tuple[LossModule, bool]:
+    ) -> tuple[LossModule, bool]:
         if continuous:
             # Loss
             loss_module = SACLoss(
@@ -161,13 +161,11 @@ class Masac(Algorithm):
                 terminated=(group, "terminated"),
             )
 
-        loss_module.make_value_estimator(
-            ValueEstimators.TD0, gamma=self.experiment_config.gamma
-        )
+        loss_module.make_value_estimator(ValueEstimators.TD0, gamma=self.experiment_config.gamma)
 
         return loss_module, True
 
-    def _get_parameters(self, group: str, loss: LossModule) -> Dict[str, Iterable]:
+    def _get_parameters(self, group: str, loss: LossModule) -> dict[str, Iterable]:
         items = {
             "loss_actor": list(loss.actor_network_params.flatten_keys().values()),
             "loss_qvalue": list(loss.qvalue_network_params.flatten_keys().values()),
@@ -188,11 +186,8 @@ class Masac(Algorithm):
                 *self.action_spec[group, "action"].shape,
                 self.action_spec[group, "action"].space.n,
             ]
-        print(
-            f"Creating actor module for group {group} with logits shape {logits_shape}")
-        actor_input_spec = Composite(
-            {group: self.observation_spec[group].clone().to(self.device)}
-        )
+        print(f"Creating actor module for group {group} with logits shape {logits_shape}")
+        actor_input_spec = Composite({group: self.observation_spec[group].clone().to(self.device)})
         print(f"Number of agents in group {group}: {n_agents}")
         actor_output_spec = Composite(
             {
@@ -306,9 +301,7 @@ class Masac(Algorithm):
         if nested_terminated_key not in keys:
             batch.set(
                 nested_terminated_key,
-                batch.get(("next", "terminated"))
-                .unsqueeze(-1)
-                .expand((*group_shape, 1)),
+                batch.get(("next", "terminated")).unsqueeze(-1).expand((*group_shape, 1)),
             )
 
         if nested_reward_key not in keys:
@@ -383,9 +376,7 @@ class Masac(Algorithm):
         )
         modules.append(
             TensorDictModule(
-                lambda action: _others_actions(
-                    action, n_actions=n_actions, n_agents=n_agents
-                ),
+                lambda action: _others_actions(action, n_actions=n_actions, n_agents=n_agents),
                 in_keys=[(group, "logits")],
                 out_keys=[(group, "others_action")],
             )
@@ -393,11 +384,7 @@ class Masac(Algorithm):
         critic_input_spec = Composite(
             {
                 group: Composite(
-                    {
-                        "others_action": Unbounded(
-                            shape=(n_agents, n_actions * (n_agents - 1))
-                        )
-                    },
+                    {"others_action": Unbounded(shape=(n_agents, n_actions * (n_agents - 1)))},
                     shape=(n_agents,),
                 ),
             },
@@ -405,9 +392,7 @@ class Masac(Algorithm):
         )
 
         if self.state_spec is not None:
-            global_state_key = _unravel_key_to_tuple(
-                list(self.state_spec.keys(True, True))[0]
-            )
+            global_state_key = _unravel_key_to_tuple(list(self.state_spec.keys(True, True))[0])
             new_global_state_key = list(global_state_key)
             new_global_state_key[-1] = new_global_state_key[-1] + "_expanded"
             new_global_state_key = tuple(new_global_state_key)
@@ -469,9 +454,7 @@ class Masac(Algorithm):
             )
             critic_input_spec[group].update(
                 {
-                    process_key(key): val.reshape(
-                        *val.shape[1:-1], val.shape[-1] * n_agents
-                    )
+                    process_key(key): val.reshape(*val.shape[1:-1], val.shape[-1] * n_agents)
                     .unsqueeze(0)
                     .expand(n_agents, *val.shape[1:-1], val.shape[-1] * n_agents)
                     .to(self.device)
@@ -500,9 +483,7 @@ class Masac(Algorithm):
         modules = []
 
         if self.share_param_critic:
-            critic_output_spec = Composite(
-                {"state_action_value": Unbounded(shape=(1,))}
-            )
+            critic_output_spec = Composite({"state_action_value": Unbounded(shape=(1,))})
         else:
             critic_output_spec = Composite(
                 {
@@ -514,7 +495,6 @@ class Masac(Algorithm):
             )
 
         if self.state_spec is not None:
-
             modules.append(
                 TensorDictModule(
                     lambda action: action.reshape(*action.shape[:-2], -1),
@@ -547,11 +527,7 @@ class Masac(Algorithm):
 
         else:
             critic_input_spec = Composite(
-                {
-                    group: self.observation_spec[group]
-                    .clone()
-                    .update(self.action_spec[group])
-                }
+                {group: self.observation_spec[group].clone().update(self.action_spec[group])}
             )
 
             modules.append(
@@ -571,9 +547,7 @@ class Masac(Algorithm):
         if self.share_param_critic:
             modules.append(
                 TensorDictModule(
-                    lambda value: value.unsqueeze(-2).expand(
-                        *value.shape[:-1], n_agents, 1
-                    ),
+                    lambda value: value.unsqueeze(-2).expand(*value.shape[:-1], n_agents, 1),
                     in_keys=["state_action_value"],
                     out_keys=[(group, "state_action_value")],
                 )
@@ -602,9 +576,7 @@ def _others_actions(logits, n_actions, n_agents):
     while len(indices.shape) < len(actions.shape):
         indices = indices.unsqueeze(0)
     indices = indices.expand(actions.shape)
-    actions = actions.masked_select(
-        ~indices
-    )  # shape ..., n_agents, n_agents-1, n_actions
+    actions = actions.masked_select(~indices)  # shape ..., n_agents, n_agents-1, n_actions
 
     actions = actions.view(*batch_size, n_agents, (n_agents - 1) * n_actions)
     # out shape ..., n_agents, n_agents-1 * n_actions
@@ -619,11 +591,11 @@ class MasacConfig(AlgorithmConfig):
     num_qvalue_nets: int = MISSING
     loss_function: str = MISSING
     delay_qvalue: bool = MISSING
-    target_entropy: Union[float, str] = MISSING
+    target_entropy: float | str = MISSING
     discrete_target_entropy_weight: float = MISSING
     alpha_init: float = MISSING
-    min_alpha: Optional[float] = MISSING
-    max_alpha: Optional[float] = MISSING
+    min_alpha: float | None = MISSING
+    max_alpha: float | None = MISSING
     fixed_alpha: bool = MISSING
     scale_mapping: str = MISSING
     use_tanh_normal: bool = MISSING
@@ -632,7 +604,7 @@ class MasacConfig(AlgorithmConfig):
     coupled_discrete_values: bool = MISSING
 
     @staticmethod
-    def associated_class() -> Type[Algorithm]:
+    def associated_class() -> type[Algorithm]:
         return Masac
 
     @staticmethod

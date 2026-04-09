@@ -4,31 +4,27 @@
 #  LICENSE file in the root directory of this source tree.
 #
 
+import io
 import json
 import os
 import warnings
 from collections.abc import MutableMapping, Sequence
 from pathlib import Path
+from typing import Any
 
-from typing import Any, Dict, List, Optional
-
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torchrl
-
+import wandb
+from PIL import Image
 from tensordict import TensorDictBase
 from torch import Tensor
-
 from torchrl.record import TensorboardLogger
 from torchrl.record.loggers import get_logger
 from torchrl.record.loggers.wandb import WandbLogger
 
 from benchmarl.environments import Task
-
-import io
-from PIL import Image
-import wandb
-import matplotlib.pyplot as plt
 
 
 class Logger:
@@ -41,10 +37,10 @@ class Logger:
         environment_name: str,
         task_name: str,
         model_name: str,
-        group_map: Dict[str, List[str]],
+        group_map: dict[str, list[str]],
         seed: int,
         project_name: str,
-        wandb_extra_kwargs: Dict[str, Any],
+        wandb_extra_kwargs: dict[str, Any],
     ):
         self.experiment_config = experiment_config
         self.algorithm_name = algorithm_name
@@ -66,7 +62,7 @@ class Logger:
         else:
             self.json_writer = None
 
-        self.loggers: List[torchrl.record.loggers.Logger] = []
+        self.loggers: list[torchrl.record.loggers.Logger] = []
         for logger_name in experiment_config.loggers:
             wandb_project = wandb_extra_kwargs.get("project", project_name)
             if wandb_project != project_name:
@@ -105,9 +101,7 @@ class Logger:
                     for key, value in dictionary.items():
                         new_key = parent_key + separator + key if parent_key else key
                         if isinstance(value, MutableMapping):
-                            items.extend(
-                                flatten(value, new_key, separator=separator).items()
-                            )
+                            items.extend(flatten(value, new_key, separator=separator).items())
                         elif isinstance(value, Sequence):
                             for i, v in enumerate(value):
                                 items.append((new_key + separator + str(i), v))
@@ -156,9 +150,7 @@ class Logger:
             if "info" in batch.get(("next", group)).keys():
                 to_log.update(
                     {
-                        f"collection/{group}/info/{key}": value.to(torch.float)
-                        .mean()
-                        .item()
+                        f"collection/{group}/info/{key}": value.to(torch.float).mean().item()
                         for key, value in batch.get(("next", group, "info")).items()
                     }
                 )
@@ -181,23 +173,18 @@ class Logger:
     def log_training(self, group: str, training_td: TensorDictBase, step: int):
         if not len(self.loggers):
             return
-        to_log = {
-            f"train/{group}/{key}": value.mean().item()
-            for key, value in training_td.items()
-        }
+        to_log = {f"train/{group}/{key}": value.mean().item() for key, value in training_td.items()}
         self.log(to_log, step=step)
 
     def log_evaluation(
         self,
-        rollouts: List[TensorDictBase],
+        rollouts: list[TensorDictBase],
         total_frames: int,
         step: int,
-        video_frames: Optional[List] = None,
+        video_frames: list | None = None,
         rollout_fig=None,
     ):
-        if (
-            not len(self.loggers) and not self.experiment_config.create_json
-        ) or not len(rollouts):
+        if (not len(self.loggers) and not self.experiment_config.create_json) or not len(rollouts):
             return
 
         # Cut rollouts at first done
@@ -218,15 +205,31 @@ class Logger:
         to_log = {}
         json_metrics = {}
         for group in self.group_map.keys():
-            # returns has shape (n_episodes)
-            returns = torch.stack(
-                [self._get_reward(group, td).sum(0).mean() for td in rollouts],
-                dim=0,
-            )
-            self._log_min_mean_max(
-                to_log, f"eval/{group}/reward/episode_reward", returns
-            )
+            # Compute per-episode masked mean return for this group
+            ep_returns = []
+            ep_n_active = []
+            for td in rollouts:
+                reward = self._get_reward(group, td)  # (T, n_agents, 1)
+                per_agent_return = reward.sum(0)  # (n_agents, 1)
+                mask = self._get_active_mask(group, td)  # (T, n_agents) or None
+                if mask is not None:
+                    ever_active = mask.any(dim=0).float()  # (n_agents,)
+                    n_active = ever_active.sum().clamp(min=1)
+                    masked_return = (per_agent_return.squeeze(-1) * ever_active).sum() / n_active
+                else:
+                    n_active = torch.tensor(
+                        float(per_agent_return.shape[0]),
+                        device=per_agent_return.device,
+                    )
+                    masked_return = per_agent_return.mean()
+                ep_returns.append(masked_return)
+                ep_n_active.append(n_active)
+            returns = torch.stack(ep_returns, dim=0)  # (n_episodes,)
+            n_actives = torch.stack(ep_n_active, dim=0)  # (n_episodes,)
+            self._log_min_mean_max(to_log, f"eval/{group}/reward/episode_reward", returns)
             json_metrics[group + "_return"] = returns
+            # S1b: log active agent count per eval episode
+            self._log_min_mean_max(to_log, f"eval/{group}/n_active_agents", n_actives)
 
         mean_group_return = self._log_global_episode_reward(
             list(json_metrics.values()), to_log, prefix="eval"
@@ -234,42 +237,41 @@ class Logger:
         # mean_group_return has shape (n_episodes) as we take the mean groups
         json_metrics["return"] = mean_group_return
 
-        to_log["eval/reward/episode_len_mean"] = sum(
-            td.batch_size[0] for td in rollouts
-        ) / len(rollouts)
+        to_log["eval/reward/episode_len_mean"] = sum(td.batch_size[0] for td in rollouts) / len(
+            rollouts
+        )
 
         if self.json_writer is not None:
             self.json_writer.write(
                 metrics=json_metrics,
                 total_frames=total_frames,
-                evaluation_step=total_frames
-                // self.experiment_config.evaluation_interval,
+                evaluation_step=total_frames // self.experiment_config.evaluation_interval,
             )
             json_file = str(self.json_writer.path)
             for logger in self.loggers:
                 if isinstance(logger, WandbLogger):
-                    logger.experiment.save(
-                        json_file, base_path=os.path.dirname(json_file)
-                    )
-        
-        # Add the custom plot(s) to the log dictionary if they exist.
-        # rollout_fig can be a single figure or a list of figures.
+                    logger.experiment.save(json_file, base_path=os.path.dirname(json_file))
+
+        # Add the custom plot(s) to the unified log dictionary.
+        # Images must ride in the SAME wandb.log() call as scalar metrics;
+        # separate wandb.log(commit=False) calls for media vs scalars can
+        # cause WandB to create phantom duplicate panels in the auto-workspace.
         if rollout_fig is not None:
             figs = rollout_fig if isinstance(rollout_fig, list) else [rollout_fig]
             for fig_idx, fig in enumerate(figs):
                 suffix = "" if len(figs) == 1 else f"_{fig_idx}"
                 log_key = f"eval/rollout_plot{suffix}"
-                buf = io.BytesIO()
-                fig.savefig(buf, format='png')
-                buf.seek(0)
-                img = Image.open(buf)
-                buf.seek(0)
+                # wandb.Image(fig) renders to PNG immediately, so
+                # fig.clf() / plt.close() afterwards is safe.
+                to_log[log_key] = wandb.Image(fig)
+                # Non-WandB loggers: send via their image API if available
                 for logger in self.loggers:
-                    if isinstance(logger, WandbLogger):
-                        logger.experiment.log({log_key: wandb.Image(img)}, commit=False)
-                    elif hasattr(logger, "log_image"):
-                        logger.log_image(log_key, img, step=step)
-                buf.close()
+                    if not isinstance(logger, WandbLogger) and hasattr(logger, "log_image"):
+                        buf = io.BytesIO()
+                        fig.savefig(buf, format="png")
+                        buf.seek(0)
+                        logger.log_image(log_key, Image.open(buf), step=step)
+                        buf.close()
                 fig.clf()
                 plt.close(fig)
 
@@ -287,9 +289,7 @@ class Logger:
                     # Other loggers cannot deal with odd video sizes so we check if the video dimensions are odd and make them even
                     for index in (-1, -2):
                         if vid.shape[index] % 2 != 0:
-                            vid = vid.index_select(
-                                index, torch.arange(1, vid.shape[index])
-                            )
+                            vid = vid.index_select(index, torch.arange(1, vid.shape[index]))
                     # End of check
 
                     logger.log_video("eval_video", vid, step=step)
@@ -299,12 +299,14 @@ class Logger:
             if isinstance(logger, WandbLogger):
                 logger.experiment.log({}, commit=True)
 
-    def log(self, dict_to_log: Dict, step: int = None):
+    def log(self, dict_to_log: dict, step: int = None):
         for logger in self.loggers:
             if isinstance(logger, WandbLogger):
                 logger.experiment.log(dict_to_log, commit=False)
             else:
                 for key, value in dict_to_log.items():
+                    if not isinstance(value, (int, float)):
+                        continue  # skip non-scalar entries (e.g. wandb.Image)
                     logger.log_scalar(key.replace("/", "_"), value, step=step)
 
     def finish(self):
@@ -314,19 +316,13 @@ class Logger:
 
                 wandb.finish()
 
-    def _get_reward(
-        self, group: str, td: TensorDictBase, remove_agent_dim: bool = False
-    ):
+    def _get_reward(self, group: str, td: TensorDictBase, remove_agent_dim: bool = False):
         reward = td.get(("next", group, "reward"), None)
         if reward is None:
-            reward = (
-                td.get(("next", "reward")).expand(td.get(group).shape).unsqueeze(-1)
-            )
+            reward = td.get(("next", "reward")).expand(td.get(group).shape).unsqueeze(-1)
         return reward.mean(-2) if remove_agent_dim else reward
 
-    def _get_agents_done(
-        self, group: str, td: TensorDictBase, remove_agent_dim: bool = False
-    ):
+    def _get_agents_done(self, group: str, td: TensorDictBase, remove_agent_dim: bool = False):
         done = td.get(("next", group, "done"), None)
         if done is None:
             done = td.get(("next", "done")).expand(td.get(group).shape).unsqueeze(-1)
@@ -360,9 +356,7 @@ class Logger:
                 # We need to make sure td.get(group) is not None.
                 group_td = td.get(group, None)
                 if group_td is not None:
-                    episode_reward = global_episode_reward.expand(
-                        group_td.shape
-                    ).unsqueeze(-1)
+                    episode_reward = global_episode_reward.expand(group_td.shape).unsqueeze(-1)
 
         # If after all attempts, episode_reward is still None, we have a problem.
         if episode_reward is None:
@@ -375,24 +369,31 @@ class Logger:
 
         return episode_reward.mean(-2) if remove_agent_dim else episode_reward
 
+    @staticmethod
+    def _get_active_mask(group: str, td: TensorDictBase):
+        """Retrieve per-agent active mask for *group*, or None."""
+        mask = td.get((group, "active_mask"), None)
+        if mask is None:
+            mask = td.get(("next", group, "active_mask"), None)
+        return mask
+
     def _log_individual_and_group_rewards(
         self,
         group: str,
         batch: TensorDictBase,
         global_done: Tensor,
         any_episode_ended: bool,
-        to_log: Dict[str, Tensor],
+        to_log: dict[str, Tensor],
         prefix: str = "collection",
         log_individual_agents: bool = True,
     ):
         reward = self._get_reward(group, batch)  # Has agent dim
         episode_reward = self._get_episode_reward(group, batch)  # Has agent dim
         n_agents_in_group = episode_reward.shape[-2]
+        active_mask = self._get_active_mask(group, batch)  # (..., n_agents) or None
 
         # Add multiagent dim
-        unsqueeze_global_done = global_done.unsqueeze(-1).expand(
-            (*batch.get_item_shape(group), 1)
-        )
+        unsqueeze_global_done = global_done.unsqueeze(-1).expand((*batch.get_item_shape(group), 1))
         #######
         # All trajectories are considered done at the global done
         #######
@@ -400,6 +401,9 @@ class Logger:
         # 1. Here we log rewards from individual agent data
         if log_individual_agents:
             for i in range(n_agents_in_group):
+                # Skip agents that are never active in this batch
+                if active_mask is not None and not active_mask[..., i].any():
+                    continue
                 self._log_min_mean_max(
                     to_log,
                     f"{prefix}/{group}/reward/agent_{i}/reward",
@@ -413,32 +417,45 @@ class Logger:
                         episode_reward[..., i, :][agent_global_done],
                     )
 
-        # 2. Here we log rewards from group data taking the mean over agents
-        group_episode_reward = episode_reward.mean(-2)[global_done]
+        # 2. Group-level: masked mean over ever-active agents only.
+        # Use episode_reward != 0 as a proxy for "was active at some point
+        # during the episode" since the instantaneous active_mask at the done
+        # frame misses agents that departed mid-episode (EV random arrival).
+        if active_mask is not None:
+            # global_done is (…, 1); squeeze to (…) so boolean indexing
+            # covers only batch dims, preserving agent dim naturally.
+            done_2d = global_done.squeeze(-1)  # (n_envs, n_steps)
+            ep_done = episode_reward[done_2d]  # (n_episodes, n_agents, 1)
+            amask_done = active_mask[done_2d]  # (n_episodes, n_agents)
+            ever_active = (ep_done.squeeze(-1).abs() > 1e-8) | amask_done
+            n_ever = ever_active.float().sum(-1).clamp(min=1)  # (n_episodes,)
+            group_episode_reward = ep_done.squeeze(-1).sum(-1) / n_ever
+        else:
+            group_episode_reward = episode_reward.mean(-2)[global_done]
+
         if any_episode_ended:
             self._log_min_mean_max(
                 to_log, f"{prefix}/{group}/reward/episode_reward", group_episode_reward
             )
+            # S1b: log ever-active agent count at episode boundaries
+            if active_mask is not None:
+                self._log_min_mean_max(to_log, f"{prefix}/{group}/n_active_agents", n_ever)
         self._log_min_mean_max(to_log, f"{prefix}/reward/reward", reward)
 
         return group_episode_reward
 
     def _log_global_episode_reward(
-        self, episode_rewards: List[Tensor], to_log: Dict[str, Tensor], prefix: str
+        self, episode_rewards: list[Tensor], to_log: dict[str, Tensor], prefix: str
     ):
         # Each element in the list is the episode reward (with shape n_episodes) for the group at the global done,
         # so they will have same shape as done is shared
-        episode_rewards = torch.stack(episode_rewards, dim=0).mean(
-            0
-        )  # Mean over groups
+        episode_rewards = torch.stack(episode_rewards, dim=0).mean(0)  # Mean over groups
         if episode_rewards.numel() > 0:
-            self._log_min_mean_max(
-                to_log, f"{prefix}/reward/episode_reward", episode_rewards
-            )
+            self._log_min_mean_max(to_log, f"{prefix}/reward/episode_reward", episode_rewards)
 
         return episode_rewards
 
-    def _log_min_mean_max(self, to_log: Dict[str, Tensor], key: str, value: Tensor):
+    def _log_min_mean_max(self, to_log: dict[str, Tensor], key: str, value: Tensor):
         to_log.update(
             {
                 key + "_min": value.min().item(),
@@ -476,14 +493,10 @@ class JsonWriter:
         self.path = Path(folder) / Path(name)
         self.run_data = {"absolute_metrics": {}}
         self.data = {
-            environment_name: {
-                task_name: {algorithm_name: {f"seed_{seed}": self.run_data}}
-            }
+            environment_name: {task_name: {algorithm_name: {f"seed_{seed}": self.run_data}}}
         }
 
-    def write(
-        self, total_frames: int, metrics: Dict[str, List[Tensor]], evaluation_step: int
-    ):
+    def write(self, total_frames: int, metrics: dict[str, list[Tensor]], evaluation_step: int):
         """
         Writes a step into the json reporting file
 

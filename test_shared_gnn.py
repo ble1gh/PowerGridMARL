@@ -13,15 +13,15 @@ Usage:
     python test_shared_gnn.py
 """
 
+from types import SimpleNamespace
+
 import torch
 import torch_geometric.nn as tgnn
-from types import SimpleNamespace
+from benchmarl.algorithms.HGTeam import HGTeam, HGTeamConfig
+from benchmarl.models import HeteroGnnConfig, MlpConfig
+from benchmarl.models.heterognn import HeteroGNN
 from tensordict import TensorDict
 from torchrl.data import Bounded, Composite, Unbounded
-
-from benchmarl.algorithms.HGTeam import HGTeam, HGTeamConfig
-from benchmarl.models import MlpConfig, HeteroGnnConfig
-from benchmarl.models.heterognn import HeteroGNN
 
 DEVICE = "cpu"
 
@@ -160,10 +160,10 @@ gnn = hetero_gnns[0]
 
 edge_types = gnn.edge_types
 # Check for cross-group interaction edges
-cross_edges = [(s, r, d) for (s, r, d) in edge_types if s != d and s in group_map and d in group_map]
-assert len(cross_edges) >= 2, (
-    f"Expected cross-group edges (EV→PV, PV→EV), got: {cross_edges}"
-)
+cross_edges = [
+    (s, r, d) for (s, r, d) in edge_types if s != d and s in group_map and d in group_map
+]
+assert len(cross_edges) >= 2, f"Expected cross-group edges (EV→PV, PV→EV), got: {cross_edges}"
 print(f"PASS — cross-group edges: {cross_edges}")
 
 # Check both groups appear as node types
@@ -178,27 +178,36 @@ print("TEST 3: Forward pass produces embeddings and logits ... ", end="")
 B = 2  # batch size
 
 # Build a fake TensorDict matching the observation spec
-td = TensorDict({
-    "EV": TensorDict({
-        "observation": torch.randn(B, N_EV, OBS_DIM_EV),
-    }, batch_size=[B, N_EV]),
-    "PV": TensorDict({
-        "observation": torch.randn(B, N_PV, OBS_DIM_PV),
-    }, batch_size=[B, N_PV]),
-    "grid_node_features": torch.randn(B, N_GRID, 2),
-    "line_adjacency": torch.zeros(B, N_GRID, N_GRID, 3),
-    "transformer_adjacency": torch.zeros(B, N_GRID, N_GRID, 3),
-    "switch_adjacency": torch.zeros(B, N_GRID, N_GRID, 1),
-    # Simple mapping: agent i → grid node i (mod N_GRID)
-    "EV_agent_grid_edge_index": torch.stack([
-        torch.arange(N_EV), torch.arange(N_EV) % N_GRID
-    ]).unsqueeze(0).expand(B, 2, N_EV),
-    "PV_agent_grid_edge_index": torch.stack([
-        torch.arange(N_PV), torch.arange(N_PV) % N_GRID
-    ]).unsqueeze(0).expand(B, 2, N_PV),
-    "EV_participation_score": torch.rand(B, N_EV, 1),
-    "PV_participation_score": torch.rand(B, N_PV, 1),
-}, batch_size=[B])
+td = TensorDict(
+    {
+        "EV": TensorDict(
+            {
+                "observation": torch.randn(B, N_EV, OBS_DIM_EV),
+            },
+            batch_size=[B, N_EV],
+        ),
+        "PV": TensorDict(
+            {
+                "observation": torch.randn(B, N_PV, OBS_DIM_PV),
+            },
+            batch_size=[B, N_PV],
+        ),
+        "grid_node_features": torch.randn(B, N_GRID, 2),
+        "line_adjacency": torch.zeros(B, N_GRID, N_GRID, 3),
+        "transformer_adjacency": torch.zeros(B, N_GRID, N_GRID, 3),
+        "switch_adjacency": torch.zeros(B, N_GRID, N_GRID, 1),
+        # Simple mapping: agent i → grid node i (mod N_GRID)
+        "EV_agent_grid_edge_index": torch.stack([torch.arange(N_EV), torch.arange(N_EV) % N_GRID])
+        .unsqueeze(0)
+        .expand(B, 2, N_EV),
+        "PV_agent_grid_edge_index": torch.stack([torch.arange(N_PV), torch.arange(N_PV) % N_GRID])
+        .unsqueeze(0)
+        .expand(B, 2, N_PV),
+        "EV_participation_score": torch.rand(B, N_EV, 1),
+        "PV_participation_score": torch.rand(B, N_PV, 1),
+    },
+    batch_size=[B],
+)
 
 # Make some adjacency edges non-zero in line_adjacency
 for i in range(N_GRID - 1):

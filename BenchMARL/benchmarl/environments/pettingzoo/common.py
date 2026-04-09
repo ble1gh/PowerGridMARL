@@ -5,13 +5,12 @@
 #
 
 import copy
-from typing import Callable, Dict, List, Optional
+from collections.abc import Callable
 
 from torchrl.data import Composite
 from torchrl.envs import EnvBase, PettingZooEnv
 
 from benchmarl.environments.common import Task, TaskClass
-
 from benchmarl.utils import DEVICE_TYPING
 
 
@@ -20,7 +19,7 @@ class PettingZooClass(TaskClass):
         self,
         num_envs: int,
         continuous_actions: bool,
-        seed: Optional[int],
+        seed: int | None,
         device: DEVICE_TYPING,
     ) -> Callable[[], EnvBase]:
         config = copy.deepcopy(self.config)
@@ -33,7 +32,7 @@ class PettingZooClass(TaskClass):
             parallel=True,
             return_state=self.has_state(),
             render_mode="rgb_array",
-            **config
+            **config,
         )
 
     def supports_continuous_actions(self) -> bool:
@@ -47,7 +46,6 @@ class PettingZooClass(TaskClass):
             "SIMPLE_REFERENCE",
             "SIMPLE_SPEAKER_LISTENER",
             "SIMPLE_SPREAD",
-            "SIMPLE_TAG",
             "SIMPLE_WORLD_COMM",
         }:
             return True
@@ -62,7 +60,6 @@ class PettingZooClass(TaskClass):
             "SIMPLE_REFERENCE",
             "SIMPLE_SPEAKER_LISTENER",
             "SIMPLE_SPREAD",
-            "SIMPLE_TAG",
             "SIMPLE_WORLD_COMM",
         }:
             return True
@@ -77,7 +74,6 @@ class PettingZooClass(TaskClass):
             "SIMPLE_REFERENCE",
             "SIMPLE_SPEAKER_LISTENER",
             "SIMPLE_SPREAD",
-            "SIMPLE_TAG",
             "SIMPLE_WORLD_COMM",
         }:
             return True
@@ -89,15 +85,15 @@ class PettingZooClass(TaskClass):
     def max_steps(self, env: EnvBase) -> int:
         return self.config["max_cycles"]
 
-    def group_map(self, env: EnvBase) -> Dict[str, List[str]]:
+    def group_map(self, env: EnvBase) -> dict[str, list[str]]:
         return env.group_map
 
-    def state_spec(self, env: EnvBase) -> Optional[Composite]:
+    def state_spec(self, env: EnvBase) -> Composite | None:
         if "state" in env.observation_spec:
             return Composite({"state": env.observation_spec["state"].clone()})
         return None
 
-    def action_mask_spec(self, env: EnvBase) -> Optional[Composite]:
+    def action_mask_spec(self, env: EnvBase) -> Composite | None:
         observation_spec = env.observation_spec.clone()
         for group in self.group_map(env):
             group_obs_spec = observation_spec[group]
@@ -123,7 +119,7 @@ class PettingZooClass(TaskClass):
             del observation_spec["state"]
         return observation_spec
 
-    def info_spec(self, env: EnvBase) -> Optional[Composite]:
+    def info_spec(self, env: EnvBase) -> Composite | None:
         observation_spec = env.observation_spec.clone()
         for group in self.group_map(env):
             group_obs_spec = observation_spec[group]

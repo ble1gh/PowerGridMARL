@@ -7,28 +7,26 @@
 from __future__ import annotations
 
 import abc
-
 import importlib
-
 import warnings
 from abc import abstractmethod
+from collections.abc import Callable
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Type
+from typing import Any
 
 from tensordict import TensorDictBase
 from torch import Tensor
-
 from torchrl.data import Composite
 from torchrl.envs import EnvBase, RewardSum, Transform
 
-from benchmarl.utils import _read_yaml_config, DEVICE_TYPING
+from benchmarl.utils import DEVICE_TYPING, _read_yaml_config
 
 
 def _type_check_task_config(
     environemnt_name: str,
     task_name: str,
-    config: Dict[str, Any],
+    config: dict[str, Any],
     warn_on_missing_dataclass: bool = True,
 ):
 
@@ -71,7 +69,7 @@ class TaskClass(abc.ABC):
 
     """
 
-    def __init__(self, name: str, config: Dict[str, Any]):
+    def __init__(self, name: str, config: dict[str, Any]):
         self.name = name
         if config is None:
             config = {}
@@ -82,7 +80,7 @@ class TaskClass(abc.ABC):
         self,
         num_envs: int,
         continuous_actions: bool,
-        seed: Optional[int],
+        seed: int | None,
         device: DEVICE_TYPING,
     ) -> Callable[[], EnvBase]:
         """
@@ -142,7 +140,7 @@ class TaskClass(abc.ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def group_map(self, env: EnvBase) -> Dict[str, List[str]]:
+    def group_map(self, env: EnvBase) -> dict[str, list[str]]:
         """
         The group_map mapping agents groups to agent names.
         This should be reelected in the TensorDicts coming from the environment where
@@ -188,7 +186,7 @@ class TaskClass(abc.ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def info_spec(self, env: EnvBase) -> Optional[Composite]:
+    def info_spec(self, env: EnvBase) -> Composite | None:
         """
         A spec for the info.
         If provided, must be a Composite with one (group_name, "info") entry per group (this entry can be composite).
@@ -201,7 +199,7 @@ class TaskClass(abc.ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def state_spec(self, env: EnvBase) -> Optional[Composite]:
+    def state_spec(self, env: EnvBase) -> Composite | None:
         """
         A spec for the state.
         If provided, must be a Composite with one entry.
@@ -225,7 +223,7 @@ class TaskClass(abc.ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def action_mask_spec(self, env: EnvBase) -> Optional[Composite]:
+    def action_mask_spec(self, env: EnvBase) -> Composite | None:
         """
         A spec for the action mask.
         If provided, must be a Composite with one (group_name, "action_mask") entry per group.
@@ -245,7 +243,7 @@ class TaskClass(abc.ABC):
         raise NotImplementedError
 
     @staticmethod
-    def log_info(batch: TensorDictBase) -> Dict[str, float]:
+    def log_info(batch: TensorDictBase) -> dict[str, float]:
         """
         Return a str->float dict with extra items to log.
         This function has access to the collected batch and is optional.
@@ -269,7 +267,7 @@ class TaskClass(abc.ABC):
             reset_keys = env.reset_keys
         return RewardSum(reset_keys=reset_keys)
 
-    def get_env_transforms(self, env: EnvBase) -> List[Transform]:
+    def get_env_transforms(self, env: EnvBase) -> list[Transform]:
         """
         Returns a list of :class:`torchrl.envs.Transform` to be applied to the env.
 
@@ -280,7 +278,7 @@ class TaskClass(abc.ABC):
         """
         return []
 
-    def get_replay_buffer_transforms(self, env: EnvBase, group: str) -> List[Transform]:
+    def get_replay_buffer_transforms(self, env: EnvBase, group: str) -> list[Transform]:
         """
         Returns a list of :class:`torchrl.envs.Transform` to be applied to the :class:`torchrl.data.ReplayBuffer`
         of the specified group.
@@ -352,7 +350,7 @@ class Task(Enum):
     """
 
     @staticmethod
-    def associated_class() -> Type[TaskClass]:
+    def associated_class() -> type[TaskClass]:
         """
         The associated task class
         """
@@ -365,7 +363,7 @@ class Task(Enum):
         """
         return cls.associated_class().env_name()
 
-    def get_task(self, config: Optional[Dict[str, Any]] = None) -> TaskClass:
+    def get_task(self, config: dict[str, Any] | None = None) -> TaskClass:
         """
         Get the :class:`TaskClass` object associated with this enum element by passing it the task name and config.
 
@@ -390,11 +388,11 @@ class Task(Enum):
         return obj
 
     @staticmethod
-    def _load_from_yaml(name: str) -> Dict[str, Any]:
+    def _load_from_yaml(name: str) -> dict[str, Any]:
         yaml_path = Path(__file__).parent.parent / "conf" / "task" / f"{name}.yaml"
         return _read_yaml_config(str(yaml_path.resolve()))
 
-    def get_from_yaml(self, path: Optional[str] = None) -> TaskClass:
+    def get_from_yaml(self, path: str | None = None) -> TaskClass:
         """
         Load the task configuration from yaml
 
@@ -421,11 +419,9 @@ class Task(Enum):
 
     @property
     def config(self):
-        raise ValueError(
-            "Task.config is deprecated, use Task.get_task().config instead"
-        )
+        raise ValueError("Task.config is deprecated, use Task.get_task().config instead")
 
-    def update_config(self, config: Dict[str, Any]) -> Task:
+    def update_config(self, config: dict[str, Any]) -> Task:
         raise ValueError(
             "Task.update_config is deprecated please use Task.get_task().config.update() instead"
         )
@@ -450,7 +446,7 @@ class Task(Enum):
             "Called function is deprecated is deprecated, please use Task.get_task().function() instead"
         )
 
-    def group_map(self, env: EnvBase) -> Dict[str, List[str]]:
+    def group_map(self, env: EnvBase) -> dict[str, list[str]]:
         raise ValueError(
             "Called function is deprecated is deprecated, please use Task.get_task().function() instead"
         )
@@ -460,12 +456,12 @@ class Task(Enum):
             "Called function is deprecated is deprecated, please use Task.get_task().function() instead"
         )
 
-    def info_spec(self, env: EnvBase) -> Optional[Composite]:
+    def info_spec(self, env: EnvBase) -> Composite | None:
         raise ValueError(
             "Called function is deprecated is deprecated, please use Task.get_task().function() instead"
         )
 
-    def state_spec(self, env: EnvBase) -> Optional[Composite]:
+    def state_spec(self, env: EnvBase) -> Composite | None:
         raise ValueError(
             "Called function is deprecated is deprecated, please use Task.get_task().function() instead"
         )
@@ -475,13 +471,13 @@ class Task(Enum):
             "Called function is deprecated is deprecated, please use Task.get_task().function() instead"
         )
 
-    def action_mask_spec(self, env: EnvBase) -> Optional[Composite]:
+    def action_mask_spec(self, env: EnvBase) -> Composite | None:
         raise ValueError(
             "Called function is deprecated is deprecated, please use Task.get_task().function() instead"
         )
 
     @staticmethod
-    def log_info(batch: TensorDictBase) -> Dict[str, float]:
+    def log_info(batch: TensorDictBase) -> dict[str, float]:
         raise ValueError(
             "Called function is deprecated is deprecated, please use Task.get_task().function() instead"
         )
@@ -491,12 +487,12 @@ class Task(Enum):
             "Called function is deprecated is deprecated, please use Task.get_task().function() instead"
         )
 
-    def get_env_transforms(self, env: EnvBase) -> List[Transform]:
+    def get_env_transforms(self, env: EnvBase) -> list[Transform]:
         raise ValueError(
             "Called function is deprecated is deprecated, please use Task.get_task().function() instead"
         )
 
-    def get_replay_buffer_transforms(self, env: EnvBase, group: str) -> List[Transform]:
+    def get_replay_buffer_transforms(self, env: EnvBase, group: str) -> list[Transform]:
         raise ValueError(
             "Called function is deprecated is deprecated, please use Task.get_task().function() instead"
         )

@@ -5,22 +5,21 @@
 #
 
 import warnings
-from dataclasses import dataclass, MISSING
-from typing import Dict, Iterable, Optional, Tuple, Type, List
+from collections.abc import Iterable
+from dataclasses import MISSING, dataclass
 
 import torch
-from torch import nn
 import torch_geometric.nn as tgnn
 from tensordict import TensorDictBase
 from tensordict.nn import TensorDictModule, TensorDictSequential
 from tensordict.nn.distributions import NormalParamExtractor
+from torch import nn
 from torch.distributions import Categorical
 from torchrl.data import Composite, Unbounded
 from torchrl.modules import (
     IndependentNormal,
     MaskedCategorical,
     ProbabilisticActor,
-    TanhNormal,
 )
 from torchrl.objectives import ClipPPOLoss, LossModule, ValueEstimators
 
@@ -29,14 +28,14 @@ from benchmarl.algorithms.hgteam_modules import (
     EmbeddingProcessor,
     HyperNetworkJoiner,
     merge_embedding_losses,
-    reparameterize,
 )
-from benchmarl.models.common import ModelConfig
 from benchmarl.beta_param_extractor import BetaParamExtractor
 from benchmarl.independent_beta import IndependentBeta
-from benchmarl.tanh_normal_entropy import TanhNormalWithEntropy
-from benchmarl.models import MlpConfig, LstmConfig, HeteroGnnConfig
+from benchmarl.models import HeteroGnnConfig
+from benchmarl.models.common import ModelConfig
 from benchmarl.models.heterognn import HeteroGNN
+from benchmarl.tanh_normal_entropy import TanhNormalWithEntropy
+
 
 class HGTeamLoss(ClipPPOLoss):
     actor_network: TensorDictModule
@@ -46,13 +45,37 @@ class HGTeamLoss(ClipPPOLoss):
     target_actor_network_params: TensorDictBase
     target_critic_network_params: TensorDictBase
 
-    def __init__(self, algorithm, group, *args, **kwargs):
+    def __init__(self, algorithm: "HGTeamBase", group: str, *args, **kwargs) -> None:
+        """Wrap ClipPPOLoss with HGTeam embedding and masking logic.
+
+        Args:
+            algorithm: Parent HGTeamBase instance (provides gnn_mode,
+                group_map, use_vib, etc.).
+            group: Agent group name this loss operates on.
+            *args: Forwarded to ``ClipPPOLoss.__init__``.
+            **kwargs: Forwarded to ``ClipPPOLoss.__init__``.
+        """
         super().__init__(*args, **kwargs)
         self.algorithm = algorithm
         self.group = group
 
     def forward(self, tensordict: TensorDictBase) -> TensorDictBase:
-        # --- PRE-FORWARD: make participation scores grad-enabled ----
+        """Compute PPO loss with inactive-agent masking and embedding aux losses.
+
+        Pre-forward: enables grad on participation scores, snapshots z tensors,
+        applies VIB SNI (deterministic mu for importance ratio).
+
+        Post-forward: restores z, retains grad on embeddings, computes and
+        merges embedding auxiliary losses into ``loss_objective``.
+
+        Args:
+            tensordict: Batch tensordict with group observations, actions,
+                advantages, and value targets.
+
+        Returns:
+            TensorDict with scalar ``loss_objective``, ``loss_critic``, and
+            any ``loss_embedding_*`` keys.
+        """
         # Participation scores are environment observations (no grad by default).
         # We clone+detach+requires_grad BEFORE super().forward() so the actor
         # consumes the grad-enabled version and .grad is populated after backward.
@@ -77,7 +100,7 @@ class HGTeamLoss(ClipPPOLoss):
         # at the end is order-independent.
         _z_stash: dict[tuple, torch.Tensor] = {}
         _z_keys = ("embedding_z", "embedding_z_token")
-        for g in self.algorithm.group_map.keys():
+        for g in self.algorithm.group_map:
             for zk in _z_keys:
                 val = tensordict.get((g, zk), None)
                 if val is not None:
@@ -96,6 +119,25 @@ class HGTeamLoss(ClipPPOLoss):
 
         # --- FORWARD: standard PPO losses --------------------------
         out = super().forward(tensordict)
+
+        # --- MASKED REDUCTION for inactive agents -------------------
+        # With reduction="none", ClipPPOLoss returns per-element losses.
+        # We reduce them here, masking out inactive (padded) agent slots.
+        active_mask = tensordict.get((self.group, "active_mask"), None)
+        for key in list(out.keys()):
+            if not key.startswith("loss_"):
+                continue
+            val = out.get(key)
+            if val.dim() == 0:
+                continue  # already scalar (e.g. from embedding losses)
+            if active_mask is not None:
+                m = active_mask.float()
+                while m.dim() < val.dim():
+                    m = m.unsqueeze(-1)
+                m = m.expand_as(val)
+                out.set(key, (val * m).sum() / m.sum().clamp(min=1))
+            else:
+                out.set(key, val.mean())
 
         # --- Restore z tensors from snapshot ------------------------
         for key, val in _z_stash.items():
@@ -123,11 +165,10 @@ class HGTeamLoss(ClipPPOLoss):
                 self._grad_embedding_z_ref = embedding_z
 
         # Compute and merge embedding auxiliary losses into loss_objective
-        merge_embedding_losses(
-            self.algorithm, self.group, tensordict, out, "loss_objective"
-        )
+        merge_embedding_losses(self.algorithm, self.group, tensordict, out, "loss_objective")
 
         return out
+
 
 # EmbeddingProcessor, HyperNetworkJoiner, reparameterize, and
 # merge_embedding_losses are imported from hgteam_modules.py.
@@ -163,9 +204,9 @@ class HGTeamBase(Algorithm):
         gnn_concat_heads: bool = False,
         gnn_use_beta: bool = True,
         gnn_self_loops: bool = True,
-        gnn_agent_node_feature_key: Optional[str] = "participation_score",
+        gnn_agent_node_feature_key: str | None = "participation_score",
         gnn_agent_node_feature_dim: int = 1,
-        gnn_norm_class: Optional[str] = None,
+        gnn_norm_class: str | None = None,
         critic_embed_dim: int = 32,
         # Split-z parameters (learned_query mode)
         split_z: bool = False,
@@ -176,7 +217,7 @@ class HGTeamBase(Algorithm):
         use_vib: bool = False,
         vib_beta: float = 0.01,
         vib_warmup_frames: int = 500_000,
-        **kwargs
+        **kwargs,
     ):
         super().__init__(**kwargs)
 
@@ -190,7 +231,9 @@ class HGTeamBase(Algorithm):
         self.centralised_value_per_agent = centralised_value_per_agent
         self.gnn_mode = gnn_mode
         if gnn_mode not in ("none", "concat", "hypernetwork", "learned_query"):
-            raise ValueError(f"gnn_mode must be 'none', 'concat', 'hypernetwork', or 'learned_query', got '{gnn_mode}'")
+            raise ValueError(
+                f"gnn_mode must be 'none', 'concat', 'hypernetwork', or 'learned_query', got '{gnn_mode}'"
+            )
         self.z_dim = z_dim
         self.hypernet_actor_feature_dim = hypernet_actor_feature_dim
         self.stochastic_z = stochastic_z
@@ -201,7 +244,9 @@ class HGTeamBase(Algorithm):
         if gnn_mode == "hypernetwork" and hypernet_actor_feature_dim is None:
             raise ValueError("hypernet_actor_feature_dim is required when gnn_mode='hypernetwork'")
         if gnn_mode != "none" and split_z and gnn_mode != "learned_query":
-            raise ValueError(f"split_z is only supported with gnn_mode='learned_query', got '{gnn_mode}'")
+            raise ValueError(
+                f"split_z is only supported with gnn_mode='learned_query', got '{gnn_mode}'"
+            )
 
         # Mode-specific validation (warnings for ignored flags)
         if gnn_mode == "none":
@@ -300,7 +345,6 @@ class HGTeamBase(Algorithm):
         self._shared_gnn_critic = None
         self._shared_actor_gnn = None
 
-
     def _filter_shared_gnn_params(
         self,
         all_params: list,
@@ -329,7 +373,7 @@ class HGTeamBase(Algorithm):
         for _ in range(10):  # bounded unwrap
             if isinstance(gnn_module, HeteroGNN):
                 break
-            if hasattr(gnn_module, 'module'):
+            if hasattr(gnn_module, "module"):
                 gnn_module = gnn_module.module
             else:
                 break
@@ -365,10 +409,37 @@ class HGTeamBase(Algorithm):
         filtered = [p for p in all_params if p.data_ptr() not in exclude_ptrs]
         return filtered
 
+    @staticmethod
+    def _obs_spec_for_model(obs_spec: Composite, group: str, device) -> Composite:
+        """Clone a group's observation spec, stripping ``active_mask``.
+
+        ``active_mask`` is registered in the environment's observation spec so
+        that SerialEnv/ParallelEnv propagate it to the training batch.  Models,
+        however, should never see it as an input feature — it is boolean, 1-D
+        per agent, and used only for loss masking / edge filtering.
+        """
+        group_spec = obs_spec[group].clone().to(device)
+        if "active_mask" in group_spec.keys():
+            del group_spec["active_mask"]
+        return group_spec
 
     def _get_policy_for_loss(
         self, group: str, model_config: ModelConfig, continuous: bool
     ) -> TensorDictModule:
+        """Build the stochastic actor pipeline for a single agent group.
+
+        Constructs: observation encoder (MLP/Transformer) → optional GNN
+        embedding → optional hypernetwork or concat joiner → distribution
+        head (Normal, TanhNormal, or Beta).
+
+        Args:
+            group: Agent group name (e.g. ``"EV"``).
+            model_config: Model configuration (MLP, LSTM, etc.).
+            continuous: Whether the action space is continuous.
+
+        Returns:
+            A ``ProbabilisticActor`` wrapped in a ``TensorDictModule``.
+        """
         n_agents = len(self.group_map[group])
         if continuous:
             logits_shape = list(self.action_spec[group, "action"].shape)
@@ -380,7 +451,7 @@ class HGTeamBase(Algorithm):
             ]
 
         actor_input_spec = Composite(
-            {group: self.observation_spec[group].clone().to(self.device)}
+            {group: self._obs_spec_for_model(self.observation_spec, group, self.device)}
         )
 
         # Determine actor output based on gnn_mode
@@ -429,16 +500,11 @@ class HGTeamBase(Algorithm):
             if self.split_z and self.gnn_mode == "learned_query":
                 # Split-z mode: GNN produces [z_token | z_query_raw]
                 z_query_raw_dim = (
-                    self.z_query_dim * 2 if self.stochastic_z_query
-                    else self.z_query_dim
+                    self.z_query_dim * 2 if self.stochastic_z_query else self.z_query_dim
                 )
                 gnn_output_dim = self.z_token_dim + z_query_raw_dim
             else:
-                gnn_output_dim = (
-                    self.z_dim * 2
-                    if self.stochastic_z
-                    else self.z_dim
-                )
+                gnn_output_dim = self.z_dim * 2 if self.stochastic_z else self.z_dim
 
             gnn_stream_module = self._get_or_build_shared_actor_gnn(gnn_output_dim)
 
@@ -460,8 +526,8 @@ class HGTeamBase(Algorithm):
                     in_keys=[(group, "gnn_embedding")],
                     out_keys=[
                         (group, "embedding_z_token"),
-                        (group, "embedding_z"),       # z_query (alias)
-                        (group, "embedding_mu"),       # pre-noise mean (for VIB KL)
+                        (group, "embedding_z"),  # z_query (alias)
+                        (group, "embedding_mu"),  # pre-noise mean (for VIB KL)
                         (group, "embedding_logvar"),
                     ],
                 )
@@ -473,57 +539,57 @@ class HGTeamBase(Algorithm):
                 embedding_processor_module = TensorDictModule(
                     embedding_processor,
                     in_keys=[(group, "gnn_embedding")],
-                    out_keys=[(group, "embedding_z"), (group, "embedding_mu"), (group, "embedding_logvar")],
+                    out_keys=[
+                        (group, "embedding_z"),
+                        (group, "embedding_mu"),
+                        (group, "embedding_logvar"),
+                    ],
                 )
 
         if self.gnn_mode == "hypernetwork":
             # Hypernetwork mode: GNN embeddings generate weights for actor
             feature_dim = self.hypernet_actor_feature_dim
-            
+
             joiner = HyperNetworkJoiner(
-                embedding_dim=gnn_output_dim,           # From GNN (2x if stochastic)
-                feature_dim=feature_dim,                # From Actor
+                embedding_dim=gnn_output_dim,  # From GNN (2x if stochastic)
+                feature_dim=feature_dim,  # From Actor
                 output_dim=logits_shape[-1],
                 device=self.device,
                 stochastic_embedding=self.stochastic_z,
             )
-            
+
             joiner_module = TensorDictModule(
                 joiner,
                 in_keys=[(group, "actor_features"), (group, "gnn_embedding")],
-                out_keys=[(group, "logits"), (group, "embedding_z"), (group, "embedding_logvar")]
+                out_keys=[(group, "logits"), (group, "embedding_z"), (group, "embedding_logvar")],
             )
 
             # Sequence: Actor -> GNN -> Joiner
-            actor_module = TensorDictSequential(
-                actor_module, 
-                gnn_stream_module, 
-                joiner_module
-            )
-            
+            actor_module = TensorDictSequential(actor_module, gnn_stream_module, joiner_module)
+
         elif self.gnn_mode == "concat":
             # Concat mode: GNN embeddings concatenated with observations as input to MLP
             # Flow: GNN -> EmbeddingProcessor -> Concat with obs -> MLP -> logits
-            
+
             # Get the latent dim (after stochastic processing)
             latent_dim = self.z_dim
-            
+
             # Get observation shape for this group
             obs_shape = self.observation_spec[group, "observation"].shape
             obs_dim = obs_shape[-1]  # Last dimension is feature dim
-            
+
             # Create concatenation module
             def concat_obs_embedding(obs, embedding_z):
                 # obs: (..., n_agents, obs_dim)
                 # embedding_z: (..., n_agents, latent_dim)
                 return torch.cat([obs, embedding_z], dim=-1)
-            
+
             concat_module = TensorDictModule(
                 concat_obs_embedding,
                 in_keys=[(group, "observation"), (group, "embedding_z")],
-                out_keys=[(group, "concat_input")]
+                out_keys=[(group, "concat_input")],
             )
-            
+
             # Create new actor input spec with concatenated features
             concat_input_spec = Composite(
                 {
@@ -533,7 +599,7 @@ class HGTeamBase(Algorithm):
                     )
                 }
             )
-            
+
             # Create MLP that takes concatenated input
             mlp_actor = model_config.get_model(
                 input_spec=concat_input_spec,
@@ -546,13 +612,10 @@ class HGTeamBase(Algorithm):
                 device=self.device,
                 action_spec=self.action_spec,
             )
-            
+
             # Sequence: GNN -> EmbeddingProcessor -> Concat -> MLP
             actor_module = TensorDictSequential(
-                gnn_stream_module,
-                embedding_processor_module,
-                concat_module,
-                mlp_actor
+                gnn_stream_module, embedding_processor_module, concat_module, mlp_actor
             )
 
         elif self.gnn_mode == "learned_query":
@@ -643,12 +706,9 @@ class HGTeamBase(Algorithm):
 
         return policy
 
-
-    def _compute_embedding_losses(
-        self, group: str, batch: TensorDictBase
-    ) -> dict:
+    def _compute_embedding_losses(self, group: str, batch: TensorDictBase) -> dict:
         """Compute embedding-related losses from the batch after forward pass.
-        
+
         Returns dict with:
         - embedding_entropy: Raw entropy value (for logging)
         - embedding_diversity: Raw diversity value (for logging)
@@ -660,14 +720,14 @@ class HGTeamBase(Algorithm):
         - diag_alpha_beta_mean_diff: Mean difference between alpha-half and beta-half logits
         """
         losses = {}
-        
+
         # Get embedding stats from batch
         # In split-z mode, "embedding_z" is an alias for z_query
         embedding_z = batch.get((group, "embedding_z"), None)
         if not torch.is_tensor(embedding_z):
             # Embeddings not found - this means hypernetwork is not enabled or forward failed
             return losses
-            
+
         embedding_logvar = batch.get((group, "embedding_logvar"), None)
         if not torch.is_tensor(embedding_logvar):
             embedding_logvar = None
@@ -685,7 +745,7 @@ class HGTeamBase(Algorithm):
             entropy = 0.5 * (1 + embedding_logvar)  # Simplified, ignoring constants
             entropy_mean = entropy.mean()
             losses["embedding_entropy"] = entropy_mean.detach()
-            
+
             if self.embedding_entropy_coef > 0:
                 # We want to MINIMIZE entropy, so we add positive entropy as loss
                 losses["loss_embedding_entropy"] = entropy_mean * self.embedding_entropy_coef
@@ -717,7 +777,9 @@ class HGTeamBase(Algorithm):
                     beta_effective = self.vib_beta
 
                 losses["vib_kl"] = kl_mean.detach()
-                losses["vib_beta_effective"] = torch.tensor(beta_effective, device=embedding_z.device).detach()
+                losses["vib_beta_effective"] = torch.tensor(
+                    beta_effective, device=embedding_z.device
+                ).detach()
                 losses["vib_mu_norm"] = embedding_mu.norm(dim=-1).mean().detach()
                 losses["vib_std_mean"] = torch.exp(0.5 * embedding_logvar).mean().detach()
                 losses["loss_vib_kl"] = kl_mean * beta_effective
@@ -753,9 +815,9 @@ class HGTeamBase(Algorithm):
             losses["embedding_diversity"] = diversity.detach()
 
             if self.embedding_diversity_coef > 0:
-                 # We want to MAXIMIZE diversity, so we MINIMIZE negative diversity
-                 losses["loss_embedding_diversity"] = -diversity * self.embedding_diversity_coef
-        
+                # We want to MAXIMIZE diversity, so we MINIMIZE negative diversity
+                losses["loss_embedding_diversity"] = -diversity * self.embedding_diversity_coef
+
         # Additional diagnostics specific to hypernetwork mode
         if self.gnn_mode == "hypernetwork":
             # Actor features produced by the base actor MLP
@@ -766,7 +828,7 @@ class HGTeamBase(Algorithm):
                 losses["diag_actor_features_std"] = actor_features.std().detach()
                 # Norm gives overall scale
                 losses["diag_actor_features_norm"] = actor_features.norm(dim=-1).mean().detach()
-            
+
             # Logits before BetaParamExtractor
             logits = batch.get((group, "logits"), None)
             if logits is not None and logits.numel() > 0:
@@ -775,14 +837,14 @@ class HGTeamBase(Algorithm):
                 losses["diag_logits_std"] = logits.std().detach()
                 losses["diag_logits_min"] = logits.min().detach()
                 losses["diag_logits_max"] = logits.max().detach()
-                
+
                 # Split into alpha/beta halves to detect symmetry
                 action_dim = logits.shape[-1] // 2
                 alpha_half = logits[..., :action_dim]
                 beta_half = logits[..., action_dim:]
                 alpha_mean = alpha_half.mean().detach()
                 beta_mean = beta_half.mean().detach()
-                losses["diag_alpha_beta_mean_diff"] = (alpha_mean - beta_mean)
+                losses["diag_alpha_beta_mean_diff"] = alpha_mean - beta_mean
 
             # Compute lin_beta gradient norms per GNN layer if available
             try:
@@ -798,7 +860,11 @@ class HGTeamBase(Algorithm):
                         beta_grad_norms = []
                         # hetero_conv.convs is a ModuleDict mapping (src, rel, dst) -> TransformerConv
                         for edge_key, conv in hetero_conv.convs.items():
-                            if hasattr(conv, "lin_beta") and conv.lin_beta is not None and hasattr(conv.lin_beta, "weight"):
+                            if (
+                                hasattr(conv, "lin_beta")
+                                and conv.lin_beta is not None
+                                and hasattr(conv.lin_beta, "weight")
+                            ):
                                 if conv.lin_beta.weight.grad is not None:
                                     grad_norm = conv.lin_beta.weight.grad.norm().detach()
                                     beta_grad_norms.append(grad_norm)
@@ -809,7 +875,9 @@ class HGTeamBase(Algorithm):
                                         rel = str(edge_key)
                                     # Sanitize rel for logging
                                     rel = str(rel).replace(" ", "_")
-                                    losses[f"diag_gnn_lin_beta_grad_norm_layer_{i}_{rel}"] = grad_norm
+                                    losses[f"diag_gnn_lin_beta_grad_norm_layer_{i}_{rel}"] = (
+                                        grad_norm
+                                    )
                         if beta_grad_norms:
                             # Log mean gradient norm per layer
                             mean_grad_norm = torch.stack(beta_grad_norms).mean()
@@ -817,15 +885,14 @@ class HGTeamBase(Algorithm):
             except Exception:
                 # Avoid crashing training due to diagnostics
                 pass
-        
+
         return losses
 
     #####################
     # Custom new methods
     #####################
 
-
-    def _get_or_build_shared_actor_gnn(self, gnn_output_dim: int):
+    def _get_or_build_shared_actor_gnn(self, gnn_output_dim: int) -> HeteroGNN:
         """Lazily build and return a shared actor GNN that sees ALL agent groups.
 
         The GNN has one node type per agent group plus ``grid_node``, with
@@ -868,7 +935,7 @@ class HGTeamBase(Algorithm):
             "line_adjacency": 3,
             "transformer_adjacency": 3,
             "switch_adjacency": 1,
-            "interaction": 0,   # fallback for any interact edge
+            "interaction": 0,  # fallback for any interact edge
             "mapping": 0,
             "mapping_rev": 0,
         }
@@ -950,7 +1017,7 @@ class HGTeamBase(Algorithm):
         shared_input_spec = Composite()
         for g in all_groups:
             shared_input_spec.set(
-                g, self.observation_spec[g].clone().to(self.device)
+                g, self._obs_spec_for_model(self.observation_spec, g, self.device)
             )
 
         # --- Output spec: each group gets its own embedding ----
@@ -981,8 +1048,7 @@ class HGTeamBase(Algorithm):
         )
         return self._shared_actor_gnn
 
-
-    def _add_graph_keys_to_spec(self, spec):
+    def _add_graph_keys_to_spec(self, spec: Composite) -> None:
         """Add GNN-required graph keys from observation_spec into *spec*.
 
         Always adds keys for every agent group in ``self.group_map``.
@@ -993,7 +1059,7 @@ class HGTeamBase(Algorithm):
         # Grid adjacency matrices (shared across types)
         if cfg.grid_edge_keys:
             for spec_key in cfg.grid_edge_keys.values():
-                if spec_key in self.observation_spec.keys():
+                if spec_key in self.observation_spec:
                     spec.set(
                         spec_key,
                         self.observation_spec[spec_key].clone().to(self.device),
@@ -1003,7 +1069,7 @@ class HGTeamBase(Algorithm):
         if cfg.node_features_keys:
             for node_type, spec_key in cfg.node_features_keys.items():
                 if node_type == "grid_node":
-                    if spec_key in self.observation_spec.keys():
+                    if spec_key in self.observation_spec:
                         spec.set(
                             spec_key,
                             self.observation_spec[spec_key].clone().to(self.device),
@@ -1011,7 +1077,7 @@ class HGTeamBase(Algorithm):
                 else:
                     for g in groups_to_add:
                         per_type_key = f"{g}_{spec_key}"
-                        if per_type_key in self.observation_spec.keys():
+                        if per_type_key in self.observation_spec:
                             spec.set(
                                 per_type_key,
                                 self.observation_spec[per_type_key].clone().to(self.device),
@@ -1021,7 +1087,7 @@ class HGTeamBase(Algorithm):
         if cfg.agent_node_index_key:
             for g in groups_to_add:
                 key = f"{g}_agent_grid_edge_index"
-                if key in self.observation_spec.keys():
+                if key in self.observation_spec:
                     spec.set(
                         key,
                         self.observation_spec[key].clone().to(self.device),
@@ -1071,7 +1137,7 @@ class HGTeam(HGTeamBase):
         lmbda: float,
         minibatch_advantage: bool,
         critic_use_other_actions: bool = False,
-        **kwargs
+        **kwargs,
     ):
         super().__init__(**kwargs)
 
@@ -1083,11 +1149,17 @@ class HGTeam(HGTeamBase):
         self.minibatch_advantage = minibatch_advantage
         self.critic_use_other_actions = critic_use_other_actions
 
-
     def _get_loss(
         self, group: str, policy_for_loss: TensorDictModule, continuous: bool
-    ) -> Tuple[LossModule, bool]:
-        # Loss
+    ) -> tuple[LossModule, bool]:
+        """Create the HGTeamLoss (ClipPPO) module for *group*.
+
+        Configures GAE value estimator, sets TensorDict keys, and disables
+        built-in advantage normalisation (handled in ``process_batch``).
+
+        Returns:
+            ``(loss_module, False)`` — False means no target-network updater.
+        """
         loss_module = HGTeamLoss(
             algorithm=self,
             group=group,
@@ -1097,8 +1169,8 @@ class HGTeam(HGTeamBase):
             entropy_coeff=self.entropy_coef,
             critic_coeff=self.critic_coef,
             loss_critic_type=self.loss_critic_type,
-            normalize_advantage=True,
-            normalize_advantage_exclude_dims=(1,),
+            normalize_advantage=False,
+            reduction="none",
         )
         loss_module.set_keys(
             reward=(group, "reward"),
@@ -1111,16 +1183,25 @@ class HGTeam(HGTeamBase):
             sample_log_prob=(group, "log_prob"),
         )
         loss_module.make_value_estimator(
-            ValueEstimators.GAE, 
-            gamma=self.experiment_config.gamma, 
+            ValueEstimators.GAE,
+            gamma=self.experiment_config.gamma,
             lmbda=self.lmbda,
             vectorized=False,
             deactivate_vmap=True,  # Clearly disable vmap for sparse graphs (dynamic shapes)
         )
         return loss_module, False
 
-    def _get_parameters(self, group: str, loss: ClipPPOLoss) -> Dict[str, Iterable]:
-        # --- Actor parameters ---
+    def _get_parameters(self, group: str, loss: ClipPPOLoss) -> dict[str, Iterable]:
+        """Return optimizer parameter groups for *group*'s actor and critic.
+
+        Shared GNN parameters are placed in a separate param group with
+        ``lr / num_groups`` to compensate for receiving one Adam step per
+        group.  Other-group GNN output convolutions are filtered out.
+
+        Returns:
+            Dict mapping ``"loss_objective"`` and ``"loss_critic"`` to
+            parameter lists (or lists of param-group dicts).
+        """
         # The actor_network_params TensorDict contains all params from the
         # actor pipeline, including the shared GNN.  In a multi-group setup
         # the shared GNN appears in every group's optimizer, so it would
@@ -1141,13 +1222,13 @@ class HGTeam(HGTeamBase):
             )
             n_after = len(actor_params)
             if n_before != n_after:
-                print(f"[HGTeam] {group}/actor: filtered {n_before - n_after} "
-                      f"other-group GNN params ({n_before} → {n_after})")
+                print(
+                    f"[HGTeam] {group}/actor: filtered {n_before - n_after} "
+                    f"other-group GNN params ({n_before} → {n_after})"
+                )
 
             # Separate shared GNN params from per-group params for LR scaling
-            actor_params = self._split_shared_gnn_param_groups(
-                actor_params, self._shared_actor_gnn
-            )
+            actor_params = self._split_shared_gnn_param_groups(actor_params, self._shared_actor_gnn)
 
         # --- Critic parameters ---
         critic_params = list(loss.critic_network_params.flatten_keys().values())
@@ -1159,8 +1240,10 @@ class HGTeam(HGTeamBase):
             )
             n_after = len(critic_params)
             if n_before != n_after:
-                print(f"[HGTeam] {group}/critic: filtered {n_before - n_after} "
-                      f"other-group GNN params ({n_before} → {n_after})")
+                print(
+                    f"[HGTeam] {group}/critic: filtered {n_before - n_after} "
+                    f"other-group GNN params ({n_before} → {n_after})"
+                )
 
             # Separate shared GNN params from per-group params for LR scaling
             critic_params = self._split_shared_gnn_param_groups(
@@ -1172,7 +1255,11 @@ class HGTeam(HGTeamBase):
             "loss_critic": critic_params,
         }
 
-    def _split_shared_gnn_param_groups(self, all_params, shared_gnn):
+    def _split_shared_gnn_param_groups(
+        self,
+        all_params: list[torch.nn.Parameter],
+        shared_gnn: HeteroGNN,
+    ) -> list[torch.nn.Parameter] | list[dict]:
         """Split params into per-group (full LR) and shared GNN (scaled LR).
 
         Because the shared GNN appears in every group's optimizer, it receives
@@ -1215,10 +1302,27 @@ class HGTeam(HGTeamBase):
     def _get_policy_for_collection(
         self, policy_for_loss: TensorDictModule, group: str, continuous: bool
     ) -> TensorDictModule:
-        # HGTeam uses the same stochastic actor for collection
+        """Return the collection policy (same as loss policy for on-policy PPO)."""
         return policy_for_loss
 
     def process_batch(self, group: str, batch: TensorDictBase) -> TensorDictBase:
+        """Prepare a collected batch for PPO training.
+
+        Steps:
+          1. Broadcast shared done/terminated/reward into per-group keys.
+          2. Inject critic action edge features if needed.
+          3. Compute GAE advantages and value targets (minibatch-chunked).
+          4. Zero advantages for inactive agents (D7).
+          5. Per-slot masked advantage normalisation (S8a).
+
+        Args:
+            group: Agent group name.
+            batch: Collected rollout tensordict ``[T, B, ...]``.
+
+        Returns:
+            Batch with ``(group, "advantage")`` and ``(group, "value_target")``
+            filled.
+        """
         batch = batch.to(self.device)
         keys = list(batch.keys(True, True))
         group_shape = batch.get(group).shape
@@ -1235,9 +1339,7 @@ class HGTeam(HGTeamBase):
         if nested_terminated_key not in keys:
             batch.set(
                 nested_terminated_key,
-                batch.get(("next", "terminated"))
-                .unsqueeze(-1)
-                .expand((*group_shape, 1)),
+                batch.get(("next", "terminated")).unsqueeze(-1).expand((*group_shape, 1)),
             )
 
         if nested_reward_key not in keys:
@@ -1246,15 +1348,10 @@ class HGTeam(HGTeamBase):
                 batch.get(("next", "reward")).unsqueeze(-1).expand((*group_shape, 1)),
             )
 
-        # Pre-compute augmented critic observations with other agents' actions
-        if self.critic_use_other_actions:
-            self._augment_critic_observations(batch)
-
         loss = self.get_loss_and_updater(group)[0]
         if self.minibatch_advantage:
             increment = -(
-                -self.experiment.config.train_minibatch_size(self.on_policy)
-                // batch.shape[1]
+                -self.experiment.config.train_minibatch_size(self.on_policy) // batch.shape[1]
             )
         else:
             increment = batch.batch_size[0] + 1
@@ -1274,122 +1371,96 @@ class HGTeam(HGTeamBase):
             start_index += increment
 
         batch = torch.cat(minibatches, dim=0)
+
+        # --- Zero out advantages for inactive (padded) agent slots ---
+        # Inactive agents have obs=0, reward=0, but GAE still computes
+        # non-zero advantages from critic residuals.  Zeroing them here
+        # ensures they contribute nothing to the policy gradient and
+        # prevents advantage normalization from being skewed.
+        active_mask = batch.get((group, "active_mask"), None)
+        if active_mask is not None:
+            adv = batch.get((group, "advantage"))
+            vtarg = batch.get((group, "value_target"))
+            vval = batch.get((group, "state_value"))
+            m = active_mask
+            while m.dim() < adv.dim():
+                m = m.unsqueeze(-1)
+            m = m.expand_as(adv)
+            adv[~m] = 0.0
+            # Set value_target = state_value for inactive agents so
+            # critic loss is zero (target - prediction = 0).
+            vtarg[~m] = vval[~m].detach()
+
+            # --- S8a: Per-slot masked advantage normalization ---
+            # The batch has batch_size (n_envs, T) and the group adds
+            # n_agents as an additional dimension.  Shapes:
+            #   active_mask: (*batch_dims, n_agents)
+            #   adv:         (*batch_dims, n_agents, 1)
+            agent_dim = active_mask.dim() - 1  # last dim of active_mask
+            n_agents = active_mask.shape[agent_dim]
+            for slot in range(n_agents):
+                slot_active = active_mask.select(agent_dim, slot)  # (*batch_dims) bool
+                if slot_active.sum() > 1:
+                    slot_adv_view = adv.select(agent_dim, slot)  # (*batch_dims, 1)
+                    slot_vals = slot_adv_view[slot_active]  # (n_active, 1)
+                    slot_adv_view[slot_active] = (
+                        slot_vals - slot_vals.mean()
+                    ) / slot_vals.std(correction=0).clamp(min=1e-7)
+        else:
+            # No active_mask — fall back to standard per-slot normalization.
+            # This path is reached when the environment does not provide
+            # variable agent counts (i.e. all slots are always active).
+            warnings.warn(
+                f"HGTeam.process_batch({group}): 'active_mask' not found. "
+                "Falling back to standard per-slot advantage normalization "
+                "(no inactive-agent masking).",
+                stacklevel=2,
+            )
+            adv = batch.get((group, "advantage"))
+            agent_dim = adv.dim() - 2  # second-to-last: (*batch_dims, n_agents, 1)
+            n_agents = adv.shape[agent_dim]
+            for slot in range(n_agents):
+                slot_adv_view = adv.select(agent_dim, slot)  # (*batch_dims, 1)
+                if slot_adv_view.numel() > 1:
+                    slot_adv_view.copy_(
+                        (slot_adv_view - slot_adv_view.mean())
+                        / slot_adv_view.std(correction=0).clamp(min=1e-7)
+                    )
+
         return batch
 
     def process_loss_vals(
         self, group: str, loss_vals: TensorDictBase, batch: TensorDictBase = None
     ) -> TensorDictBase:
-        loss_vals.set(
-            "loss_objective", loss_vals["loss_objective"] + loss_vals["loss_entropy"]
-        )
+        """Post-process loss values: merge entropy loss into objective."""
+        loss_vals.set("loss_objective", loss_vals["loss_objective"] + loss_vals["loss_entropy"])
         del loss_vals["loss_entropy"]
-        
+
         # Note: embedding losses are already added to loss_objective in HGTeamLoss.forward()
         # We don't add them again here to avoid double-counting
-        
+
         return loss_vals
 
     def _compute_other_actions_dim(self) -> int:
-        """Total dimension of all agents' actions across all groups."""
-        return sum(
-            len(self.group_map[g]) * self.action_spec[g, "action"].shape[-1]
-            for g in self.group_map
-        )
-
-    def _augment_critic_observations(self, batch: TensorDictBase):
-        """Pre-compute augmented critic observations for all groups.
-
-        For each agent i in each group, creates:
-            critic_obs_i = [obs_i, a_{-i}]
-        where a_{-i} contains every other agent's action (across all groups)
-        with agent i's own action zeroed out (counterfactual baseline).
-
-        Also computes augmented observations for the ``next`` sub-tensordict
-        (needed for GAE bootstrapping), using actions shifted forward by one
-        timestep.  The last timestep gets zero-padded actions (masked by the
-        done flag in GAE).
-        """
-        type_order = list(self.group_map.keys())
-
-        # Idempotency guard: skip if already augmented (process_batch is
-        # called once per group, but we augment all groups at once).
-        if batch.get((type_order[0], "critic_obs"), None) is not None:
-            return
-
-        # Gather all current actions
-        all_actions = {g: batch.get((g, "action")) for g in type_order}
-
-        # Augment current-state observations for every group
-        for group in type_order:
-            obs = batch.get((group, "observation"))
-            critic_obs = self._compute_augmented_obs(
-                obs, group, all_actions, type_order
-            )
-            batch.set((group, "critic_obs"), critic_obs)
-
-        # Handle "next" state for GAE bootstrapping
-        next_td = batch.get("next", None)
-        if next_td is not None:
-            # Approximate next-state other-actions by shifting current
-            # actions forward by one timestep along dim 0 (time).
-            next_actions = {}
-            for g in type_order:
-                act = all_actions[g]
-                shifted = torch.zeros_like(act)
-                if act.shape[0] > 1:
-                    shifted[:-1] = act[1:]
-                next_actions[g] = shifted
-
-            for group in type_order:
-                next_obs = next_td.get((group, "observation"), None)
-                if next_obs is not None:
-                    next_critic_obs = self._compute_augmented_obs(
-                        next_obs, group, next_actions, type_order
-                    )
-                    next_td.set((group, "critic_obs"), next_critic_obs)
-
-    def _compute_augmented_obs(
-        self,
-        obs: torch.Tensor,
-        target_group: str,
-        all_actions: dict,
-        type_order: list,
-    ) -> torch.Tensor:
-        """Return ``[obs_i, a_{-i}]`` for every agent *i* in *target_group*.
-
-        * Same-group actions are included with agent *i*'s own action zeroed.
-        * Other-group actions are fully visible to every agent.
-
-        Returns a tensor of shape ``(..., n_agents, obs_dim + total_actions_dim)``.
-        """
-        n_self = len(self.group_map[target_group])
-        parts = [obs]
-
-        for g in type_order:
-            acts = all_actions[g]
-            n_g = len(self.group_map[g])
-            d_g = acts.shape[-1]
-
-            if g == target_group:
-                # Same group: for each viewer agent i, zero out its own action
-                # expanded: (..., n_self, n_g, d_g)
-                expanded = acts.unsqueeze(-3).expand(
-                    *acts.shape[:-2], n_self, n_g, d_g
-                )
-                mask = (1.0 - torch.eye(n_g, device=acts.device)).unsqueeze(-1)
-                masked = expanded * mask
-                parts.append(masked.flatten(-2, -1))
-            else:
-                # Other group: all actions visible to every agent
-                flat = acts.flatten(-2, -1)  # (..., n_g * d_g)
-                flat = flat.unsqueeze(-2).expand(
-                    *obs.shape[:-1], flat.shape[-1]
-                )
-                parts.append(flat)
-
-        return torch.cat(parts, dim=-1)
+        """Action dimension for a single agent (used for edge_features_dims)."""
+        # All agent types have the same 1-d continuous action in this env
+        first_group = next(iter(self.group_map))
+        return self.action_spec[first_group, "action"].shape[-1]
 
     def get_critic(self, group: str) -> TensorDictModule:
+        """Build or return the cached critic module for *group*.
+
+        Uses a shared HeteroGNN critic when ``share_critic_across_groups``
+        is True or the critic config is HeteroGnnConfig (default).  Falls
+        back to a per-type MLP critic otherwise.
+
+        Args:
+            group: Agent group name.
+
+        Returns:
+            A ``TensorDictModule`` that maps observations →
+            ``(group, "state_value")``.
+        """
         n_agents = len(self.group_map[group])
 
         # ================================================================
@@ -1424,39 +1495,37 @@ class HGTeam(HGTeamBase):
             critic_input_spec = self.state_spec
         else:
             input_has_agent_dim = True
-            if self.critic_use_other_actions:
-                obs_dim = self.observation_spec[group, "observation"].shape[-1]
-                other_actions_dim = self._compute_other_actions_dim()
-                augmented_dim = obs_dim + other_actions_dim
-                critic_input_spec = Composite(
-                    {group: Composite(
-                        {"critic_obs": Unbounded(shape=(n_agents, augmented_dim))},
-                        shape=(n_agents,),
-                    )}
-                )
-            else:
-                critic_input_spec = Composite(
-                    {group: self.observation_spec[group].clone().to(self.device)}
-                )
+            # With critic_use_other_actions, actions are now passed as GNN
+            # edge features (Option B) instead of flat concatenation.
+            # The critic input spec is always plain observations.
+            critic_input_spec = Composite(
+                {group: self._obs_spec_for_model(self.observation_spec, group, self.device)}
+            )
             # Include root-level graph keys the GNN needs
             if isinstance(self.critic_model_config, HeteroGnnConfig):
                 self._add_graph_keys_to_spec(critic_input_spec)
 
         # Build model
         critic_config = self.critic_model_config
-        if (self.centralised_value_per_agent
-                and isinstance(critic_config, HeteroGnnConfig)):
+        if self.centralised_value_per_agent and isinstance(critic_config, HeteroGnnConfig):
             critic_config.prune_non_agent_final_layer = True
 
         # Per-type key overrides
         if isinstance(critic_config, HeteroGnnConfig):
             import copy
+
             critic_config = copy.deepcopy(critic_config)
             if critic_config.agent_node_index_key is not None:
                 critic_config.agent_node_index_key = f"{group}_agent_grid_edge_index"
             if critic_config.node_features_keys and "agents" in critic_config.node_features_keys:
                 orig_key = critic_config.node_features_keys["agents"]
                 critic_config.node_features_keys["agents"] = f"{group}_{orig_key}"
+            # Inject action edge features dims for critic_use_other_actions
+            if self.critic_use_other_actions:
+                action_dim = self._compute_other_actions_dim()
+                efd = dict(critic_config.edge_features_dims or {})
+                efd["interaction"] = action_dim
+                critic_config.edge_features_dims = efd
 
         value_module = critic_config.get_model(
             input_spec=critic_input_spec,
@@ -1469,12 +1538,13 @@ class HGTeam(HGTeamBase):
             device=self.device,
             action_spec=self.action_spec,
         )
+        # Enable action edge features on the critic GNN
+        if self.critic_use_other_actions and isinstance(critic_config, HeteroGnnConfig):
+            value_module._use_action_edge_features = True
 
         if self.share_param_critic and not self.centralised_value_per_agent:
             expand_module = TensorDictModule(
-                lambda value: value.unsqueeze(-2).expand(
-                    *value.shape[:-1], n_agents, 1
-                ),
+                lambda value: value.unsqueeze(-2).expand(*value.shape[:-1], n_agents, 1),
                 in_keys=["state_value"],
                 out_keys=[(group, "state_value")],
             )
@@ -1500,31 +1570,20 @@ class HGTeam(HGTeamBase):
                                Direct output: (group, state_value)
         """
         import copy
+
         type_order = list(self.group_map.keys())
-        total_agents = sum(len(a) for a in self.group_map.values())
 
         # --- Build shared GNN critic on first call -----------------------
         if self._shared_gnn_critic is None:
-            # Build input spec with each agent type as its own group
+            # Build input spec with each agent type as its own group.
+            # With critic_use_other_actions, actions are passed as GNN
+            # edge features (Option B), so the input spec is plain obs.
             critic_input_spec = Composite()
             for t in type_order:
-                n_t = len(self.group_map[t])
-                if self.critic_use_other_actions:
-                    obs_dim = self.observation_spec[t, "observation"].shape[-1]
-                    other_actions_dim = self._compute_other_actions_dim()
-                    augmented_dim = obs_dim + other_actions_dim
-                    critic_input_spec.set(
-                        t,
-                        Composite(
-                            {"critic_obs": Unbounded(shape=(n_t, augmented_dim))},
-                            shape=(n_t,),
-                        ),
-                    )
-                else:
-                    critic_input_spec.set(
-                        t,
-                        self.observation_spec[t].clone().to(self.device),
-                    )
+                critic_input_spec.set(
+                    t,
+                    self._obs_spec_for_model(self.observation_spec, t, self.device),
+                )
 
             # Add graph keys for ALL types
             if isinstance(self.critic_model_config, HeteroGnnConfig):
@@ -1532,35 +1591,44 @@ class HGTeam(HGTeamBase):
 
             # Build per-type node_features_keys and dims from the base config
             critic_config = copy.deepcopy(self.critic_model_config)
-            
+
             if isinstance(critic_config, HeteroGnnConfig):
                 # Set agent_groups so the GNN knows all types
                 critic_config.agent_groups = list(type_order)
-                
+
                 # Build per-type node feature keys (e.g., EV -> EV_participation_score)
                 base_node_features_keys = dict(critic_config.node_features_keys or {})
                 base_node_features_dims = dict(critic_config.node_features_dims or {})
-                
+
                 # Remove the generic "agents" placeholder if present
                 agents_feature_key = base_node_features_keys.pop("agents", None)
                 agents_feature_dim = base_node_features_dims.pop("agents", None)
-                
+
                 # Add per-type entries
                 for t in type_order:
                     if agents_feature_key is not None:
                         base_node_features_keys[t] = f"{t}_{agents_feature_key}"
                     if agents_feature_dim is not None:
                         base_node_features_dims[t] = agents_feature_dim
-                
+
                 critic_config.node_features_keys = base_node_features_keys
                 critic_config.node_features_dims = base_node_features_dims
-                
+
                 # Use a per-type edge key convention; the GNN's _forward will
                 # auto-discover {group}_agent_grid_edge_index for each group
                 critic_config.agent_node_index_key = "agent_grid_edge_index"
-                
+
                 if self.centralised_value_per_agent:
                     critic_config.prune_non_agent_final_layer = True
+
+                # When critic_use_other_actions, inject action edge features
+                # dims so TransformerConv allocates edge_dim weights for
+                # agent-agent interaction edges.
+                if self.critic_use_other_actions:
+                    action_dim = self._compute_other_actions_dim()
+                    efd = dict(critic_config.edge_features_dims or {})
+                    efd["interaction"] = action_dim
+                    critic_config.edge_features_dims = efd
 
             # Output spec: per-type state_value
             if self.centralised_value_per_agent:
@@ -1576,9 +1644,7 @@ class HGTeam(HGTeamBase):
                         ),
                     )
             else:
-                critic_output_spec = Composite(
-                    {"state_value": Unbounded(shape=(1,))}
-                )
+                critic_output_spec = Composite({"state_value": Unbounded(shape=(1,))})
 
             # The primary agent_group for the model (used for self.out_key, etc.)
             primary_group = type_order[0]
@@ -1595,6 +1661,9 @@ class HGTeam(HGTeamBase):
                 device=self.device,
                 action_spec=self.action_spec,
             )
+            # Enable action edge features on the critic GNN
+            if self.critic_use_other_actions:
+                self._shared_gnn_critic._use_action_edge_features = True
 
         # --- Per-group wrapper -------------------------------------------
         if self.centralised_value_per_agent:
@@ -1610,9 +1679,9 @@ class HGTeam(HGTeamBase):
                 return self._shared_gnn_critic
         else:
             # Fully centralised: single scalar value, expand per group
-            expand_fn = lambda value: value.unsqueeze(-2).expand(
-                *value.shape[:-1], n_agents, 1
-            )
+            def expand_fn(value):
+                return value.unsqueeze(-2).expand(*value.shape[:-1], n_agents, 1)
+
             expand_module = TensorDictModule(
                 expand_fn,
                 in_keys=["state_value"],
@@ -1651,18 +1720,22 @@ class HGTeamConfig(AlgorithmConfig):
     stochastic_z: bool = MISSING
     embedding_entropy_coef: float = MISSING
     embedding_diversity_coef: float = MISSING
-    
+
     # GNN configuration parameters
     gnn_num_layers: int = MISSING
     gnn_heads: int = MISSING
     gnn_concat_heads: bool = MISSING
     gnn_use_beta: bool = MISSING
     gnn_self_loops: bool = MISSING
-    gnn_agent_node_feature_key: Optional[str] = MISSING
+    gnn_agent_node_feature_key: str | None = MISSING
     gnn_agent_node_feature_dim: int = MISSING
-    critic_use_other_actions: bool = MISSING  # Condition value fn on other agents' actions (counterfactual)
-    gnn_norm_class: Optional[str] = MISSING  # "LayerNorm", "BatchNorm1d", etc. or null/None
-    critic_embed_dim: int = MISSING  # Common dimension for per-type observation projections in shared critic
+    critic_use_other_actions: bool = (
+        MISSING  # Condition value fn on other agents' actions (counterfactual)
+    )
+    gnn_norm_class: str | None = MISSING  # "LayerNorm", "BatchNorm1d", etc. or null/None
+    critic_embed_dim: int = (
+        MISSING  # Common dimension for per-type observation projections in shared critic
+    )
 
     # Split-z parameters (learned_query mode): separate GNN output into
     # z_token (deterministic, KV prepend) and z_query (cross-attention query).
@@ -1677,7 +1750,7 @@ class HGTeamConfig(AlgorithmConfig):
     vib_warmup_frames: int = MISSING
 
     @staticmethod
-    def associated_class() -> Type[Algorithm]:
+    def associated_class() -> type[Algorithm]:
         return HGTeam
 
     @staticmethod

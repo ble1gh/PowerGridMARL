@@ -17,4 +17,3 @@ parser.add_argument("--num-samples", default=1, type=int)
 parser.add_argument("--log-level", default="WARN", type=str)
 parser.add_argument("--redis-password", default=None, type=str)
 parser.add_argument("--node-ip-address", default="127.0.0.1", type=str)
-

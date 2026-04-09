@@ -6,17 +6,17 @@
 
 from .common import Algorithm, AlgorithmConfig
 from .ensemble import EnsembleAlgorithm, EnsembleAlgorithmConfig
+from .HGTeam import HGTeam, HGTeamConfig
+from .HGTeamHA import HGTeamHAPPO, HGTeamHAPPOConfig
+from .HGTeamSAC import HGTeamSAC, HGTeamSACConfig
 from .iddpg import Iddpg, IddpgConfig
 from .ippo import Ippo, IppoConfig
 from .iql import Iql, IqlConfig
 from .isac import Isac, IsacConfig
-from .HGTeam import HGTeam, HGTeamConfig
-from .HGTeamSAC import HGTeamSAC, HGTeamSACConfig
-from .HGTeamHA import HGTeamHAPPO, HGTeamHAPPOConfig
 from .maddpg import Maddpg, MaddpgConfig
 from .mappo import Mappo, MappoConfig
-from .mat import MAT, MATConfig
 from .masac import Masac, MasacConfig
+from .mat import MAT, MATConfig
 from .qmix import Qmix, QmixConfig
 from .vdn import Vdn, VdnConfig
 

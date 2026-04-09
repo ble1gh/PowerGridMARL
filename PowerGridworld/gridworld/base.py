@@ -1,67 +1,52 @@
 from abc import ABC, abstractmethod
 from copy import deepcopy
-from typing import Tuple, List, Dict
-
-import numpy as np
 
 import gymnasium as gym
-
-from gridworld.log import logger
+import numpy as np
 
 
 class ComponentEnv(gym.Env, ABC):
     """Base class for any environment used in the multiagent simulation."""
 
-    def __init__(
-        self,
-        name: str = None,
-        **kwargs
-    ):
+    def __init__(self, name: str = None, **kwargs):
         super().__init__()
-        
+
         self.name = name
-        self._real_power = 0.
-        self._reactive_power = 0.
+        self._real_power = 0.0
+        self._reactive_power = 0.0
         self._obs_labels = []
 
-
     @abstractmethod
-    def reset(self, **kwargs) -> Tuple[np.ndarray, dict]:
+    def reset(self, **kwargs) -> tuple[np.ndarray, dict]:
         """Standard gym reset method but with kwargs."""
         return
 
-
     @abstractmethod
-    def step(self, action: np.ndarray, **kwargs) -> Tuple[np.ndarray, float, bool, dict]:
+    def step(self, action: np.ndarray, **kwargs) -> tuple[np.ndarray, float, bool, dict]:
         """Standard gym step method but with kwargs."""
         return
 
-
     @abstractmethod
-    def step_reward(self, **kwargs) -> Tuple[float, dict]:
+    def step_reward(self, **kwargs) -> tuple[float, dict]:
         """Returns the current step reward and metadata dict."""
         return
-    
 
     @abstractmethod
-    def get_obs(self, **kwargs) -> Tuple[np.ndarray, dict]:
+    def get_obs(self, **kwargs) -> tuple[np.ndarray, dict]:
         """Returns the current observation (state) and any metadata."""
         return
 
-
     @property
     def real_power(self) -> float:
-        """Returns the real power of the component, positive for load and 
+        """Returns the real power of the component, positive for load and
         negative for generation."""
         return self._real_power
 
-
     @property
     def reactive_power(self) -> float:
-        """Returns the reactive power of the component, positive for load and 
+        """Returns the reactive power of the component, positive for load and
         negative for generation."""
         return self._reactive_power
-
 
     @property
     def obs_labels(self) -> list:
@@ -72,30 +57,23 @@ class ComponentEnv(gym.Env, ABC):
 
 
 class MultiComponentEnv(ComponentEnv):
-    """Class for creating a single Gym environment from multiple component 
+    """Class for creating a single Gym environment from multiple component
     environments.  The action and observation spaces of the multi-component env
     are taken as the union over the components.
     """
 
-    def __init__(
-            self, 
-            name: str = None,
-            components: List[dict] = None,
-            **kwargs
-        ):
+    def __init__(self, name: str = None, components: list[dict] = None, **kwargs):
 
         super().__init__(name=name, **kwargs)
-        
+
         self.envs = []
         for c in components:
             env = c["cls"](name=c["name"], **c["config"])
             self.envs.append(deepcopy(env))
 
-        self.observation_space = gym.spaces.Dict(
-            {e.name: e.observation_space for e in self.envs})
+        self.observation_space = gym.spaces.Dict({e.name: e.observation_space for e in self.envs})
 
-        self.action_space = gym.spaces.Dict(
-            {e.name: e.action_space for e in self.envs})
+        self.action_space = gym.spaces.Dict({e.name: e.action_space for e in self.envs})
 
         self._obs_labels_dict = {e.name: e.obs_labels for e in self.envs}
         obs_labels = []
@@ -103,26 +81,24 @@ class MultiComponentEnv(ComponentEnv):
             obs_labels += e.obs_labels
         self._obs_labels = list(set(obs_labels))
 
-
     def reset(self, **kwargs) -> dict:
         """Default reset method resets each component and returns the obs dict."""
         _ = [e.reset(**kwargs) for e in self.envs]
         return self.get_obs(**kwargs)
 
-
-    def step(self, action: dict, **kwargs) -> Tuple[dict, float, bool, dict]:
+    def step(self, action: dict, **kwargs) -> tuple[dict, float, bool, dict]:
         """Default step method composes the obs, reward, done, meta dictionaries
         from each component step."""
 
         # Initialize outputs.
-        real_power = 0.
+        real_power = 0.0
         obs = {}
         dones = []
         metas = {}
 
         # Loop over envs and collect real power injection/consumption.
         for env in self.envs:
-            env_kwargs = {k: v for k,v in kwargs.items() if k in env.obs_labels}
+            env_kwargs = {k: v for k, v in kwargs.items() if k in env.obs_labels}
             # Always pass current_time through (control metadata, not an obs dim)
             if "current_time" in kwargs:
                 env_kwargs["current_time"] = kwargs["current_time"]
@@ -137,16 +113,15 @@ class MultiComponentEnv(ComponentEnv):
 
         # Compute the step reward using user-implemented method.
         step_reward, _ = self.step_reward()
-        
+
         return obs, step_reward, any(dones), metas
 
-
-    def step_reward(self) -> Tuple[float, dict]:
+    def step_reward(self) -> tuple[float, dict]:
         """Default step reward simply sums those from the components.  Overwrite
         this method to customize how this is computed."""
 
         # Initialize outputs.
-        reward = 0.
+        reward = 0.0
         meta = {}
 
         # Loop over envs and create the reward dict.
@@ -157,9 +132,8 @@ class MultiComponentEnv(ComponentEnv):
 
         return reward, meta
 
-
-    def get_obs(self, **kwargs) -> Tuple[dict, dict]:
-        """Default get obs composes a dictionary of observations from each 
+    def get_obs(self, **kwargs) -> tuple[dict, dict]:
+        """Default get obs composes a dictionary of observations from each
         component env."""
 
         # Initialize outputs.
@@ -168,7 +142,7 @@ class MultiComponentEnv(ComponentEnv):
 
         # Loop over envs and create the observation dict (of dicts).
         for env in self.envs:
-            env_kwargs = {k: v for k,v in kwargs.items() if k in env.obs_labels}
+            env_kwargs = {k: v for k, v in kwargs.items() if k in env.obs_labels}
             # Always pass current_time through (control metadata, not an obs dim)
             if "current_time" in kwargs:
                 env_kwargs["current_time"] = kwargs["current_time"]
@@ -176,12 +150,10 @@ class MultiComponentEnv(ComponentEnv):
 
         return obs, meta
 
-
     @property
-    def obs_labels_dict(self) -> Dict[str, list]:
+    def obs_labels_dict(self) -> dict[str, list]:
         return self._obs_labels_dict
 
-
     @property
-    def env_dict(self) -> Dict[str, ComponentEnv]:
+    def env_dict(self) -> dict[str, ComponentEnv]:
         return {e.name: e for e in self.envs}

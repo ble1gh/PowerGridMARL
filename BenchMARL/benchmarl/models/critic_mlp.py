@@ -6,8 +6,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, MISSING
-from typing import Optional, Sequence, Type
+from collections.abc import Sequence
+from dataclasses import MISSING, dataclass
 
 import torch
 from tensordict import TensorDictBase
@@ -50,9 +50,7 @@ class Mlp(Model):
             is_critic=kwargs.pop("is_critic"),
         )
 
-        self.input_features = sum(
-            [spec.shape[-1] for spec in self.input_spec.values(True, True)]
-        )
+        self.input_features = sum([spec.shape[-1] for spec in self.input_spec.values(True, True)])
         self.output_features = self.output_leaf_spec.shape[-1]
 
         if self.input_has_agent_dim:
@@ -103,10 +101,7 @@ class Mlp(Model):
                     "If the MLP input has the agent dimension,"
                     f" the second to last spec dimension should be the number of agents, got {self.input_spec}"
                 )
-        if (
-            self.output_has_agent_dim
-            and self.output_leaf_spec.shape[-2] != self.n_agents
-        ):
+        if self.output_has_agent_dim and self.output_leaf_spec.shape[-2] != self.n_agents:
             raise ValueError(
                 "If the MLP output has the agent dimension,"
                 " the second to last spec dimension should be the number of agents"
@@ -144,13 +139,13 @@ class MlpConfig(ModelConfig):
     """Dataclass config for a :class:`~benchmarl.models.Mlp`."""
 
     num_cells: Sequence[int] = MISSING
-    layer_class: Type[nn.Module] = MISSING
+    layer_class: type[nn.Module] = MISSING
 
-    activation_class: Type[nn.Module] = MISSING
-    activation_kwargs: Optional[dict] = None
+    activation_class: type[nn.Module] = MISSING
+    activation_kwargs: dict | None = None
 
-    norm_class: Type[nn.Module] = None
-    norm_kwargs: Optional[dict] = None
+    norm_class: type[nn.Module] = None
+    norm_kwargs: dict | None = None
 
     @staticmethod
     def associated_class():

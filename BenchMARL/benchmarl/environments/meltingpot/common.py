@@ -4,11 +4,10 @@
 #  LICENSE file in the root directory of this source tree.
 #
 import copy
-from typing import Callable, Dict, List, Optional
+from collections.abc import Callable
 
 import torch
 from tensordict import TensorDictBase
-
 from torchrl.data import Composite
 from torchrl.envs import (
     DoubleToFloat,
@@ -27,7 +26,7 @@ class MeltingPotClass(TaskClass):
         self,
         num_envs: int,
         continuous_actions: bool,
-        seed: Optional[int],
+        seed: int | None,
         device: DEVICE_TYPING,
     ) -> Callable[[], EnvBase]:
         from torchrl.envs.libs.meltingpot import MeltingpotEnv
@@ -53,10 +52,10 @@ class MeltingPotClass(TaskClass):
     def max_steps(self, env: EnvBase) -> int:
         return self.config.get("max_steps", 100)
 
-    def group_map(self, env: EnvBase) -> Dict[str, List[str]]:
+    def group_map(self, env: EnvBase) -> dict[str, list[str]]:
         return env.group_map
 
-    def get_env_transforms(self, env: EnvBase) -> List[Transform]:
+    def get_env_transforms(self, env: EnvBase) -> list[Transform]:
         interaction_inventories_keys = [
             (group, "observation", "INTERACTION_INVENTORIES")
             for group in self.group_map(env).keys()
@@ -75,7 +74,7 @@ class MeltingPotClass(TaskClass):
             else []
         )
 
-    def get_replay_buffer_transforms(self, env: EnvBase, group: str) -> List[Transform]:
+    def get_replay_buffer_transforms(self, env: EnvBase, group: str) -> list[Transform]:
         return [
             DTypeCastTransform(
                 dtype_in=torch.uint8,
@@ -90,7 +89,7 @@ class MeltingPotClass(TaskClass):
             )
         ]
 
-    def state_spec(self, env: EnvBase) -> Optional[Composite]:
+    def state_spec(self, env: EnvBase) -> Composite | None:
         observation_spec = env.observation_spec.clone()
         for group in self.group_map(env):
             del observation_spec[group]
@@ -100,7 +99,7 @@ class MeltingPotClass(TaskClass):
             )
         return observation_spec
 
-    def action_mask_spec(self, env: EnvBase) -> Optional[Composite]:
+    def action_mask_spec(self, env: EnvBase) -> Composite | None:
         return None
 
     def observation_spec(self, env: EnvBase) -> Composite:
@@ -110,7 +109,7 @@ class MeltingPotClass(TaskClass):
                 del observation_spec[group_key]
         return observation_spec
 
-    def info_spec(self, env: EnvBase) -> Optional[Composite]:
+    def info_spec(self, env: EnvBase) -> Composite | None:
         observation_spec = env.observation_spec.clone()
         for group_key in list(observation_spec.keys()):
             if group_key not in self.group_map(env).keys():

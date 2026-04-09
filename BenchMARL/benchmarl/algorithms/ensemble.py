@@ -5,16 +5,14 @@
 #
 
 
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Dict, Iterable, Optional, Tuple, Type
 
 from tensordict import TensorDictBase
 from tensordict.nn import TensorDictModule
-
 from torchrl.objectives import LossModule
 
 from benchmarl.algorithms.common import Algorithm, AlgorithmConfig
-
 from benchmarl.models.common import ModelConfig
 
 
@@ -25,18 +23,16 @@ class EnsembleAlgorithm(Algorithm):
 
     def _get_loss(
         self, group: str, policy_for_loss: TensorDictModule, continuous: bool
-    ) -> Tuple[LossModule, bool]:
+    ) -> tuple[LossModule, bool]:
         return self.algorithms_map[group]._get_loss(group, policy_for_loss, continuous)
 
-    def _get_parameters(self, group: str, loss: LossModule) -> Dict[str, Iterable]:
+    def _get_parameters(self, group: str, loss: LossModule) -> dict[str, Iterable]:
         return self.algorithms_map[group]._get_parameters(group, loss)
 
     def _get_policy_for_loss(
         self, group: str, model_config: ModelConfig, continuous: bool
     ) -> TensorDictModule:
-        return self.algorithms_map[group]._get_policy_for_loss(
-            group, model_config, continuous
-        )
+        return self.algorithms_map[group]._get_policy_for_loss(group, model_config, continuous)
 
     def _get_policy_for_collection(
         self, policy_for_loss: TensorDictModule, group: str, continuous: bool
@@ -48,16 +44,13 @@ class EnsembleAlgorithm(Algorithm):
     def process_batch(self, group: str, batch: TensorDictBase) -> TensorDictBase:
         return self.algorithms_map[group].process_batch(group, batch)
 
-    def process_loss_vals(
-        self, group: str, loss_vals: TensorDictBase
-    ) -> TensorDictBase:
+    def process_loss_vals(self, group: str, loss_vals: TensorDictBase) -> TensorDictBase:
         return self.algorithms_map[group].process_loss_vals(group, loss_vals)
 
 
 @dataclass
 class EnsembleAlgorithmConfig(AlgorithmConfig):
-
-    algorithm_configs_map: Dict[str, AlgorithmConfig]
+    algorithm_configs_map: dict[str, AlgorithmConfig]
 
     def __post_init__(self):
         algorithm_configs = list(self.algorithm_configs_map.values())
@@ -69,10 +62,7 @@ class EnsembleAlgorithmConfig(AlgorithmConfig):
                     "Algorithms in EnsembleAlgorithmConfig must either be all on_policy or all off_policy"
                 )
 
-        if (
-            not self.supports_discrete_actions()
-            and not self.supports_continuous_actions()
-        ):
+        if not self.supports_discrete_actions() and not self.supports_continuous_actions():
             raise ValueError(
                 "Ensemble algorithm does not support discrete actions nor continuous actions."
                 " Make sure that at least one type of action is supported across all the algorithms used."
@@ -93,11 +83,11 @@ class EnsembleAlgorithmConfig(AlgorithmConfig):
         )
 
     @classmethod
-    def get_from_yaml(cls, path: Optional[str] = None):
+    def get_from_yaml(cls, path: str | None = None):
         raise NotImplementedError
 
     @staticmethod
-    def associated_class() -> Type[Algorithm]:
+    def associated_class() -> type[Algorithm]:
         return EnsembleAlgorithm
 
     def on_policy(self) -> bool:
@@ -106,9 +96,7 @@ class EnsembleAlgorithmConfig(AlgorithmConfig):
     def supports_continuous_actions(self) -> bool:
         supports_continuous_actions = True
         for algorithm_config in self.algorithm_configs_map.values():
-            supports_continuous_actions *= (
-                algorithm_config.supports_continuous_actions()
-            )
+            supports_continuous_actions *= algorithm_config.supports_continuous_actions()
         return supports_continuous_actions
 
     def supports_discrete_actions(self) -> bool:

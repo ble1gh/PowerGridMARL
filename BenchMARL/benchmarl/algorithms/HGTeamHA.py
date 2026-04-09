@@ -28,8 +28,9 @@ Design decisions (see /memories/session/happo-design-decisions.md):
 """
 
 import random
-from dataclasses import dataclass, MISSING
-from typing import Dict, Iterable, Optional, Tuple, Type
+import warnings
+from collections.abc import Iterable
+from dataclasses import MISSING, dataclass
 
 import torch
 from tensordict import TensorDictBase
@@ -38,7 +39,6 @@ from torchrl.objectives import ClipPPOLoss, LossModule, ValueEstimators
 
 from benchmarl.algorithms.common import Algorithm, AlgorithmConfig
 from benchmarl.algorithms.HGTeam import HGTeam, HGTeamBase, HGTeamLoss
-from benchmarl.models.common import ModelConfig
 
 
 class HGTeamHAPPOLoss(HGTeamLoss):
@@ -51,9 +51,19 @@ class HGTeamHAPPOLoss(HGTeamLoss):
     FACTOR_KEY = "happo_factor"
 
     def forward(self, tensordict: TensorDictBase) -> TensorDictBase:
-        # If a factor is stored in the tensordict, inject it into the
-        # advantage so that ClipPPOLoss.forward sees ``factor * advantage``.
-        # We restore the original advantage after the call.
+        """Compute PPO loss with HAPPO factor-weighted advantages.
+
+        Reads ``happo_factor`` from *tensordict* and multiplies it into
+        the advantage before delegating to ``HGTeamLoss.forward()``.  The
+        original advantage is restored afterwards.
+
+        Args:
+            tensordict: Batch tensordict with advantages and optional
+                ``happo_factor`` key.
+
+        Returns:
+            TensorDict with loss keys (same as ``HGTeamLoss.forward``).
+        """
         adv_key = (self.group, "advantage")
         factor = tensordict.get(self.FACTOR_KEY, None)
 
@@ -107,7 +117,24 @@ class HGTeamHAPPO(HGTeamBase):
         fixed_order: bool = False,
         critic_use_other_actions: bool = False,
         **kwargs,
-    ):
+    ) -> None:
+        """Initialise HGTeamHAPPO with PPO + HAPPO-specific parameters.
+
+        Args:
+            clip_epsilon: PPO clipping parameter ε.
+            entropy_coef: Entropy bonus coefficient.
+            critic_coef: Critic loss weight.
+            loss_critic_type: Critic loss type (``"smooth_l1"`` or ``"l2"``).
+            lmbda: GAE λ for advantage estimation.
+            minibatch_advantage: If True, compute GAE per minibatch.
+            encoder_update_mode: ``"accumulated"`` (GNN grads accumulated
+                across groups, stepped at lr/3) or ``"separate_forward"``
+                (GNN frozen during head updates, separate forward pass).
+            fixed_order: If True, use deterministic group ordering.
+            critic_use_other_actions: If True, pass actions as GNN edge
+                features on the critic.
+            **kwargs: Forwarded to ``HGTeamBase.__init__``.
+        """
         super().__init__(**kwargs)
 
         self.clip_epsilon = clip_epsilon
@@ -120,10 +147,10 @@ class HGTeamHAPPO(HGTeamBase):
         self.fixed_order = fixed_order
         self.critic_use_other_actions = critic_use_other_actions
 
-        if encoder_update_mode not in ("accumulated", "separate_forward"):
+        if encoder_update_mode not in ("accumulated", "separate_forward", "coop_encoder"):
             raise ValueError(
-                f"encoder_update_mode must be 'accumulated' or "
-                f"'separate_forward', got '{encoder_update_mode}'"
+                f"encoder_update_mode must be 'accumulated', "
+                f"'separate_forward', or 'coop_encoder', got '{encoder_update_mode}'"
             )
 
     # ------------------------------------------------------------------
@@ -132,7 +159,15 @@ class HGTeamHAPPO(HGTeamBase):
 
     def _get_loss(
         self, group: str, policy_for_loss: TensorDictModule, continuous: bool
-    ) -> Tuple[LossModule, bool]:
+    ) -> tuple[LossModule, bool]:
+        """Create HGTeamHAPPOLoss for *group* with GAE value estimator.
+
+        Identical to ``HGTeam._get_loss`` except uses ``HGTeamHAPPOLoss``
+        which multiplies advantages by the HAPPO factor.
+
+        Returns:
+            ``(loss_module, False)`` — False means no target-network updater.
+        """
         loss_module = HGTeamHAPPOLoss(
             algorithm=self,
             group=group,
@@ -142,8 +177,8 @@ class HGTeamHAPPO(HGTeamBase):
             entropy_coeff=self.entropy_coef,
             critic_coeff=self.critic_coef,
             loss_critic_type=self.loss_critic_type,
-            normalize_advantage=True,
-            normalize_advantage_exclude_dims=(1,),
+            normalize_advantage=False,
+            reduction="none",
         )
         loss_module.set_keys(
             reward=(group, "reward"),
@@ -164,7 +199,13 @@ class HGTeamHAPPO(HGTeamBase):
         )
         return loss_module, False
 
-    def _get_parameters(self, group: str, loss: ClipPPOLoss) -> Dict[str, Iterable]:
+    def _get_parameters(self, group: str, loss: ClipPPOLoss) -> dict[str, Iterable]:
+        """Return optimizer param groups with encoder-update-mode handling.
+
+        In ``accumulated`` mode, shared GNN params are included at lr/N.
+        In ``separate_forward`` mode, GNN params are stripped (handled by
+        a dedicated GNN optimizer in ``train_groups``).
+        """
         actor_params = list(loss.actor_network_params.flatten_keys().values())
 
         if self.gnn_mode != "none" and self._shared_actor_gnn is not None:
@@ -180,15 +221,10 @@ class HGTeamHAPPO(HGTeamBase):
                     actor_params, self._shared_actor_gnn
                 )
             else:
-                # Mode B (separate_forward): strip GNN params from per-group
-                # optimizer entirely — they'll be handled by gnn_optimizer.
-                shared_ptrs = {
-                    p.data_ptr() for p in self._shared_actor_gnn.parameters()
-                }
-                actor_params = [
-                    p for p in actor_params
-                    if p.data_ptr() not in shared_ptrs
-                ]
+                # separate_forward / coop_encoder: strip GNN params from
+                # per-group optimizer — they're handled by gnn_optimizer.
+                shared_ptrs = {p.data_ptr() for p in self._shared_actor_gnn.parameters()}
+                actor_params = [p for p in actor_params if p.data_ptr() not in shared_ptrs]
 
         critic_params = list(loss.critic_network_params.flatten_keys().values())
         if self._shared_gnn_critic is not None:
@@ -207,9 +243,16 @@ class HGTeamHAPPO(HGTeamBase):
     def _get_policy_for_collection(
         self, policy_for_loss: TensorDictModule, group: str, continuous: bool
     ) -> TensorDictModule:
+        """Return the collection policy (same as loss policy for on-policy)."""
         return policy_for_loss
 
     def process_batch(self, group: str, batch: TensorDictBase) -> TensorDictBase:
+        """Prepare a collected batch for HAPPO training.
+
+        Same as ``HGTeam.process_batch``: broadcasts shared keys, computes
+        GAE advantages, zeros inactive agents (D7), and applies S8a per-slot
+        masked advantage normalisation.
+        """
         batch = batch.to(self.device)
         keys = list(batch.keys(True, True))
         group_shape = batch.get(group).shape
@@ -226,9 +269,7 @@ class HGTeamHAPPO(HGTeamBase):
         if nested_terminated_key not in keys:
             batch.set(
                 nested_terminated_key,
-                batch.get(("next", "terminated"))
-                .unsqueeze(-1)
-                .expand((*group_shape, 1)),
+                batch.get(("next", "terminated")).unsqueeze(-1).expand((*group_shape, 1)),
             )
         if nested_reward_key not in keys:
             batch.set(
@@ -236,14 +277,10 @@ class HGTeamHAPPO(HGTeamBase):
                 batch.get(("next", "reward")).unsqueeze(-1).expand((*group_shape, 1)),
             )
 
-        if self.critic_use_other_actions:
-            self._augment_critic_observations(batch)
-
         loss = self.get_loss_and_updater(group)[0]
         if self.minibatch_advantage:
             increment = -(
-                -self.experiment.config.train_minibatch_size(self.on_policy)
-                // batch.shape[1]
+                -self.experiment.config.train_minibatch_size(self.on_policy) // batch.shape[1]
             )
         else:
             increment = batch.batch_size[0] + 1
@@ -263,14 +300,58 @@ class HGTeamHAPPO(HGTeamBase):
             start_index += increment
 
         batch = torch.cat(minibatches, dim=0)
+
+        # --- Zero out advantages for inactive (padded) agent slots ---
+        active_mask = batch.get((group, "active_mask"), None)
+        if active_mask is not None:
+            adv = batch.get((group, "advantage"))
+            vtarg = batch.get((group, "value_target"))
+            vval = batch.get((group, "state_value"))
+            m = active_mask
+            while m.dim() < adv.dim():
+                m = m.unsqueeze(-1)
+            m = m.expand_as(adv)
+            adv[~m] = 0.0
+            vtarg[~m] = vval[~m].detach()
+
+            # --- S8a: Per-slot masked advantage normalization ---
+            # See HGTeam.process_batch for full rationale.
+            agent_dim = active_mask.dim() - 1  # last dim of active_mask
+            n_agents = active_mask.shape[agent_dim]
+            for slot in range(n_agents):
+                slot_active = active_mask.select(agent_dim, slot)  # (*batch_dims) bool
+                if slot_active.sum() > 1:
+                    slot_adv_view = adv.select(agent_dim, slot)  # (*batch_dims, 1)
+                    slot_vals = slot_adv_view[slot_active]  # (n_active, 1)
+                    slot_adv_view[slot_active] = (
+                        slot_vals - slot_vals.mean()
+                    ) / slot_vals.std(correction=0).clamp(min=1e-7)
+        else:
+            # No active_mask — fall back to standard per-slot normalization.
+            warnings.warn(
+                f"HGTeamHAPPO.process_batch({group}): 'active_mask' not found. "
+                "Falling back to standard per-slot advantage normalization "
+                "(no inactive-agent masking).",
+                stacklevel=2,
+            )
+            adv = batch.get((group, "advantage"))
+            agent_dim = adv.dim() - 2  # second-to-last: (*batch_dims, n_agents, 1)
+            n_agents = adv.shape[agent_dim]
+            for slot in range(n_agents):
+                slot_adv_view = adv.select(agent_dim, slot)  # (*batch_dims, 1)
+                if slot_adv_view.numel() > 1:
+                    slot_adv_view.copy_(
+                        (slot_adv_view - slot_adv_view.mean())
+                        / slot_adv_view.std(correction=0).clamp(min=1e-7)
+                    )
+
         return batch
 
     def process_loss_vals(
         self, group: str, loss_vals: TensorDictBase, batch: TensorDictBase = None
     ) -> TensorDictBase:
-        loss_vals.set(
-            "loss_objective", loss_vals["loss_objective"] + loss_vals["loss_entropy"]
-        )
+        """Post-process loss values: merge entropy loss into objective."""
+        loss_vals.set("loss_objective", loss_vals["loss_objective"] + loss_vals["loss_entropy"])
         del loss_vals["loss_entropy"]
         return loss_vals
 
@@ -278,8 +359,6 @@ class HGTeamHAPPO(HGTeamBase):
     # HGTeamBase, but get_critic is defined on HGTeam).
     get_critic = HGTeam.get_critic
     _get_shared_critic = HGTeam._get_shared_critic
-    _augment_critic_observations = HGTeam._augment_critic_observations
-    _compute_augmented_obs = HGTeam._compute_augmented_obs
     _compute_other_actions_dim = HGTeam._compute_other_actions_dim
     _split_shared_gnn_param_groups = HGTeam._split_shared_gnn_param_groups
 
@@ -287,7 +366,12 @@ class HGTeamHAPPO(HGTeamBase):
     # HAPPO sequential training loop
     # ------------------------------------------------------------------
 
-    def train_groups(self, experiment, batch, current_frames: int):
+    def train_groups(
+        self,
+        experiment: "Experiment",  # noqa: F821
+        batch: TensorDictBase,
+        current_frames: int,
+    ) -> None:
         """Sequential HAPPO training across groups.
 
         For each collection iteration:
@@ -300,6 +384,9 @@ class HGTeamHAPPO(HGTeamBase):
         4. If encoder_update_mode == "accumulated": step GNN optimizer once.
            If encoder_update_mode == "separate_forward": unfreeze GNN, fresh
            forward+backward, step GNN optimizer.
+           If encoder_update_mode == "coop_encoder": unfreeze GNN, compute
+           cooperative advantage (mean of per-agent raw advantages), run
+           cooperative PPO surrogate + VIB, step GNN optimizer.
         5. Run callbacks and exploration schedule.
         """
         groups = list(experiment.train_group_map.keys())
@@ -344,19 +431,45 @@ class HGTeamHAPPO(HGTeamBase):
             buf_len = len(buffer)
             storage_device = buffer.storage.device
 
-            # --- Snapshot old log-probs before update ---
+            # --- Snapshot old log-probs under the *current* policy ---
+            # In accumulated mode, previous groups' PPO updates have already
+            # stepped the shared GNN, so the stored collection-time log-probs
+            # no longer reflect the current encoder.  We re-evaluate log-probs
+            # under the current policy so that the HAPPO factor captures only
+            # this group's policy change, not shared-encoder drift from
+            # earlier groups.
+            import contextlib
+
+            chunk_size_snap = experiment.config.train_minibatch_size(self.on_policy)
             with torch.no_grad():
                 full_data = buffer[:buf_len]
-                old_log_probs = full_data.get(
-                    (group, "log_prob")
-                ).to(experiment.config.train_device)
+                if g_idx > 0 and self.encoder_update_mode == "accumulated":
+                    ctx_snap = (
+                        loss_module.actor_network_params.to_module(loss_module.actor_network)
+                        if loss_module.functional
+                        else contextlib.nullcontext()
+                    )
+                    lp_chunks = []
+                    for chunk in full_data.chunk(
+                        max(1, -(-full_data.shape[0] // chunk_size_snap)), dim=0
+                    ):
+                        chunk_dev = chunk.to(experiment.config.train_device)
+                        with ctx_snap:
+                            dist_snap = loss_module.actor_network.get_dist(chunk_dev)
+                        action_snap = chunk_dev.get((group, "action"))
+                        lp_chunks.append(dist_snap.log_prob(action_snap).cpu())
+                    old_log_probs = torch.cat(lp_chunks, dim=0).to(experiment.config.train_device)
+                else:
+                    old_log_probs = full_data.get((group, "log_prob")).to(
+                        experiment.config.train_device
+                    )
 
             # --- Write factor into buffer storage ---
             storage_td = buffer.storage._storage
             if g_idx == 0 or cumulative_log_factor is None:
                 # First group: factor = 1 everywhere → no weighting.
                 # Ensure the key exists with ones so the loss can read it.
-                if factor_key not in storage_td.keys():
+                if factor_key not in storage_td:
                     storage_td.set(
                         factor_key,
                         torch.ones(*storage_td.batch_size, device=storage_device),
@@ -364,18 +477,16 @@ class HGTeamHAPPO(HGTeamBase):
                 else:
                     storage_td[factor_key][:buf_len] = 1.0
             else:
-                factor_vals = torch.exp(
-                    cumulative_log_factor[:buf_len].to(storage_device)
-                ).detach()
-                if factor_key not in storage_td.keys():
+                factor_vals = torch.exp(cumulative_log_factor[:buf_len].to(storage_device)).detach()
+                if factor_key not in storage_td:
                     storage_td.set(
                         factor_key,
                         torch.ones(*storage_td.batch_size, device=storage_device),
                     )
                 storage_td[factor_key][:buf_len] = factor_vals
 
-            # --- Freeze GNN if separate_forward mode ---
-            if self.encoder_update_mode == "separate_forward":
+            # --- Freeze GNN if separate_forward or coop_encoder mode ---
+            if self.encoder_update_mode in ("separate_forward", "coop_encoder"):
                 if self._shared_actor_gnn is not None:
                     for p in self._shared_actor_gnn.parameters():
                         p.requires_grad_(False)
@@ -398,6 +509,7 @@ class HGTeamHAPPO(HGTeamBase):
             # size matches train_minibatch_size, which is already known to
             # fit in GPU memory from the PPO optimizer loop.
             import contextlib
+
             chunk_size = experiment.config.train_minibatch_size(self.on_policy)
             with torch.no_grad():
                 ctx = (
@@ -412,9 +524,7 @@ class HGTeamHAPPO(HGTeamBase):
                         dist = loss_module.actor_network.get_dist(chunk_dev)
                     action = chunk_dev.get((group, "action"))
                     new_lp_chunks.append(dist.log_prob(action).cpu())
-                new_log_probs = torch.cat(new_lp_chunks, dim=0).to(
-                    experiment.config.train_device
-                )
+                new_log_probs = torch.cat(new_lp_chunks, dim=0).to(experiment.config.train_device)
                 # Ensure shape matches old_log_probs
                 if new_log_probs.dim() < old_log_probs.dim():
                     new_log_probs = new_log_probs.unsqueeze(-1)
@@ -423,6 +533,16 @@ class HGTeamHAPPO(HGTeamBase):
 
             # Group ratio in log-space: sum over agents
             log_ratio_per_agent = new_log_probs - old_log_probs
+
+            # Mask inactive agent log-ratios so padded slots don't
+            # corrupt the HAPPO factor passed to subsequent groups.
+            agent_mask = full_data.get((group, "active_mask"), None)
+            if agent_mask is not None:
+                am = agent_mask.to(log_ratio_per_agent.device).float()
+                while am.dim() < log_ratio_per_agent.dim():
+                    am = am.unsqueeze(-1)
+                log_ratio_per_agent = log_ratio_per_agent * am
+
             # Sum over non-batch dims (agent / action dims) to get per-sample
             # group-level log-ratio.  Batch dims come from the buffer storage.
             n_batch_dims = len(full_data.batch_size)
@@ -433,7 +553,29 @@ class HGTeamHAPPO(HGTeamBase):
             else:
                 log_group_ratio = log_ratio_per_agent
 
-            # Clip the ratio: min(ratio, clip(ratio, 1-eps, 1+eps))
+            # --- Mean log-ratio normalization (Option A) ---
+            # Divide the summed log-ratio by the number of active agents so
+            # the group factor becomes the *geometric mean* of per-agent
+            # importance ratios:  (∏ rᵢ)^{1/n} instead of ∏ rᵢ.
+            # Without this, the product's variance grows exponentially with
+            # agent count, causing systematic clipping bias for larger groups
+            # and inconsistent factor magnitude across samples with different
+            # numbers of active agents.
+            if agent_mask is not None:
+                n_active = agent_mask.float().sum(dim=-1).clamp(min=1)
+                # n_active shape: (batch,) or (batch, ...) — reduce extra dims
+                while n_active.dim() > n_batch_dims:
+                    n_active = n_active.sum(dim=-1)
+                log_group_ratio = log_group_ratio / n_active.to(log_group_ratio.device)
+
+            # Clip the ratio with HAPPO's *pessimistic* (asymmetric) clamp.
+            # min(ratio, clip(ratio, 1-ε, 1+ε)) caps the upside at 1+ε
+            # (preventing an over-optimistic factor from inflating downstream
+            # advantages) but allows unrestricted downside: if a previous
+            # group's policy worsened significantly (ratio ≪ 1-ε), the factor
+            # shrinks freely, dampening subsequent groups' updates.
+            # This asymmetry is required for the monotonic-improvement
+            # guarantee in HAPPO (Kuba et al., 2022, Theorem 1).
             group_ratio = torch.exp(log_group_ratio)
             clipped_ratio = torch.clamp(
                 group_ratio,
@@ -447,14 +589,10 @@ class HGTeamHAPPO(HGTeamBase):
             if cumulative_log_factor is None:
                 cumulative_log_factor = log_factor_update.cpu()
             else:
-                cumulative_log_factor = (
-                    cumulative_log_factor + log_factor_update.cpu()
-                )
+                cumulative_log_factor = cumulative_log_factor + log_factor_update.cpu()
 
             # --- Log training and callbacks ---
-            experiment.logger.log_training(
-                group, training_td, step=experiment.n_iters_performed
-            )
+            experiment.logger.log_training(group, training_td, step=experiment.n_iters_performed)
             experiment._on_train_end(training_td, group)
 
             # --- Exploration schedule ---
@@ -477,8 +615,11 @@ class HGTeamHAPPO(HGTeamBase):
                 pass
 
             elif self.encoder_update_mode == "separate_forward":
-                # Mode B: Unfreeze GNN, run a fresh forward+backward on
-                # the last group's buffer data, then step.
+                # Unfreeze GNN, then accumulate gradients from all groups
+                # (one forward+backward per group, step once at the end).
+                # This ensures balanced gradient signal — each group
+                # contributes equally to the encoder update regardless of
+                # the random ordering used for HAPPO sequencing.
                 for p in self._shared_actor_gnn.parameters():
                     p.requires_grad_(True)
 
@@ -491,25 +632,258 @@ class HGTeamHAPPO(HGTeamBase):
                         eps=self.experiment_config.adam_eps,
                     )
 
-                # Use the last group's buffer for the encoder update
-                last_group = group_order[-1]
-                buffer = experiment.replay_buffers[last_group]
-                subdata = buffer.sample().to(experiment.config.train_device)
+                n_groups = len(group_order)
+                self._gnn_optimizer.zero_grad()
 
-                # Forward through loss to get gradients on GNN
-                loss_vals = experiment.losses[last_group](subdata)
-                loss_vals = self.process_loss_vals(last_group, loss_vals, batch=subdata)
-                obj_loss = loss_vals.get("loss_objective", None)
-                if obj_loss is not None:
-                    self._gnn_optimizer.zero_grad()
-                    obj_loss.backward()
-                    if experiment.config.clip_grad_norm and experiment.config.clip_grad_val is not None:
-                        torch.nn.utils.clip_grad_norm_(
-                            self._shared_actor_gnn.parameters(),
-                            experiment.config.clip_grad_val,
+                for gnn_group in group_order:
+                    buffer = experiment.replay_buffers[gnn_group]
+                    subdata = buffer.sample().to(experiment.config.train_device)
+
+                    # Forward through this group's loss to get GNN gradients
+                    loss_vals = experiment.losses[gnn_group](subdata)
+                    loss_vals = self.process_loss_vals(gnn_group, loss_vals, batch=subdata)
+                    obj_loss = loss_vals.get("loss_objective", None)
+                    if obj_loss is not None:
+                        # Scale by 1/n_groups so accumulated grads average
+                        (obj_loss / n_groups).backward()
+
+                if experiment.config.clip_grad_norm and experiment.config.clip_grad_val is not None:
+                    torch.nn.utils.clip_grad_norm_(
+                        self._shared_actor_gnn.parameters(),
+                        experiment.config.clip_grad_val,
+                    )
+                self._gnn_optimizer.step()
+                self._gnn_optimizer.zero_grad()
+
+            elif self.encoder_update_mode == "coop_encoder":
+                # Cooperative encoder update (Option 4 — value averaging).
+                #
+                # The cooperative advantage is the mean of per-agent raw
+                # (pre-S8a) advantages across all active agents.  By
+                # linearity of GAE:
+                #   mean_i(A^i) = mean_i(V_target^i - V^i)
+                # Both V_target and V (state_value) are in the replay
+                # buffers after process_batch.
+                #
+                # The cooperative PPO surrogate uses a global importance
+                # ratio: r = exp(mean_active(log π_new) - mean_active(log π_old))
+                # with the cooperative advantage as the signal.
+                #
+                # The encoder loss is: -L_coop_obj + β_VIB · D_KL
+                # The cooperative critic loss (mean(V_target - V)^2) is
+                # logged as a tracking metric only, not used for training.
+
+                import contextlib
+
+                for p in self._shared_actor_gnn.parameters():
+                    p.requires_grad_(True)
+
+                if not hasattr(self, "_gnn_optimizer"):
+                    gnn_params = list(self._shared_actor_gnn.parameters())
+                    self._gnn_optimizer = torch.optim.Adam(
+                        gnn_params,
+                        lr=self.experiment_config.lr,
+                        eps=self.experiment_config.adam_eps,
+                    )
+
+                train_device = experiment.config.train_device
+                chunk_size = experiment.config.train_minibatch_size(self.on_policy)
+
+                # --- Compute cooperative advantage from all group buffers ---
+                # Raw advantage = value_target - state_value (post-D7, pre-S8a
+                # normalization is implicit: D7 set vtarg=sval for inactive
+                # agents, so their contribution is zero).
+                sum_raw_adv = None
+                sum_coop_sval = None
+                sum_coop_vtarg = None
+                total_active = None
+                buf_len = None
+
+                for g in groups:
+                    gbuf = experiment.replay_buffers[g]
+                    glen = len(gbuf)
+                    if buf_len is None:
+                        buf_len = glen
+                    gdata = gbuf[:glen]
+                    vtarg = gdata.get((g, "value_target"))  # (buf, n_agents, 1)
+                    sval = gdata.get((g, "state_value"))    # (buf, n_agents, 1)
+                    amask = gdata.get((g, "active_mask"), None)  # (buf, n_agents)
+
+                    raw_adv = vtarg - sval  # per-agent raw advantage
+                    if amask is not None:
+                        m = amask.float().unsqueeze(-1)  # (buf, n_agents, 1)
+                    else:
+                        m = torch.ones_like(raw_adv)
+
+                    g_sum = (raw_adv * m).sum(dim=1)     # (buf, 1)
+                    g_sval = (sval * m).sum(dim=1)       # (buf, 1)
+                    g_vtarg = (vtarg * m).sum(dim=1)     # (buf, 1)
+                    g_nact = m.sum(dim=1)                # (buf, 1)
+
+                    if sum_raw_adv is None:
+                        sum_raw_adv = g_sum
+                        sum_coop_sval = g_sval
+                        sum_coop_vtarg = g_vtarg
+                        total_active = g_nact
+                    else:
+                        sum_raw_adv = sum_raw_adv + g_sum
+                        sum_coop_sval = sum_coop_sval + g_sval
+                        sum_coop_vtarg = sum_coop_vtarg + g_vtarg
+                        total_active = total_active + g_nact
+
+                coop_adv = sum_raw_adv / total_active.clamp(min=1)  # (buf, 1)
+                coop_sval = sum_coop_sval / total_active.clamp(min=1)
+                coop_vtarg = sum_coop_vtarg / total_active.clamp(min=1)
+
+                # Z-score normalize cooperative advantage
+                coop_adv = (coop_adv - coop_adv.mean()) / coop_adv.std().clamp(min=1e-7)
+
+                # --- Log cooperative critic loss (tracking only) ---
+                coop_critic_loss = ((coop_vtarg - coop_sval) ** 2).mean().item()
+                experiment.logger.log(
+                    {
+                        "train/coop_encoder/coop_critic_loss": coop_critic_loss,
+                        "train/coop_encoder/coop_adv_std_raw": (
+                            sum_raw_adv / total_active.clamp(min=1)
+                        ).std().item(),
+                    },
+                    step=experiment.n_iters_performed,
+                )
+
+                # --- Compute old cooperative log-probs (from collection) ---
+                # GNN was frozen during Phase 1 and these are collection-time
+                # log_probs, so they use the same GNN + pre-Phase-1 heads.
+                old_coop_lp_sum = torch.zeros(buf_len, device="cpu")
+                old_total_active = torch.zeros(buf_len, device="cpu")
+                for g in groups:
+                    gbuf = experiment.replay_buffers[g]
+                    gdata = gbuf[:buf_len]
+                    lp = gdata.get((g, "log_prob"))  # (buf, n_agents, ...) or (buf, n_agents)
+                    amask = gdata.get((g, "active_mask"), None)
+                    if amask is not None:
+                        am = amask.float()
+                        while am.dim() < lp.dim():
+                            am = am.unsqueeze(-1)
+                        masked_lp = (lp * am).sum(dim=tuple(range(1, lp.dim())))  # (buf,)
+                        n_act = amask.float().sum(dim=-1)  # (buf,)
+                    else:
+                        masked_lp = lp.sum(dim=tuple(range(1, lp.dim())))
+                        n_act = torch.full((buf_len,), lp.shape[1], dtype=torch.float)
+                    old_coop_lp_sum = old_coop_lp_sum + masked_lp.cpu()
+                    old_total_active = old_total_active + n_act.cpu()
+
+                old_coop_lp = old_coop_lp_sum / old_total_active.clamp(min=1)  # (buf,)
+
+                # --- Cooperative PPO update for encoder ---
+                # Sample a minibatch (same indices across all groups).
+                mb_size = min(chunk_size, buf_len)
+                idx = torch.randperm(buf_len)[:mb_size]
+
+                self._gnn_optimizer.zero_grad()
+
+                # Compute new cooperative log-probs (post-Phase-1 heads,
+                # freshly-unfrozen GNN with grad enabled).
+                new_coop_lp_sum = torch.zeros(mb_size, device=train_device)
+                new_total_active = torch.zeros(mb_size, device=train_device)
+                vib_kl_total = torch.tensor(0.0, device=train_device)
+                n_vib_groups = 0
+
+                for g in groups:
+                    gbuf = experiment.replay_buffers[g]
+                    gdata = gbuf[:buf_len]
+                    mb_data = gdata[idx].to(train_device)
+
+                    loss_module = experiment.losses[g]
+                    ctx = (
+                        loss_module.actor_network_params.to_module(
+                            loss_module.actor_network
                         )
-                    self._gnn_optimizer.step()
-                    self._gnn_optimizer.zero_grad()
+                        if loss_module.functional
+                        else contextlib.nullcontext()
+                    )
+                    with ctx:
+                        dist = loss_module.actor_network.get_dist(mb_data)
+                    action = mb_data.get((g, "action"))
+                    new_lp = dist.log_prob(action)  # (mb, n_agents, ...)
+
+                    amask = mb_data.get((g, "active_mask"), None)
+                    if amask is not None:
+                        am = amask.float()
+                        while am.dim() < new_lp.dim():
+                            am = am.unsqueeze(-1)
+                        masked_lp = (new_lp * am).sum(
+                            dim=tuple(range(1, new_lp.dim()))
+                        )
+                        n_act = amask.float().sum(dim=-1)
+                    else:
+                        masked_lp = new_lp.sum(dim=tuple(range(1, new_lp.dim())))
+                        n_act = torch.full(
+                            (mb_size,), new_lp.shape[1],
+                            dtype=torch.float, device=train_device,
+                        )
+                    new_coop_lp_sum = new_coop_lp_sum + masked_lp
+                    new_total_active = new_total_active + n_act
+
+                    # Accumulate VIB KL if enabled
+                    if self.use_vib:
+                        mu = mb_data.get((g, "embedding_mu"), None)
+                        logvar = mb_data.get((g, "embedding_logvar"), None)
+                        if mu is not None and logvar is not None:
+                            kl = -0.5 * (
+                                1 + logvar - mu.pow(2) - logvar.exp()
+                            ).sum(dim=-1).mean()
+                            vib_kl_total = vib_kl_total + kl
+                            n_vib_groups += 1
+
+                new_coop_lp = new_coop_lp_sum / new_total_active.clamp(min=1)
+
+                # Importance ratio
+                old_lp_mb = old_coop_lp[idx].to(train_device)
+                ratio = torch.exp(new_coop_lp - old_lp_mb.detach())
+
+                # Cooperative advantage for this minibatch
+                mb_adv = coop_adv[idx].squeeze(-1).to(train_device)  # (mb,)
+
+                # Clipped PPO objective
+                surr1 = ratio * mb_adv
+                surr2 = torch.clamp(
+                    ratio, 1.0 - self.clip_epsilon, 1.0 + self.clip_epsilon
+                ) * mb_adv
+                coop_obj = torch.min(surr1, surr2).mean()
+
+                # Encoder loss = -coop_objective + VIB
+                encoder_loss = -coop_obj
+                if n_vib_groups > 0:
+                    total_frames = experiment.total_frames
+                    if self.vib_warmup_frames > 0:
+                        beta_eff = min(
+                            self.vib_beta,
+                            self.vib_beta * total_frames / self.vib_warmup_frames,
+                        )
+                    else:
+                        beta_eff = self.vib_beta
+                    encoder_loss = encoder_loss + beta_eff * (vib_kl_total / n_vib_groups)
+
+                encoder_loss.backward()
+
+                if experiment.config.clip_grad_norm and experiment.config.clip_grad_val is not None:
+                    torch.nn.utils.clip_grad_norm_(
+                        self._shared_actor_gnn.parameters(),
+                        experiment.config.clip_grad_val,
+                    )
+                self._gnn_optimizer.step()
+                self._gnn_optimizer.zero_grad()
+
+                # --- Log coop_encoder metrics ---
+                experiment.logger.log(
+                    {
+                        "train/coop_encoder/coop_obj": coop_obj.item(),
+                        "train/coop_encoder/encoder_loss": encoder_loss.item(),
+                        "train/coop_encoder/coop_ratio_mean": ratio.mean().item(),
+                        "train/coop_encoder/coop_ratio_max": ratio.max().item(),
+                    },
+                    step=experiment.n_iters_performed,
+                )
 
 
 @dataclass
@@ -546,10 +920,10 @@ class HGTeamHAPPOConfig(AlgorithmConfig):
     gnn_concat_heads: bool = MISSING
     gnn_use_beta: bool = MISSING
     gnn_self_loops: bool = MISSING
-    gnn_agent_node_feature_key: Optional[str] = MISSING
+    gnn_agent_node_feature_key: str | None = MISSING
     gnn_agent_node_feature_dim: int = MISSING
     critic_use_other_actions: bool = MISSING
-    gnn_norm_class: Optional[str] = MISSING
+    gnn_norm_class: str | None = MISSING
     critic_embed_dim: int = MISSING
 
     # Split-z parameters
@@ -568,7 +942,7 @@ class HGTeamHAPPOConfig(AlgorithmConfig):
     fixed_order: bool = MISSING
 
     @staticmethod
-    def associated_class() -> Type[Algorithm]:
+    def associated_class() -> type[Algorithm]:
         return HGTeamHAPPO
 
     @staticmethod
