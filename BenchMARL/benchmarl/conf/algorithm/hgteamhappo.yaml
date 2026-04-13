@@ -50,5 +50,7 @@ vib_beta: 0.001
 vib_warmup_frames: 500000
 
 # HAPPO-specific parameters
-encoder_update_mode: "separate_forward"  # Options: "accumulated", "separate_forward"
+encoder_update_mode: "separate_forward"  # Options: "accumulated", "separate_forward", "coop_encoder"
 fixed_order: False                  # Random group ordering each epoch (True = fixed order)
+encoder_n_optimizer_steps: null     # Phase 2 GNN optimizer steps (null = use n_minibatch_iters)
+encoder_lr: null                    # Phase 2 GNN learning rate (null = use experiment lr)

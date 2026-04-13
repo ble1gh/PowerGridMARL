@@ -138,6 +138,12 @@ def parse_args():
         default=False,
         help="Use fixed (not random) group ordering in HAPPO",
     )
+    parser.add_argument(
+        "--encoder-n-optimizer-steps",
+        type=int,
+        default=None,
+        help="Phase 2 GNN optimizer steps (default: use --n-minibatch-iters)",
+    )
 
     # --- Off-policy (SAC) experiment config ---
     parser.add_argument("--off-policy-memory-size", type=int, default=1_000_000)
@@ -255,6 +261,8 @@ def main():
         algorithm_config.entropy_coef = args.entropy_coef
         algorithm_config.encoder_update_mode = args.encoder_update_mode
         algorithm_config.fixed_order = args.fixed_order
+        algorithm_config.encoder_lr = args.lr_encoder
+        algorithm_config.encoder_n_optimizer_steps = args.encoder_n_optimizer_steps
     else:
         algorithm_config = HGTeamConfig.get_from_yaml()
         algorithm_config.entropy_coef = args.entropy_coef

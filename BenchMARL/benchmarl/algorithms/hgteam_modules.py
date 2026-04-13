@@ -7,6 +7,8 @@ This module contains:
   - ``merge_embedding_losses``: Merge auxiliary embedding losses into a loss output.
 """
 
+import contextlib
+
 import torch
 from tensordict import TensorDictBase
 from torch import nn
@@ -89,6 +91,7 @@ class EmbeddingProcessor(nn.Module):
         self.stochastic_query = stochastic_query
         self.z_token_dim = z_token_dim
         self.z_query_dim = z_query_dim
+        self._deterministic_override = False
 
         if split_z:
             # GNN output layout: [z_token | z_query_mean (| z_query_logvar)]
@@ -97,6 +100,21 @@ class EmbeddingProcessor(nn.Module):
             self.latent_dim = embedding_dim // 2
         else:
             self.latent_dim = embedding_dim
+
+    @contextlib.contextmanager
+    def deterministic_mode(self):
+        """Context manager: use z = mu (no sampling) for stable importance ratios.
+
+        Selective Noise Injection (Igl et al., NeurIPS 2019): during PPO
+        updates, replace stochastic z with its deterministic mean so that
+        importance ratios are not corrupted by re-sampled noise.
+        """
+        prev = self._deterministic_override
+        self._deterministic_override = True
+        try:
+            yield
+        finally:
+            self._deterministic_override = prev
 
     def forward(
         self,
@@ -126,6 +144,11 @@ class EmbeddingProcessor(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Returns ``(z, mean, log_var)``."""
         if self.stochastic:
+            if self._deterministic_override:
+                # SNI: split into (mean, logvar) but return z = mean (no noise)
+                mean, log_var = embedding.chunk(2, dim=-1)
+                log_var = torch.clamp(log_var, min=-10.0, max=2.0)
+                return mean, mean, log_var
             z, mean, log_var = reparameterize(embedding)
         else:
             z = embedding
@@ -148,7 +171,13 @@ class EmbeddingProcessor(nn.Module):
         remainder = embedding[..., self.z_token_dim :]
 
         if self.stochastic_query:
-            z_query, mean, log_var = reparameterize(remainder)
+            if self._deterministic_override:
+                # SNI: split into (mean, logvar) but return z_query = mean
+                mean, log_var = remainder.chunk(2, dim=-1)
+                log_var = torch.clamp(log_var, min=-10.0, max=2.0)
+                z_query = mean
+            else:
+                z_query, mean, log_var = reparameterize(remainder)
         else:
             z_query = remainder
             mean = remainder  # Deterministic: mean is the value itself

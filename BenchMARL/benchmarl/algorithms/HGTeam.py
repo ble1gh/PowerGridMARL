@@ -4,6 +4,7 @@
 #  LICENSE file in the root directory of this source tree.
 #
 
+import contextlib
 import warnings
 from collections.abc import Iterable
 from dataclasses import MISSING, dataclass
@@ -108,17 +109,20 @@ class HGTeamLoss(ClipPPOLoss):
 
         # --- VIB SNI: use deterministic mu for PPO loss computation --
         # Selective Noise Injection (Igl et al., NeurIPS 2019): during the
-        # PPO update, replace stochastic z_query with its deterministic mean
-        # so the importance ratio is not corrupted by re-sampled noise.
-        # The stochastic z is restored afterwards for the VIB KL term.
+        # PPO update, use EmbeddingProcessor.deterministic_mode() so that
+        # get_dist() produces z = mu (no sampling noise).  This makes the
+        # importance ratio reflect only parameter changes, not z re-sampling.
+        _sni_ctx = None
         if self.algorithm.use_vib:
-            embedding_mu = tensordict.get((self.group, "embedding_mu"), None)
-            embedding_z_pre = tensordict.get((self.group, "embedding_z"), None)
-            if embedding_mu is not None and embedding_z_pre is not None:
-                tensordict.set((self.group, "embedding_z"), embedding_mu)
+            # Find the EmbeddingProcessor in the actor pipeline
+            for m in self.actor_network.modules():
+                if isinstance(m, EmbeddingProcessor):
+                    _sni_ctx = m.deterministic_mode()
+                    break
 
-        # --- FORWARD: standard PPO losses --------------------------
-        out = super().forward(tensordict)
+        with _sni_ctx if _sni_ctx is not None else contextlib.nullcontext():
+            # --- FORWARD: standard PPO losses --------------------------
+            out = super().forward(tensordict)
 
         # --- MASKED REDUCTION for inactive agents -------------------
         # With reduction="none", ClipPPOLoss returns per-element losses.

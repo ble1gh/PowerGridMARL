@@ -6,7 +6,7 @@
 #SBATCH --nodes=1
 #SBATCH -n 1
 #SBATCH --cpus-per-task=16
-#SBATCH --mem=64GB
+#SBATCH --mem=32GB
 #
 # GPU Request:
 # MIG slices available on this partition:
@@ -109,10 +109,12 @@ GPU_MONITOR_PID=$!
 python run_hgteam_mlp.py \
     --seed 20 \
     --project-name "PowerGridworldVariable_VPP" \
-    --wandb-name "HGTeamHA_$(date +%Y%m%d)_${SLURM_JOB_ID}_vppboost_lmbda0.95_separate_forward" \
+    --wandb-name "HGTeamHA_$(date +%Y%m%d)_${SLURM_JOB_ID}_vppboost_lmbda0.99_separate_forward" \
     --results-dir "$RESULTS_DIR" \
     --max-n-frames 10000000 \
     --lr 1e-4 \
+    --lr-encoder 1e-6 \
+    --encoder-n-optimizer-steps 1 \
     --evaluation-interval 24576 \
     --evaluation-episodes 20 \
     --n-envs-per-worker 32 \
@@ -138,10 +140,11 @@ python run_hgteam_mlp.py \
     --use-vib true \
     --vib-warmup-frames 500000 \
     --embedding-viz-interval 5 \
-    --lmbda 0.95 \
+    --lmbda 0.99 \
     --critic-use-other-actions true \
     --encoder-update-mode separate_forward \
-
+    --encoder-n-optimizer-steps 1 \
+    
 # Stop GPU monitoring
 kill $GPU_MONITOR_PID 2>/dev/null || true
 
