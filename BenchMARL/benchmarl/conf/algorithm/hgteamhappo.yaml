@@ -11,9 +11,9 @@ loss_critic_type: "smooth_l1"
 lmbda: 0.95
 scale_mapping: "biased_softplus_1.0"
 scale_lb: 0.0001
-use_tanh_normal: True
+use_tanh_normal: False
 minibatch_advantage: True
-use_beta: False
+use_beta: True
 beta_min_param: 1.
 
 # HGTeam-specific parameters

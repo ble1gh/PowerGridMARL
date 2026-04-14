@@ -439,6 +439,7 @@ class HGTeamHAPPO(HGTeamBase):
 
         cumulative_log_factor = None  # shape: (buffer_size,) in log-space
         factor_key = HGTeamHAPPOLoss.FACTOR_KEY
+        _factor_diagnostics = {}  # group -> (n_active_per_sample, factor_update)
 
         for g_idx, group in enumerate(group_order):
             loss_module = experiment.losses[group]
@@ -648,6 +649,12 @@ class HGTeamHAPPO(HGTeamBase):
             else:
                 cumulative_log_factor = cumulative_log_factor + log_factor_update.cpu()
 
+            # Store per-group factor diagnostics for logging
+            _factor_diagnostics[group] = (
+                n_active.detach().cpu() if agent_mask is not None else torch.ones(buf_len),
+                factor_update.detach().cpu(),
+            )
+
             # --- Log training and callbacks ---
             experiment.logger.log_training(group, training_td, step=experiment.n_iters_performed)
             experiment._on_train_end(training_td, group)
@@ -659,6 +666,48 @@ class HGTeamHAPPO(HGTeamBase):
                 explore_layer = experiment.group_policies[group]
             if hasattr(explore_layer, "step"):
                 explore_layer.step(current_frames)
+
+        # --- 4b. HAPPO factor diagnostics ---
+        if _factor_diagnostics and cumulative_log_factor is not None:
+            cum_factor = torch.exp(cumulative_log_factor)  # (buffer_size,)
+            step = experiment.n_iters_performed
+            # Scalar summaries (every iteration)
+            factor_log = {
+                "train/happo_factor/cum_factor_mean": cum_factor.mean().item(),
+                "train/happo_factor/cum_factor_std": cum_factor.std().item(),
+                "train/happo_factor/cum_factor_max": cum_factor.max().item(),
+                "train/happo_factor/cum_factor_min": cum_factor.min().item(),
+            }
+            for grp, (n_act, f_upd) in _factor_diagnostics.items():
+                factor_log[f"train/happo_factor/{grp}_factor_mean"] = f_upd.mean().item()
+                factor_log[f"train/happo_factor/{grp}_n_active_mean"] = n_act.float().mean().item()
+            experiment.logger.log(factor_log, step=step)
+
+            # Detailed wandb.Table (every 10 iterations) for scatter plots
+            if step % 10 == 0:
+                try:
+                    import wandb
+                    if wandb.run is not None:
+                        # Total active agents across all groups per sample
+                        n_active_total = sum(
+                            diag[0].float() for diag in _factor_diagnostics.values()
+                        )  # (buffer_size,)
+                        # Subsample to cap table size
+                        n_samples = min(512, cum_factor.shape[0])
+                        idx = torch.randperm(cum_factor.shape[0])[:n_samples]
+                        columns = ["n_active_total", "cum_factor"]
+                        for grp in _factor_diagnostics:
+                            columns += [f"{grp}_n_active", f"{grp}_factor"]
+                        data = []
+                        for i in idx.tolist():
+                            row = [n_active_total[i].item(), cum_factor[i].item()]
+                            for grp, (n_act, f_upd) in _factor_diagnostics.items():
+                                row += [n_act[i].item(), f_upd[i].item()]
+                            data.append(row)
+                        table = wandb.Table(columns=columns, data=data)
+                        wandb.log({"train/happo_factor_table": table}, step=step)
+                except ImportError:
+                    pass
 
         # --- 5. GNN encoder update ---
         if self._shared_actor_gnn is not None:

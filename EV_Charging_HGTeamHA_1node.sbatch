@@ -2,7 +2,7 @@
 #SBATCH --account=rai
 #SBATCH --partition=rai-gpu-grn
 #SBATCH --qos=rai-gpu-grn
-#SBATCH --time=30:00:00
+#SBATCH --time=16:00:00
 #SBATCH --nodes=1
 #SBATCH -n 1
 #SBATCH --cpus-per-task=16
@@ -109,7 +109,7 @@ GPU_MONITOR_PID=$!
 python run_hgteam_mlp.py \
     --seed 20 \
     --project-name "PowerGridworldVariable_VPP" \
-    --wandb-name "HGTeamHA_$(date +%Y%m%d)_${SLURM_JOB_ID}_vppboost_lmbda0.99_separate_forward" \
+    --wandb-name "HGTeamHA_$(date +%Y%m%d)_${SLURM_JOB_ID}_lmbda0.99_accumulated_beta" \
     --results-dir "$RESULTS_DIR" \
     --max-n-frames 10000000 \
     --lr 1e-4 \
@@ -142,8 +142,7 @@ python run_hgteam_mlp.py \
     --embedding-viz-interval 5 \
     --lmbda 0.99 \
     --critic-use-other-actions true \
-    --encoder-update-mode separate_forward \
-    --encoder-n-optimizer-steps 1 \
+    --encoder-update-mode accumulated \
     
 # Stop GPU monitoring
 kill $GPU_MONITOR_PID 2>/dev/null || true
