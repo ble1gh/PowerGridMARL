@@ -15,17 +15,15 @@
 #   gpu:h200_3g.71gb  — 71 GB (grn026, 8 slices)
 #   gpu:h200          — 141 GB full card (grn027-032, 8 each) — long queue
 #   gpu:1             — any available GPU (risky: may get 18 GB slice)
-#SBATCH --gres=gpu:h200_3g.71gb:1
-# #SBATCH --gres=gpu:h200
+#SBATCH --gres=gpu:h200_2g.35gb:1
 
-#SBATCH -o /uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/results/slurm/HGTeamHAslurmjob-%j.out-%N
-#SBATCH -e /uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/results/slurm/HGTeamHAslurmjob-%j.err-%N
-# #SBATCH --exclude=grn030
+#SBATCH -o /uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/results/slurm/SMACv2_HGTeamHA-%j.out-%N
+#SBATCH -e /uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/results/slurm/SMACv2_HGTeamHA-%j.err-%N
 
 
 PROJECT_ROOT=/uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL
 RESULTS_ROOT=$PROJECT_ROOT/results
-RESULTS_DIR=$RESULTS_ROOT/HGTeamHAresults_$(date +%Y%m%d)_${SLURM_JOB_ID}
+RESULTS_DIR=$RESULTS_ROOT/SMACv2_HGTeamHA_$(date +%Y%m%d)_${SLURM_JOB_ID}
 
 mkdir -p "$RESULTS_DIR"
 
@@ -54,7 +52,6 @@ export PYTHONPATH=$SCRDIR/PowerGridMARL/PowerGridworld:$SCRDIR/PowerGridMARL/Ben
 export WANDB_DIR="$RESULTS_DIR/wandb"
 
 # Enable GPU usage — respect SLURM's assignment (required for MIG slices)
-# MIG slices use UUID-based device IDs; hardcoding "0" breaks them.
 if [ -z "$CUDA_VISIBLE_DEVICES" ]; then
     export CUDA_VISIBLE_DEVICES="0"
 fi
@@ -68,18 +65,17 @@ export CUBLAS_WORKSPACE_CONFIG=:4096:8
 export TORCH_CUDNN_USE_HEURISTIC_MODE_B=1
 export CUDA_CACHE_DISABLE=0
 
-# Optimize for single-node computation with 64 cores - maximize CPU utilization
-# Set to 1 to avoid thread oversubscription when using 64 parallel environments
+# Optimize for single-node computation — avoid thread oversubscription
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
-export OPENBLAS_NUM_THREADS=1 
+export OPENBLAS_NUM_THREADS=1
 export NUMBA_NUM_THREADS=1
 
 # Increase process and file limits for high parallel environments
-ulimit -n 8192     # File descriptor limit - increased for more parallel envs
-ulimit -u 16384    # Process limit - increased for more parallel envs
+ulimit -n 8192
+ulimit -u 16384
 
-# Show current limits and compare to SLURM allocation
+# Show current limits
 echo "Node: $SLURM_NODELIST"
 echo "ulimit -n (open files): $(ulimit -n)"
 echo "ulimit -u (max user processes): $(ulimit -u)"
@@ -99,28 +95,47 @@ nvidia-smi
 echo "CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES"
 
 # Check if PyTorch can see GPU
-python -c "import torch; print(f'PyTorch version: {torch.__version__}'); print(f'CUDA available: {torch.cuda.is_available()}'); print(f'CUDA devices: {torch.cuda.device_count()}'); print(f'GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB')"
+python -c "import torch; print(f'PyTorch version: {torch.__version__}'); print(f'CUDA available: {torch.cuda.is_available()}'); print(f'CUDA devices: {torch.cuda.device_count()}'); print(f'GPU Memory: {torch.cuda.get_device_properties(0).total_mem / 1024**3:.1f} GB')"
 
 # Start background GPU monitoring
 nvidia-smi dmon -d 10 -s pucvmet -f $SCRDIR/gpu_usage.log &
 GPU_MONITOR_PID=$!
 
-# Run experiment — HAPPO variant
+# ============================================================================
+# Run experiment — HGTeamHA on SMACv2 Protoss 10v10
+# ============================================================================
+# Hyperparameters:
+#   - lr 5e-4: standard HAPPO for SMAC (HARL default); 10x higher than
+#     PowerGrid because discrete actions + sparser reward need faster updates
+#   - lr-encoder 5e-5: encoder at 1/10 head lr (same ratio as PowerGrid run)
+#   - lmbda 0.95: standard GAE lambda for SMAC (shorter episodes than grid's 0.99)
+#   - frames-per-batch 8192: ~820 steps/agent × 10 agents. SMACv2 episodes
+#     are shorter (50-200 steps) so less data per batch is fine.
+#   - n-envs-per-worker 16: fewer than PowerGrid (32) since SC2 envs are heavier
+#   - minibatch-size 512: smaller agent count (10-20 vs 53) → less padding waste
+#   - n-minibatch-iters 5: standard ppo_epoch for SMAC (HARL default)
+#   - entropy-coef 0.01: standard for discrete-action SMAC
+#   - encoder-n-optimizer-steps 1: same as PowerGrid
+#   - no reward-scale: SMACv2 handles its own reward scaling internally
+#   - no VIB / embedding losses: start simple, add if needed
+# ============================================================================
+
 python run_hgteam_mlp.py \
+    --task protoss_10_vs_10 \
     --seed 20 \
-    --project-name "PowerGridworldVariable_VPP" \
-    --wandb-name "HGTeamHA_$(date +%Y%m%d)_${SLURM_JOB_ID}_lmbda0.99_accumulated_1iter_minib2048_lr5e-4" \
+    --project-name "SMACv2Variable_HGTeamHA" \
+    --wandb-name "HGTeamHA_SMACv2_10v10_$(date +%Y%m%d)_${SLURM_JOB_ID}_coop_encoder_vib" \
     --results-dir "$RESULTS_DIR" \
     --max-n-frames 10000000 \
     --lr 5e-4 \
-    --lr-encoder 5e-4 \
+    --lr-encoder 5e-5 \
     --encoder-n-optimizer-steps 1 \
-    --evaluation-interval 24576 \
+    --evaluation-interval 16384 \
     --evaluation-episodes 20 \
-    --n-envs-per-worker 32 \
-    --frames-per-batch 12288 \
-    --minibatch-size 2048 \
-    --n-minibatch-iters 1 \
+    --n-envs-per-worker 16 \
+    --frames-per-batch 8192 \
+    --minibatch-size 512 \
+    --n-minibatch-iters 3 \
     --entropy-coef 0.01 \
     --algorithm happo \
     --fixed-order false \
@@ -136,14 +151,11 @@ python run_hgteam_mlp.py \
     --z-query-dim 32 \
     --stochastic-z-query true \
     --scale-lb 0.0001 \
-    --reward-scale 100000 \
-    --use-vib true \
-    --vib-warmup-frames 500000 \
-    --embedding-viz-interval 5 \
-    --lmbda 0.99 \
+    --lmbda 0.95 \
     --critic-use-other-actions true \
-    --encoder-update-mode accumulated \
-    
+    --encoder-update-mode coop_encoder \
+    --use_vib true \
+
 # Stop GPU monitoring
 kill $GPU_MONITOR_PID 2>/dev/null || true
 
@@ -158,7 +170,7 @@ fi
 cp $SCRDIR/gpu_usage.log $RESULTS_DIR/ 2>/dev/null || true
 
 # Copy the SLURM script for reference
-cp $SCRDIR/PowerGridMARL/EV_Charging_HGTeamHA_1node.sbatch $RESULTS_DIR/ 2>/dev/null || true
+cp $SCRDIR/PowerGridMARL/SMACv2_HGTeamHA_1node.sbatch $RESULTS_DIR/ 2>/dev/null || true
 
 # Clean up
 cd $PROJECT_ROOT

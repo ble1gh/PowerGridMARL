@@ -13,6 +13,7 @@ sys.path.append(os.path.join(os.getcwd(), "BenchMARL"))
 
 from benchmarl.algorithms import HGTeamConfig, HGTeamHAPPOConfig, HGTeamSACConfig
 from benchmarl.environments.PowerGridworldVariable.common import PowerGridworldVariableTask
+from benchmarl.environments.smacv2_variable.common import Smacv2VariableTask
 from benchmarl.experiment import Experiment, ExperimentConfig
 from benchmarl.experiment.embedding_viz_callback import EmbeddingVizCallback
 from benchmarl.models import HeteroGnnConfig, MlpConfig
@@ -24,6 +25,21 @@ def parse_args():
     default_results_dir = Path(__file__).resolve().parent / "results"
 
     parser = argparse.ArgumentParser(description="Run HGTeam experiment")
+
+    # --- Task / Environment ---
+    parser.add_argument(
+        "--task",
+        type=str,
+        default="evovernight13node_vpp",
+        choices=[
+            "evovernight13node_vpp",
+            "protoss_10_vs_10",
+            "protoss_10_vs_11",
+            "protoss_20_vs_20",
+            "protoss_20_vs_23",
+        ],
+        help="Task to run (PowerGridworld or SMACv2 variable-composition)",
+    )
 
     # --- Experiment ---
     parser.add_argument("--seed", type=int, default=42)
@@ -289,8 +305,16 @@ def main():
     algorithm_config.vib_warmup_frames = args.vib_warmup_frames
 
     # 3. Task
-    task = PowerGridworldVariableTask.EVOVERNIGHT13NODE_VPP.get_from_yaml()
-    task.config["reward_scale"] = args.reward_scale
+    _TASK_MAP = {
+        "evovernight13node_vpp": lambda: PowerGridworldVariableTask.EVOVERNIGHT13NODE_VPP.get_from_yaml(),
+        "protoss_10_vs_10": lambda: Smacv2VariableTask.PROTOSS_10_VS_10.get_from_yaml(),
+        "protoss_10_vs_11": lambda: Smacv2VariableTask.PROTOSS_10_VS_11.get_from_yaml(),
+        "protoss_20_vs_20": lambda: Smacv2VariableTask.PROTOSS_20_VS_20.get_from_yaml(),
+        "protoss_20_vs_23": lambda: Smacv2VariableTask.PROTOSS_20_VS_23.get_from_yaml(),
+    }
+    task = _TASK_MAP[args.task]()
+    if hasattr(task, "config") and "reward_scale" in task.config:
+        task.config["reward_scale"] = args.reward_scale
 
     # 4. Experiment Configuration
     experiment_config = ExperimentConfig.get_from_yaml()

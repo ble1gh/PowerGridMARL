@@ -378,6 +378,307 @@ class HGTeamHAPPO(HGTeamBase):
     _split_shared_gnn_param_groups = HGTeam._split_shared_gnn_param_groups
 
     # ------------------------------------------------------------------
+    # Cooperative encoder update (Phase 0 — runs before HAPPO head updates)
+    # ------------------------------------------------------------------
+
+    def _coop_encoder_update(
+        self,
+        experiment: "Experiment",  # noqa: F821
+        groups: list[str],
+    ) -> None:
+        """Cooperative GNN update with mean per-agent advantage (D12).
+
+        Runs BEFORE the sequential HAPPO head updates so that the GNN
+        receives gradients through clean (pre-HAPPO) head Jacobians.
+        The cooperative advantage is the z-scored mean of raw per-agent
+        advantages across all active agents.
+
+        After this method returns, the GNN is re-frozen (requires_grad=False)
+        so that Phase 1 head updates don't accumulate GNN gradients.
+        """
+        if self._shared_actor_gnn is None:
+            return
+
+        for p in self._shared_actor_gnn.parameters():
+            p.requires_grad_(True)
+
+        gnn_lr = self.encoder_lr if self.encoder_lr is not None else self.experiment_config.lr
+        if not hasattr(self, "_gnn_optimizer") or self._gnn_lr != gnn_lr:
+            gnn_params = list(self._shared_actor_gnn.parameters())
+            self._gnn_optimizer = torch.optim.Adam(
+                gnn_params,
+                lr=gnn_lr,
+                eps=self.experiment_config.adam_eps,
+            )
+            self._gnn_lr = gnn_lr
+
+        train_device = experiment.config.train_device
+        chunk_size = experiment.config.train_minibatch_size(self.on_policy)
+
+        # --- Compute cooperative advantage from all group buffers ---
+        sum_raw_adv = None
+        sum_coop_sval = None
+        sum_coop_vtarg = None
+        total_active = None
+        buf_len = None
+
+        for g in groups:
+            gbuf = experiment.replay_buffers[g]
+            glen = len(gbuf)
+            if buf_len is None:
+                buf_len = glen
+            gdata = gbuf[:glen]
+            vtarg = gdata.get((g, "value_target"))
+            sval = gdata.get((g, "state_value"))
+            amask = gdata.get((g, "active_mask"), None)
+
+            raw_adv = vtarg - sval
+            if amask is not None:
+                m = amask.float().unsqueeze(-1)
+            else:
+                m = torch.ones_like(raw_adv)
+
+            agent_dim = -2
+            g_sum = (raw_adv * m).sum(dim=agent_dim)
+            g_sval = (sval * m).sum(dim=agent_dim)
+            g_vtarg = (vtarg * m).sum(dim=agent_dim)
+            g_nact = m.sum(dim=agent_dim)
+
+            if sum_raw_adv is None:
+                sum_raw_adv = g_sum
+                sum_coop_sval = g_sval
+                sum_coop_vtarg = g_vtarg
+                total_active = g_nact
+            else:
+                sum_raw_adv = sum_raw_adv + g_sum
+                sum_coop_sval = sum_coop_sval + g_sval
+                sum_coop_vtarg = sum_coop_vtarg + g_vtarg
+                total_active = total_active + g_nact
+
+        coop_adv = sum_raw_adv / total_active.clamp(min=1)
+        coop_sval = sum_coop_sval / total_active.clamp(min=1)
+        coop_vtarg = sum_coop_vtarg / total_active.clamp(min=1)
+
+        # Z-score normalize cooperative advantage
+        coop_adv = (coop_adv - coop_adv.mean()) / coop_adv.std().clamp(min=1e-7)
+
+        # --- Log cooperative critic loss (tracking only) ---
+        coop_critic_loss = ((coop_vtarg - coop_sval) ** 2).mean().item()
+        experiment.logger.log(
+            {
+                "train/coop_encoder/coop_critic_loss": coop_critic_loss,
+                "train/coop_encoder/coop_adv_std_raw": (
+                    sum_raw_adv / total_active.clamp(min=1)
+                ).std().item(),
+            },
+            step=experiment.n_iters_performed,
+        )
+
+        # --- Cooperative clipped PPO update for encoder (with SNI) ---
+        n_optimizer_steps = (
+            self.encoder_n_optimizer_steps
+            if self.encoder_n_optimizer_steps is not None
+            else experiment.config.n_optimizer_steps(self.on_policy)
+        )
+        n_minibatches = max(1, -(-buf_len // chunk_size))
+
+        # VIB beta
+        beta_eff = 0.0
+        if self.use_vib:
+            total_frames = experiment.total_frames
+            if self.vib_warmup_frames > 0:
+                beta_eff = min(
+                    self.vib_beta,
+                    self.vib_beta * total_frames / self.vib_warmup_frames,
+                )
+            else:
+                beta_eff = self.vib_beta
+
+        # --- Find EmbeddingProcessors for SNI (one per group) ---
+        _ep_map: dict[str, EmbeddingProcessor | None] = {}
+        for g in groups:
+            _ep_map[g] = None
+            lm = experiment.losses[g]
+            for _m in lm.actor_network.modules():
+                if isinstance(_m, EmbeddingProcessor):
+                    _ep_map[g] = _m
+                    break
+
+        # --- Pre-load full buffer data per group (on CPU) ---
+        gbuf_full: dict[str, TensorDictBase] = {}
+        for g in groups:
+            gbuf_full[g] = experiment.replay_buffers[g][:buf_len]
+
+        # --- Compute old_log_prob with SNI (collection-time params) ---
+        # Nothing has been updated yet (no Phase 1), so these log-probs
+        # are from the actual behavior policy — the cleanest baseline.
+        old_lp_sni: dict[str, torch.Tensor] = {}
+        with torch.no_grad():
+            for g in groups:
+                lm = experiment.losses[g]
+                ctx_params = (
+                    lm.actor_network_params.to_module(lm.actor_network)
+                    if lm.functional
+                    else contextlib.nullcontext()
+                )
+                ep = _ep_map[g]
+                lp_chunks = []
+                for chunk in gbuf_full[g].chunk(
+                    max(1, -(-gbuf_full[g].shape[0] // chunk_size)), dim=0
+                ):
+                    chunk_dev = chunk.to(train_device)
+                    sni_ctx = ep.deterministic_mode() if ep is not None else contextlib.nullcontext()
+                    with sni_ctx, ctx_params:
+                        dist_old = lm.actor_network.get_dist(chunk_dev)
+                    action = chunk_dev.get((g, "action"))
+                    lp_chunks.append(dist_old.log_prob(action).cpu())
+                old_lp_sni[g] = torch.cat(lp_chunks, dim=0)
+
+        # Logging accumulators
+        _log_coop_obj = 0.0
+        _log_encoder_loss = 0.0
+        _log_vib_kl = 0.0
+        _log_ratio_mean = 0.0
+        _log_ratio_max = 0.0
+        _log_clip_frac = 0.0
+        _n_iters = 0
+
+        clip_eps = self.clip_epsilon
+        ca = coop_adv
+
+        for _epoch in range(n_optimizer_steps):
+            for _mb in range(n_minibatches):
+                mb_start = _mb * chunk_size
+                mb_end = min(mb_start + chunk_size, buf_len)
+
+                self._gnn_optimizer.zero_grad()
+
+                coop_obj_num = torch.tensor(0.0, device=train_device)
+                total_active_count = torch.tensor(0.0, device=train_device)
+                vib_kl_total = torch.tensor(0.0, device=train_device)
+                n_vib_groups = 0
+                mb_ratio_sum = 0.0
+                mb_ratio_max = 0.0
+                mb_clip_count = 0
+                mb_total_count = 0
+
+                ca_mb = ca[mb_start:mb_end].to(train_device)
+
+                for g in groups:
+                    gdata_mb = gbuf_full[g][mb_start:mb_end].to(train_device)
+                    old_lp_mb = old_lp_sni[g][mb_start:mb_end].to(train_device)
+
+                    lm = experiment.losses[g]
+                    ctx_params = (
+                        lm.actor_network_params.to_module(lm.actor_network)
+                        if lm.functional
+                        else contextlib.nullcontext()
+                    )
+                    ep = _ep_map[g]
+                    sni_ctx = ep.deterministic_mode() if ep is not None else contextlib.nullcontext()
+                    with sni_ctx, ctx_params:
+                        dist_new = lm.actor_network.get_dist(gdata_mb)
+                    action = gdata_mb.get((g, "action"))
+                    new_lp = dist_new.log_prob(action)
+
+                    log_ratio = new_lp - old_lp_mb
+                    ratio = torch.exp(log_ratio)
+                    clipped_ratio = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps)
+
+                    ca_g = ca_mb
+                    while ca_g.dim() < ratio.dim():
+                        ca_g = ca_g.unsqueeze(-1)
+
+                    gain1 = ratio * ca_g.detach()
+                    gain2 = clipped_ratio * ca_g.detach()
+                    gain = torch.min(gain1, gain2)
+
+                    amask = gdata_mb.get((g, "active_mask"), None)
+                    if amask is not None:
+                        am = amask.float()
+                        while am.dim() < gain.dim():
+                            am = am.unsqueeze(-1)
+                        coop_obj_num = coop_obj_num + (gain * am).sum()
+                        total_active_count = total_active_count + am.sum()
+                        with torch.no_grad():
+                            mb_ratio_sum += (ratio * am).sum().item()
+                            active_max = ratio.where(am.bool(), torch.zeros_like(ratio)).max().item()
+                            mb_ratio_max = max(mb_ratio_max, active_max)
+                            mb_clip_count += ((ratio != clipped_ratio) * am).sum().item()
+                            mb_total_count += am.sum().item()
+                    else:
+                        coop_obj_num = coop_obj_num + gain.sum()
+                        total_active_count = total_active_count + torch.tensor(
+                            float(gain.numel()), device=train_device,
+                        )
+                        with torch.no_grad():
+                            mb_ratio_sum += ratio.sum().item()
+                            mb_ratio_max = max(mb_ratio_max, ratio.max().item())
+                            mb_clip_count += (ratio != clipped_ratio).sum().item()
+                            mb_total_count += ratio.numel()
+
+                    # VIB KL with active_mask
+                    if self.use_vib:
+                        mu = gdata_mb.get((g, "embedding_mu"), None)
+                        logvar = gdata_mb.get((g, "embedding_logvar"), None)
+                        if mu is not None and logvar is not None:
+                            kl_per_agent = -0.5 * (
+                                1 + logvar - mu.pow(2) - logvar.exp()
+                            ).sum(dim=-1)
+                            if amask is not None:
+                                am_f = amask.float()
+                                kl = (kl_per_agent * am_f).sum() / am_f.sum().clamp(min=1)
+                            else:
+                                kl = kl_per_agent.mean()
+                            vib_kl_total = vib_kl_total + kl
+                            n_vib_groups += 1
+
+                coop_obj = coop_obj_num / total_active_count.clamp(min=1)
+
+                encoder_loss = -coop_obj
+                if n_vib_groups > 0 and beta_eff > 0:
+                    encoder_loss = encoder_loss + beta_eff * (vib_kl_total / n_vib_groups)
+
+                encoder_loss.backward()
+
+                if experiment.config.clip_grad_norm and experiment.config.clip_grad_val is not None:
+                    torch.nn.utils.clip_grad_norm_(
+                        self._shared_actor_gnn.parameters(),
+                        experiment.config.clip_grad_val,
+                    )
+                self._gnn_optimizer.step()
+                self._gnn_optimizer.zero_grad()
+
+                _log_coop_obj += coop_obj.item()
+                _log_encoder_loss += encoder_loss.item()
+                if n_vib_groups > 0:
+                    _log_vib_kl += (vib_kl_total / n_vib_groups).item()
+                if mb_total_count > 0:
+                    _log_ratio_mean += mb_ratio_sum / mb_total_count
+                    _log_ratio_max = max(_log_ratio_max, mb_ratio_max)
+                    _log_clip_frac += mb_clip_count / mb_total_count
+                _n_iters += 1
+
+        # --- Log coop_encoder metrics ---
+        if _n_iters > 0:
+            log_dict = {
+                "train/coop_encoder/coop_obj": _log_coop_obj / _n_iters,
+                "train/coop_encoder/encoder_loss": _log_encoder_loss / _n_iters,
+                "train/coop_encoder/n_encoder_iters": _n_iters,
+                "train/coop_encoder/ratio_mean": _log_ratio_mean / _n_iters,
+                "train/coop_encoder/ratio_max": _log_ratio_max,
+                "train/coop_encoder/clip_fraction": _log_clip_frac / _n_iters,
+            }
+            if self.use_vib:
+                log_dict["train/coop_encoder/vib_kl_masked"] = _log_vib_kl / _n_iters
+                log_dict["train/coop_encoder/vib_beta_eff"] = beta_eff
+            experiment.logger.log(log_dict, step=experiment.n_iters_performed)
+
+        # Re-freeze GNN for Phase 1 head updates
+        for p in self._shared_actor_gnn.parameters():
+            p.requires_grad_(False)
+
+    # ------------------------------------------------------------------
     # HAPPO sequential training loop
     # ------------------------------------------------------------------
 
@@ -392,16 +693,16 @@ class HGTeamHAPPO(HGTeamBase):
         For each collection iteration:
         1. Process batch for all groups (compute advantages).
         2. Determine group ordering (random or fixed).
+        2b. If coop_encoder: run Phase 0 (cooperative GNN update) before
+            head updates — gives the GNN clean gradients through unmodified
+            head Jacobians.
         3. For each group in order:
            a. Set HAPPO factor on the loss module.
            b. Run standard PPO optimizer loop (n_optimizer_steps × n_minibatches).
            c. Compute new log-probs, update cumulative factor.
-        4. If encoder_update_mode == "accumulated": step GNN optimizer once.
+        4. If encoder_update_mode == "accumulated": GNN already stepped.
            If encoder_update_mode == "separate_forward": unfreeze GNN, fresh
            forward+backward, step GNN optimizer.
-           If encoder_update_mode == "coop_encoder": unfreeze GNN, compute
-           cooperative advantage (mean of per-agent raw advantages), run
-           cooperative PPO surrogate + VIB, step GNN optimizer.
         5. Run callbacks and exploration schedule.
         """
         groups = list(experiment.train_group_map.keys())
@@ -422,6 +723,10 @@ class HGTeamHAPPO(HGTeamBase):
         else:
             group_order = groups.copy()
             random.shuffle(group_order)
+
+        # --- 2b. Phase 0: cooperative GNN update (before head updates) ---
+        if self.encoder_update_mode == "coop_encoder" and self._shared_actor_gnn is not None:
+            self._coop_encoder_update(experiment, groups)
 
         # --- 3. Snapshot old log-probs for all groups ---
         # We need old log-probs to compute the importance ratio after updates.
@@ -454,11 +759,17 @@ class HGTeamHAPPO(HGTeamBase):
             # under the current policy so that the HAPPO factor captures only
             # this group's policy change, not shared-encoder drift from
             # earlier groups.
+            # In coop_encoder mode, Phase 0 has updated the GNN, so ALL
+            # groups (including g_idx=0) need re-evaluated old_log_probs.
 
             chunk_size_snap = experiment.config.train_minibatch_size(self.on_policy)
+            _need_reeval = (
+                (g_idx > 0 and self.encoder_update_mode == "accumulated")
+                or self.encoder_update_mode == "coop_encoder"
+            )
             with torch.no_grad():
                 full_data = buffer[:buf_len]
-                if g_idx > 0 and self.encoder_update_mode == "accumulated":
+                if _need_reeval:
                     ctx_snap = (
                         loss_module.actor_network_params.to_module(loss_module.actor_network)
                         if loss_module.functional
@@ -965,306 +1276,8 @@ class HGTeamHAPPO(HGTeamBase):
                     experiment.logger.log(log_dict, step=experiment.n_iters_performed)
 
             elif self.encoder_update_mode == "coop_encoder":
-                # Cooperative encoder update (D12).
-                #
-                # Phase 2 trains the shared GNN with a cooperative PPO
-                # surrogate whose advantage is the mean of per-agent raw
-                # (pre-S8a) advantages across all active agents.
-                #
-                # Key design points:
-                #   - Old log-probs are re-evaluated AFTER Phase 1 head
-                #     updates (with GNN still frozen) so the importance
-                #     ratio captures only the GNN change, not head drift.
-                #   - Multiple minibatch iterations match Phase 1 sample
-                #     reuse for balanced encoder training.
-                #   - VIB KL masks inactive agents to prevent inflated
-                #     regularization from padded slots.
-
-                for p in self._shared_actor_gnn.parameters():
-                    p.requires_grad_(True)
-
-                gnn_lr = self.encoder_lr if self.encoder_lr is not None else self.experiment_config.lr
-                if not hasattr(self, "_gnn_optimizer") or self._gnn_lr != gnn_lr:
-                    gnn_params = list(self._shared_actor_gnn.parameters())
-                    self._gnn_optimizer = torch.optim.Adam(
-                        gnn_params,
-                        lr=gnn_lr,
-                        eps=self.experiment_config.adam_eps,
-                    )
-                    self._gnn_lr = gnn_lr
-
-                train_device = experiment.config.train_device
-                chunk_size = experiment.config.train_minibatch_size(self.on_policy)
-
-                # --- Compute cooperative advantage from all group buffers ---
-                # Raw advantage = value_target - state_value (post-D7:
-                # vtarg=sval for inactive agents, so contribution is zero).
-                sum_raw_adv = None
-                sum_coop_sval = None
-                sum_coop_vtarg = None
-                total_active = None
-                buf_len = None
-
-                for g in groups:
-                    gbuf = experiment.replay_buffers[g]
-                    glen = len(gbuf)
-                    if buf_len is None:
-                        buf_len = glen
-                    gdata = gbuf[:glen]
-                    vtarg = gdata.get((g, "value_target"))  # (buf, n_agents, 1)
-                    sval = gdata.get((g, "state_value"))    # (buf, n_agents, 1)
-                    amask = gdata.get((g, "active_mask"), None)  # (buf, n_agents)
-
-                    raw_adv = vtarg - sval
-                    if amask is not None:
-                        m = amask.float().unsqueeze(-1)  # (..., n_agents, 1)
-                    else:
-                        m = torch.ones_like(raw_adv)
-
-                    # Sum over agent dim (dim=-2: second-to-last, since
-                    # last dim is the value dim of size 1).  Squeeze the
-                    # agent dim so result is (..., 1) — same shape across groups.
-                    agent_dim = -2
-                    g_sum = (raw_adv * m).sum(dim=agent_dim)   # (..., 1)
-                    g_sval = (sval * m).sum(dim=agent_dim)
-                    g_vtarg = (vtarg * m).sum(dim=agent_dim)
-                    g_nact = m.sum(dim=agent_dim)
-
-                    if sum_raw_adv is None:
-                        sum_raw_adv = g_sum
-                        sum_coop_sval = g_sval
-                        sum_coop_vtarg = g_vtarg
-                        total_active = g_nact
-                    else:
-                        sum_raw_adv = sum_raw_adv + g_sum
-                        sum_coop_sval = sum_coop_sval + g_sval
-                        sum_coop_vtarg = sum_coop_vtarg + g_vtarg
-                        total_active = total_active + g_nact
-
-                coop_adv = sum_raw_adv / total_active.clamp(min=1)  # (buf, 1)
-                coop_sval = sum_coop_sval / total_active.clamp(min=1)
-                coop_vtarg = sum_coop_vtarg / total_active.clamp(min=1)
-
-                # Z-score normalize cooperative advantage
-                coop_adv = (coop_adv - coop_adv.mean()) / coop_adv.std().clamp(min=1e-7)
-
-                # --- Log cooperative critic loss (tracking only) ---
-                coop_critic_loss = ((coop_vtarg - coop_sval) ** 2).mean().item()
-                experiment.logger.log(
-                    {
-                        "train/coop_encoder/coop_critic_loss": coop_critic_loss,
-                        "train/coop_encoder/coop_adv_std_raw": (
-                            sum_raw_adv / total_active.clamp(min=1)
-                        ).std().item(),
-                    },
-                    step=experiment.n_iters_performed,
-                )
-
-                # --- Cooperative clipped PPO update for encoder (with SNI) ---
-                # Selective Noise Injection: use z=mu (deterministic) for both
-                # old and new log-probs so importance ratios reflect only GNN
-                # parameter changes, not z re-sampling noise.
-                n_optimizer_steps = (
-                    self.encoder_n_optimizer_steps
-                    if self.encoder_n_optimizer_steps is not None
-                    else experiment.config.n_optimizer_steps(self.on_policy)
-                )
-                n_minibatches = max(1, -(-buf_len // chunk_size))
-
-                # VIB beta (computed once, used in all iterations)
-                beta_eff = 0.0
-                if self.use_vib:
-                    total_frames = experiment.total_frames
-                    if self.vib_warmup_frames > 0:
-                        beta_eff = min(
-                            self.vib_beta,
-                            self.vib_beta * total_frames / self.vib_warmup_frames,
-                        )
-                    else:
-                        beta_eff = self.vib_beta
-
-                # --- Find EmbeddingProcessors for SNI (one per group) ---
-                _ep_map: dict[str, EmbeddingProcessor | None] = {}
-                for g in groups:
-                    _ep_map[g] = None
-                    lm = experiment.losses[g]
-                    for _m in lm.actor_network.modules():
-                        if isinstance(_m, EmbeddingProcessor):
-                            _ep_map[g] = _m
-                            break
-
-                # --- Pre-load full buffer data per group (on CPU) ---
-                gbuf_full: dict[str, TensorDictBase] = {}
-                for g in groups:
-                    gbuf_full[g] = experiment.replay_buffers[g][:buf_len]
-
-                # --- Compute old_log_prob with SNI (post-Phase-1 params) ---
-                old_lp_sni: dict[str, torch.Tensor] = {}
-                with torch.no_grad():
-                    for g in groups:
-                        lm = experiment.losses[g]
-                        ctx_params = (
-                            lm.actor_network_params.to_module(lm.actor_network)
-                            if lm.functional
-                            else contextlib.nullcontext()
-                        )
-                        ep = _ep_map[g]
-                        lp_chunks = []
-                        for chunk in gbuf_full[g].chunk(
-                            max(1, -(-gbuf_full[g].shape[0] // chunk_size)), dim=0
-                        ):
-                            chunk_dev = chunk.to(train_device)
-                            sni_ctx = ep.deterministic_mode() if ep is not None else contextlib.nullcontext()
-                            with sni_ctx, ctx_params:
-                                dist_old = lm.actor_network.get_dist(chunk_dev)
-                            action = chunk_dev.get((g, "action"))
-                            lp_chunks.append(dist_old.log_prob(action).cpu())
-                        old_lp_sni[g] = torch.cat(lp_chunks, dim=0)
-
-                # Accumulators for logging (averages over all iterations)
-                _log_coop_obj = 0.0
-                _log_encoder_loss = 0.0
-                _log_vib_kl = 0.0
-                _log_ratio_mean = 0.0
-                _log_ratio_max = 0.0
-                _log_clip_frac = 0.0
-                _n_iters = 0
-
-                clip_eps = self.clip_epsilon
-                ca = coop_adv  # (*batch, 1) — stays on CPU, sliced per minibatch
-
-                for _epoch in range(n_optimizer_steps):
-                    for _mb in range(n_minibatches):
-                        mb_start = _mb * chunk_size
-                        mb_end = min(mb_start + chunk_size, buf_len)
-
-                        self._gnn_optimizer.zero_grad()
-
-                        coop_obj_num = torch.tensor(0.0, device=train_device)
-                        total_active_count = torch.tensor(0.0, device=train_device)
-                        vib_kl_total = torch.tensor(0.0, device=train_device)
-                        n_vib_groups = 0
-                        mb_ratio_sum = 0.0
-                        mb_ratio_max = 0.0
-                        mb_clip_count = 0
-                        mb_total_count = 0
-
-                        ca_mb = ca[mb_start:mb_end].to(train_device)  # (*mb, 1)
-
-                        for g in groups:
-                            gdata_mb = gbuf_full[g][mb_start:mb_end].to(train_device)
-                            old_lp_mb = old_lp_sni[g][mb_start:mb_end].to(train_device)
-
-                            lm = experiment.losses[g]
-                            ctx_params = (
-                                lm.actor_network_params.to_module(lm.actor_network)
-                                if lm.functional
-                                else contextlib.nullcontext()
-                            )
-                            ep = _ep_map[g]
-                            sni_ctx = ep.deterministic_mode() if ep is not None else contextlib.nullcontext()
-                            with sni_ctx, ctx_params:
-                                dist_new = lm.actor_network.get_dist(gdata_mb)
-                            action = gdata_mb.get((g, "action"))
-                            new_lp = dist_new.log_prob(action)
-
-                            # Per-agent importance ratio
-                            log_ratio = new_lp - old_lp_mb
-                            ratio = torch.exp(log_ratio)
-                            clipped_ratio = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps)
-
-                            # Broadcast coop advantage to agent dims
-                            ca_g = ca_mb
-                            while ca_g.dim() < ratio.dim():
-                                ca_g = ca_g.unsqueeze(-1)
-
-                            # Clipped PPO surrogate (pessimistic)
-                            gain1 = ratio * ca_g.detach()
-                            gain2 = clipped_ratio * ca_g.detach()
-                            gain = torch.min(gain1, gain2)
-
-                            amask = gdata_mb.get((g, "active_mask"), None)
-                            if amask is not None:
-                                am = amask.float()
-                                while am.dim() < gain.dim():
-                                    am = am.unsqueeze(-1)
-                                coop_obj_num = coop_obj_num + (gain * am).sum()
-                                total_active_count = total_active_count + am.sum()
-                                # Ratio stats (active agents only)
-                                with torch.no_grad():
-                                    mb_ratio_sum += (ratio * am).sum().item()
-                                    active_max = ratio.where(am.bool(), torch.zeros_like(ratio)).max().item()
-                                    mb_ratio_max = max(mb_ratio_max, active_max)
-                                    mb_clip_count += ((ratio != clipped_ratio) * am).sum().item()
-                                    mb_total_count += am.sum().item()
-                            else:
-                                coop_obj_num = coop_obj_num + gain.sum()
-                                total_active_count = total_active_count + torch.tensor(
-                                    float(gain.numel()), device=train_device,
-                                )
-                                with torch.no_grad():
-                                    mb_ratio_sum += ratio.sum().item()
-                                    mb_ratio_max = max(mb_ratio_max, ratio.max().item())
-                                    mb_clip_count += (ratio != clipped_ratio).sum().item()
-                                    mb_total_count += ratio.numel()
-
-                            # VIB KL with active_mask (from buffer, not recomputed)
-                            if self.use_vib:
-                                mu = gdata_mb.get((g, "embedding_mu"), None)
-                                logvar = gdata_mb.get((g, "embedding_logvar"), None)
-                                if mu is not None and logvar is not None:
-                                    kl_per_agent = -0.5 * (
-                                        1 + logvar - mu.pow(2) - logvar.exp()
-                                    ).sum(dim=-1)
-                                    if amask is not None:
-                                        am_f = amask.float()
-                                        kl = (kl_per_agent * am_f).sum() / am_f.sum().clamp(min=1)
-                                    else:
-                                        kl = kl_per_agent.mean()
-                                    vib_kl_total = vib_kl_total + kl
-                                    n_vib_groups += 1
-
-                        coop_obj = coop_obj_num / total_active_count.clamp(min=1)
-
-                        # Encoder loss = -clipped_ppo_objective + VIB
-                        encoder_loss = -coop_obj
-                        if n_vib_groups > 0 and beta_eff > 0:
-                            encoder_loss = encoder_loss + beta_eff * (vib_kl_total / n_vib_groups)
-
-                        encoder_loss.backward()
-
-                        if experiment.config.clip_grad_norm and experiment.config.clip_grad_val is not None:
-                            torch.nn.utils.clip_grad_norm_(
-                                self._shared_actor_gnn.parameters(),
-                                experiment.config.clip_grad_val,
-                            )
-                        self._gnn_optimizer.step()
-                        self._gnn_optimizer.zero_grad()
-
-                        _log_coop_obj += coop_obj.item()
-                        _log_encoder_loss += encoder_loss.item()
-                        if n_vib_groups > 0:
-                            _log_vib_kl += (vib_kl_total / n_vib_groups).item()
-                        if mb_total_count > 0:
-                            _log_ratio_mean += mb_ratio_sum / mb_total_count
-                            _log_ratio_max = max(_log_ratio_max, mb_ratio_max)
-                            _log_clip_frac += mb_clip_count / mb_total_count
-                        _n_iters += 1
-
-                # --- Log coop_encoder metrics (averaged over iterations) ---
-                if _n_iters > 0:
-                    log_dict = {
-                        "train/coop_encoder/coop_obj": _log_coop_obj / _n_iters,
-                        "train/coop_encoder/encoder_loss": _log_encoder_loss / _n_iters,
-                        "train/coop_encoder/n_encoder_iters": _n_iters,
-                        "train/coop_encoder/ratio_mean": _log_ratio_mean / _n_iters,
-                        "train/coop_encoder/ratio_max": _log_ratio_max,
-                        "train/coop_encoder/clip_fraction": _log_clip_frac / _n_iters,
-                    }
-                    if self.use_vib:
-                        log_dict["train/coop_encoder/vib_kl_masked"] = _log_vib_kl / _n_iters
-                        log_dict["train/coop_encoder/vib_beta_eff"] = beta_eff
-                    experiment.logger.log(log_dict, step=experiment.n_iters_performed)
+                # Phase 0 already ran before the head updates — nothing to do.
+                pass
 
 
 @dataclass
