@@ -54,4 +54,4 @@ capability_config:
 max_stalkers: 8
 max_zealots: 8
 max_colossi: 4
-proximity_threshold: 6.0
+entity_obs: true

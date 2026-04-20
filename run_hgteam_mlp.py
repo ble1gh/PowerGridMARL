@@ -72,6 +72,20 @@ def parse_args():
         default="learned_query",
         choices=["none", "concat", "hypernetwork", "learned_query"],
     )
+    parser.add_argument(
+        "--actor-graph-mode",
+        type=str,
+        default="shared",
+        choices=["shared", "ego_entity"],
+        help="Actor GNN graph construction: 'shared' (PowerGrid) or 'ego_entity' (per-agent ego graphs)",
+    )
+    parser.add_argument(
+        "--ego-gnn-topology",
+        type=str,
+        default="star",
+        choices=["star", "full"],
+        help="Ego-entity GNN topology: 'star' (self-node hub) or 'full' (all-to-all entity edges)",
+    )
     parser.add_argument("--embedding-entropy-coef", type=float, default=1.0)
     parser.add_argument("--embedding-diversity-coef", type=float, default=0.001)
     parser.add_argument("--stochastic-z", type=lambda x: x.lower() != "false", default=True)
@@ -289,6 +303,8 @@ def main():
     if args.lmbda is not None:
         algorithm_config.lmbda = args.lmbda
     algorithm_config.gnn_mode = args.gnn_mode
+    algorithm_config.actor_graph_mode = args.actor_graph_mode
+    algorithm_config.ego_gnn_topology = args.ego_gnn_topology
     algorithm_config.embedding_entropy_coef = args.embedding_entropy_coef
     algorithm_config.embedding_diversity_coef = args.embedding_diversity_coef
     algorithm_config.stochastic_z = args.stochastic_z

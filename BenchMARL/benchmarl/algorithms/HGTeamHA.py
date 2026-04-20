@@ -386,12 +386,18 @@ class HGTeamHAPPO(HGTeamBase):
         experiment: "Experiment",  # noqa: F821
         groups: list[str],
     ) -> None:
-        """Cooperative GNN update with mean per-agent advantage (D12).
+        """Cooperative GNN update with per-agent advantages (D12).
 
         Runs BEFORE the sequential HAPPO head updates so that the GNN
         receives gradients through clean (pre-HAPPO) head Jacobians.
-        The cooperative advantage is the z-scored mean of raw per-agent
-        advantages across all active agents.
+
+        Each agent's surrogate term uses its own per-group advantage
+        (S8a-normalized, D7-zeroed from ``process_batch``).  By linearity,
+        this optimises the same per-capita cooperative objective
+        J_coop = (1/N) Σ_i E[R_i] as a shared cooperative advantage, but
+        with lower variance (each per-group critic V_i provides a
+        counterfactual baseline for agent i).  No HAPPO factor is applied
+        because the sequential trust-region factorisation has not started.
 
         After this method returns, the GNN is re-frozen (requires_grad=False)
         so that Phase 1 head updates don't accumulate GNN gradients.
@@ -415,64 +421,41 @@ class HGTeamHAPPO(HGTeamBase):
         train_device = experiment.config.train_device
         chunk_size = experiment.config.train_minibatch_size(self.on_policy)
 
-        # --- Compute cooperative advantage from all group buffers ---
-        sum_raw_adv = None
-        sum_coop_sval = None
-        sum_coop_vtarg = None
-        total_active = None
+        # --- Pre-load per-group advantages (S8a-normalized, D7-zeroed) ---
+        # These are already computed by process_batch and stored in the
+        # replay buffer.  No HAPPO factor multiplication (doesn't exist yet).
+        group_advs: dict[str, torch.Tensor] = {}
         buf_len = None
-
         for g in groups:
             gbuf = experiment.replay_buffers[g]
             glen = len(gbuf)
             if buf_len is None:
                 buf_len = glen
             gdata = gbuf[:glen]
-            vtarg = gdata.get((g, "value_target"))
-            sval = gdata.get((g, "state_value"))
+            group_advs[g] = gdata.get((g, "advantage")).detach().cpu()
+
+        # --- Log per-group advantage diagnostics ---
+        adv_log: dict[str, float] = {}
+        all_active_advs = []
+        for g in groups:
+            gdata = experiment.replay_buffers[g][:buf_len]
             amask = gdata.get((g, "active_mask"), None)
-
-            raw_adv = vtarg - sval
+            adv = group_advs[g]
             if amask is not None:
-                m = amask.float().unsqueeze(-1)
+                am = amask.float().cpu()
+                while am.dim() < adv.dim():
+                    am = am.unsqueeze(-1)
+                active_vals = adv[am.bool().expand_as(adv)]
             else:
-                m = torch.ones_like(raw_adv)
-
-            agent_dim = -2
-            g_sum = (raw_adv * m).sum(dim=agent_dim)
-            g_sval = (sval * m).sum(dim=agent_dim)
-            g_vtarg = (vtarg * m).sum(dim=agent_dim)
-            g_nact = m.sum(dim=agent_dim)
-
-            if sum_raw_adv is None:
-                sum_raw_adv = g_sum
-                sum_coop_sval = g_sval
-                sum_coop_vtarg = g_vtarg
-                total_active = g_nact
-            else:
-                sum_raw_adv = sum_raw_adv + g_sum
-                sum_coop_sval = sum_coop_sval + g_sval
-                sum_coop_vtarg = sum_coop_vtarg + g_vtarg
-                total_active = total_active + g_nact
-
-        coop_adv = sum_raw_adv / total_active.clamp(min=1)
-        coop_sval = sum_coop_sval / total_active.clamp(min=1)
-        coop_vtarg = sum_coop_vtarg / total_active.clamp(min=1)
-
-        # Z-score normalize cooperative advantage
-        coop_adv = (coop_adv - coop_adv.mean()) / coop_adv.std().clamp(min=1e-7)
-
-        # --- Log cooperative critic loss (tracking only) ---
-        coop_critic_loss = ((coop_vtarg - coop_sval) ** 2).mean().item()
-        experiment.logger.log(
-            {
-                "train/coop_encoder/coop_critic_loss": coop_critic_loss,
-                "train/coop_encoder/coop_adv_std_raw": (
-                    sum_raw_adv / total_active.clamp(min=1)
-                ).std().item(),
-            },
-            step=experiment.n_iters_performed,
-        )
+                active_vals = adv.reshape(-1)
+            if active_vals.numel() > 0:
+                adv_log[f"train/coop_encoder/{g}_adv_mean"] = active_vals.mean().item()
+                adv_log[f"train/coop_encoder/{g}_adv_std"] = active_vals.std().item()
+                all_active_advs.append(active_vals)
+        if all_active_advs:
+            combined = torch.cat(all_active_advs)
+            adv_log["train/coop_encoder/adv_std_all"] = combined.std().item()
+        experiment.logger.log(adv_log, step=experiment.n_iters_performed)
 
         # --- Cooperative clipped PPO update for encoder (with SNI) ---
         n_optimizer_steps = (
@@ -542,9 +525,12 @@ class HGTeamHAPPO(HGTeamBase):
         _log_ratio_max = 0.0
         _log_clip_frac = 0.0
         _n_iters = 0
+        # Per-group ratio/clip tracking
+        _per_group_ratio_sum: dict[str, float] = {g: 0.0 for g in groups}
+        _per_group_clip_count: dict[str, float] = {g: 0.0 for g in groups}
+        _per_group_total_count: dict[str, float] = {g: 0.0 for g in groups}
 
         clip_eps = self.clip_epsilon
-        ca = coop_adv
 
         for _epoch in range(n_optimizer_steps):
             for _mb in range(n_minibatches):
@@ -561,8 +547,6 @@ class HGTeamHAPPO(HGTeamBase):
                 mb_ratio_max = 0.0
                 mb_clip_count = 0
                 mb_total_count = 0
-
-                ca_mb = ca[mb_start:mb_end].to(train_device)
 
                 for g in groups:
                     gdata_mb = gbuf_full[g][mb_start:mb_end].to(train_device)
@@ -585,12 +569,15 @@ class HGTeamHAPPO(HGTeamBase):
                     ratio = torch.exp(log_ratio)
                     clipped_ratio = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps)
 
-                    ca_g = ca_mb
-                    while ca_g.dim() < ratio.dim():
-                        ca_g = ca_g.unsqueeze(-1)
+                    # Per-agent advantage from this group's critic
+                    adv_mb = group_advs[g][mb_start:mb_end].to(train_device)
+                    while adv_mb.dim() > ratio.dim():
+                        adv_mb = adv_mb.squeeze(-1)
+                    while adv_mb.dim() < ratio.dim():
+                        adv_mb = adv_mb.unsqueeze(-1)
 
-                    gain1 = ratio * ca_g.detach()
-                    gain2 = clipped_ratio * ca_g.detach()
+                    gain1 = ratio * adv_mb
+                    gain2 = clipped_ratio * adv_mb
                     gain = torch.min(gain1, gain2)
 
                     amask = gdata_mb.get((g, "active_mask"), None)
@@ -601,21 +588,31 @@ class HGTeamHAPPO(HGTeamBase):
                         coop_obj_num = coop_obj_num + (gain * am).sum()
                         total_active_count = total_active_count + am.sum()
                         with torch.no_grad():
-                            mb_ratio_sum += (ratio * am).sum().item()
+                            g_ratio_sum = (ratio * am).sum().item()
+                            g_active_n = am.sum().item()
                             active_max = ratio.where(am.bool(), torch.zeros_like(ratio)).max().item()
+                            g_clip_count = ((ratio != clipped_ratio) * am).sum().item()
+                            mb_ratio_sum += g_ratio_sum
                             mb_ratio_max = max(mb_ratio_max, active_max)
-                            mb_clip_count += ((ratio != clipped_ratio) * am).sum().item()
-                            mb_total_count += am.sum().item()
+                            mb_clip_count += g_clip_count
+                            mb_total_count += g_active_n
+                            _per_group_ratio_sum[g] += g_ratio_sum
+                            _per_group_clip_count[g] += g_clip_count
+                            _per_group_total_count[g] += g_active_n
                     else:
                         coop_obj_num = coop_obj_num + gain.sum()
                         total_active_count = total_active_count + torch.tensor(
                             float(gain.numel()), device=train_device,
                         )
                         with torch.no_grad():
+                            n_el = float(ratio.numel())
                             mb_ratio_sum += ratio.sum().item()
                             mb_ratio_max = max(mb_ratio_max, ratio.max().item())
                             mb_clip_count += (ratio != clipped_ratio).sum().item()
-                            mb_total_count += ratio.numel()
+                            mb_total_count += n_el
+                            _per_group_ratio_sum[g] += ratio.sum().item()
+                            _per_group_clip_count[g] += (ratio != clipped_ratio).sum().item()
+                            _per_group_total_count[g] += n_el
 
                     # VIB KL with active_mask
                     if self.use_vib:
@@ -669,6 +666,16 @@ class HGTeamHAPPO(HGTeamBase):
                 "train/coop_encoder/ratio_max": _log_ratio_max,
                 "train/coop_encoder/clip_fraction": _log_clip_frac / _n_iters,
             }
+            # Per-group ratio and clip fraction
+            for g in groups:
+                gc = _per_group_total_count[g]
+                if gc > 0:
+                    log_dict[f"train/coop_encoder/{g}_ratio_mean"] = (
+                        _per_group_ratio_sum[g] / gc
+                    )
+                    log_dict[f"train/coop_encoder/{g}_clip_fraction"] = (
+                        _per_group_clip_count[g] / gc
+                    )
             if self.use_vib:
                 log_dict["train/coop_encoder/vib_kl_masked"] = _log_vib_kl / _n_iters
                 log_dict["train/coop_encoder/vib_beta_eff"] = beta_eff
@@ -1302,6 +1309,8 @@ class HGTeamHAPPOConfig(AlgorithmConfig):
     share_critic_across_groups: bool = MISSING
     centralised_value_per_agent: bool = MISSING
     gnn_mode: str = MISSING
+    actor_graph_mode: str = MISSING
+    ego_gnn_topology: str = MISSING
     z_dim: int = MISSING
     hypernet_actor_feature_dim: int = MISSING
     stochastic_z: bool = MISSING

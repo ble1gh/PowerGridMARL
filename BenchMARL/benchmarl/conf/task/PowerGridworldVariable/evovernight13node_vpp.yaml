@@ -68,7 +68,7 @@ min_pv_scaling_factor: 5.0  # Minimum PV capacity (kW) when sampling
 max_pv_scaling_factor: 10.0  # Maximum PV capacity (kW) when sampling
 pv_profile_noise_std: 0.05  # Std dev of Gaussian noise on normalized PV profile (0 = no noise)
 pv_grid_aware: False
-pv_curtailment_reward_penalty: 0.1  # Reward penalty scaling for PV curtailment (utilization * penalty)
+pv_curtailment_reward_penalty: 0.05  # Reward penalty scaling for PV curtailment (utilization * penalty)
 
 # Energy Storage agent parameters
 storage_range_min: 3.0

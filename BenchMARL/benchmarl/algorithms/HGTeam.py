@@ -202,6 +202,9 @@ class HGTeamBase(Algorithm):
         stochastic_z: bool = False,
         embedding_entropy_coef: float = 0.0,
         embedding_diversity_coef: float = 0.0,
+        # Actor graph mode (shared vs ego_entity)
+        actor_graph_mode: str = "shared",
+        ego_gnn_topology: str = "star",
         # GNN configuration parameters
         gnn_num_layers: int = 2,
         gnn_heads: int = 4,
@@ -237,6 +240,20 @@ class HGTeamBase(Algorithm):
         if gnn_mode not in ("none", "concat", "hypernetwork", "learned_query"):
             raise ValueError(
                 f"gnn_mode must be 'none', 'concat', 'hypernetwork', or 'learned_query', got '{gnn_mode}'"
+            )
+        self.actor_graph_mode = actor_graph_mode
+        if actor_graph_mode not in ("shared", "ego_entity"):
+            raise ValueError(
+                f"actor_graph_mode must be 'shared' or 'ego_entity', got '{actor_graph_mode}'"
+            )
+        self.ego_gnn_topology = ego_gnn_topology
+        if ego_gnn_topology not in ("star", "full"):
+            raise ValueError(
+                f"ego_gnn_topology must be 'star' or 'full', got '{ego_gnn_topology}'"
+            )
+        if actor_graph_mode == "ego_entity" and gnn_mode == "none":
+            raise ValueError(
+                "actor_graph_mode='ego_entity' requires gnn_mode != 'none'"
             )
         self.z_dim = z_dim
         self.hypernet_actor_feature_dim = hypernet_actor_feature_dim
@@ -458,6 +475,17 @@ class HGTeamBase(Algorithm):
             {group: self._obs_spec_for_model(self.observation_spec, group, self.device)}
         )
 
+        # Strip entity keys from MLP input spec when using ego_entity mode.
+        # Entity tensors (3D) are consumed by the EgoEntityGNN, not the MLP.
+        if self.actor_graph_mode == "ego_entity":
+            group_spec = actor_input_spec[group]
+            entity_keys = [
+                k for k in group_spec.keys()
+                if k.startswith("entity_") or k == "move_feats"
+            ]
+            for k in entity_keys:
+                del group_spec[k]
+
         # Determine actor output based on gnn_mode
         if self.gnn_mode == "hypernetwork":
             # Hypernetwork mode: MLP outputs features, GNN embedding generates weights
@@ -578,27 +606,34 @@ class HGTeamBase(Algorithm):
             # Get the latent dim (after stochastic processing)
             latent_dim = self.z_dim
 
-            # Get observation shape for this group
-            obs_shape = self.observation_spec[group, "observation"].shape
-            obs_dim = obs_shape[-1]  # Last dimension is feature dim
+            # Determine what to concatenate with GNN embedding
+            if self.actor_graph_mode == "ego_entity":
+                # Ego-entity: concat move_feats (not full obs) with embedding
+                concat_feat_key = "move_feats"
+                concat_feat_dim = self.observation_spec[group, "move_feats"].shape[-1]
+            else:
+                # Shared mode: concat full observation with embedding
+                concat_feat_key = "observation"
+                obs_shape = self.observation_spec[group, "observation"].shape
+                concat_feat_dim = obs_shape[-1]
 
             # Create concatenation module
-            def concat_obs_embedding(obs, embedding_z):
-                # obs: (..., n_agents, obs_dim)
-                # embedding_z: (..., n_agents, latent_dim)
-                return torch.cat([obs, embedding_z], dim=-1)
+            def make_concat_fn(feat_key, grp):
+                def concat_obs_embedding(feat, embedding_z):
+                    return torch.cat([feat, embedding_z], dim=-1)
+                return TensorDictModule(
+                    concat_obs_embedding,
+                    in_keys=[(grp, feat_key), (grp, "embedding_z")],
+                    out_keys=[(grp, "concat_input")],
+                )
 
-            concat_module = TensorDictModule(
-                concat_obs_embedding,
-                in_keys=[(group, "observation"), (group, "embedding_z")],
-                out_keys=[(group, "concat_input")],
-            )
+            concat_module = make_concat_fn(concat_feat_key, group)
 
             # Create new actor input spec with concatenated features
             concat_input_spec = Composite(
                 {
                     group: Composite(
-                        {"concat_input": Unbounded(shape=(n_agents, obs_dim + latent_dim))},
+                        {"concat_input": Unbounded(shape=(n_agents, concat_feat_dim + latent_dim))},
                         shape=(n_agents,),
                     )
                 }
@@ -899,25 +934,24 @@ class HGTeamBase(Algorithm):
     def _get_or_build_shared_actor_gnn(self, gnn_output_dim: int) -> HeteroGNN:
         """Lazily build and return a shared actor GNN that sees ALL agent groups.
 
-        The GNN has one node type per agent group plus ``grid_node``, with
-        cross-group ``interaction`` edges between every pair of agent types,
-        ``mapping`` / ``mapping_rev`` edges between each agent type and the
-        grid, and grid-internal adjacency edges.  This allows each agent's
-        embedding to be informed by the participation scores and graph
-        positions of agents in *every* group, enabling cross-group role
-        differentiation.
+        Supports two modes via ``self.actor_graph_mode``:
 
-        The same ``nn.Module`` instance is reused across all groups' actor
-        pipelines, so gradients from every group's loss flow into it.
-
-        Note: because the shared parameters appear in every group's
-        optimizer, _get_parameters() returns them in a separate param group
-        with lr scaled by 1/num_groups to compensate for the multiple steps.
+        - ``"shared"`` (PowerGrid): one GNN over all agent types + grid nodes.
+        - ``"ego_entity"``: per-agent ego-centric entity graphs with node
+          types ``self_entity``, ``enemy``, and ``{type}_ally`` for each
+          agent type.  The forward pass folds (B, N) into a flat batch of
+          small ego graphs, runs message passing, and extracts the
+          ``self_entity`` embedding as the GNN output.
         """
         if self._shared_actor_gnn is not None:
             return self._shared_actor_gnn
 
         all_groups = list(self.group_map.keys())
+
+        if self.actor_graph_mode == "ego_entity":
+            return self._build_ego_entity_gnn(gnn_output_dim, all_groups)
+
+        # ---- shared mode (PowerGrid) --------------------------------
 
         # --- Node features for every agent type + grid ---------
         node_features_keys = {"grid_node": "grid_node_features"}
@@ -1050,6 +1084,60 @@ class HGTeamBase(Algorithm):
             device=self.device,
             action_spec=self.action_spec,
         )
+        return self._shared_actor_gnn
+
+    def _build_ego_entity_gnn(
+        self, gnn_output_dim: int, all_groups: list[str]
+    ) -> TensorDictModule:
+        """Build an ego-entity GNN for SMACv2 environments.
+
+        Each agent gets its own small graph with node types:
+        - ``self_entity`` (own features, 7d)
+        - ``enemy`` (enemy entity features, 9d each)
+        - ``{type}_ally`` for each type in all_groups (ally features, 9d each)
+
+        The GNN runs TransformerConv message passing on these ego graphs.
+        The ``self_entity`` node embedding is extracted as the per-agent output.
+
+        Returns a ``TensorDictModule`` wrapping the ego-entity GNN.
+        """
+        from benchmarl.models.ego_entity_gnn import EgoEntityGNN, EgoEntityGNNWrapper
+
+        # Derive entity dimensions from observation_spec
+        first_group = all_groups[0]
+        first_spec = self.observation_spec[first_group]
+        n_enemies = first_spec["entity_enemy"].shape[-2]
+        entity_dim = first_spec["entity_enemy"].shape[-1]
+        own_dim = first_spec["entity_self"].shape[-1]
+        move_feats_dim = first_spec["move_feats"].shape[-1]
+
+        # ally type → max count (from spec)
+        ally_type_max = {}
+        for g in all_groups:
+            ally_key = f"entity_{g}_ally"
+            ally_type_max[g] = first_spec[ally_key].shape[-2]
+
+        ego_gnn = EgoEntityGNN(
+            group_map=self.group_map,
+            all_groups=all_groups,
+            n_enemies=n_enemies,
+            entity_dim=entity_dim,
+            own_dim=own_dim,
+            move_feats_dim=move_feats_dim,
+            ally_type_max=ally_type_max,
+            output_dim=gnn_output_dim,
+            num_layers=self.gnn_num_layers,
+            heads=self.gnn_heads,
+            concat_heads=self.gnn_concat_heads,
+            use_beta=self.gnn_use_beta,
+            self_loops=self.gnn_self_loops,
+            topology=self.ego_gnn_topology,
+            norm_class=self.gnn_norm_class,
+            device=self.device,
+        )
+
+        # Wrap in TensorDictModule
+        self._shared_actor_gnn = EgoEntityGNNWrapper(ego_gnn, all_groups)
         return self._shared_actor_gnn
 
     def _add_graph_keys_to_spec(self, spec: Composite) -> None:
@@ -1719,6 +1807,8 @@ class HGTeamConfig(AlgorithmConfig):
     share_critic_across_groups: bool = MISSING
     centralised_value_per_agent: bool = MISSING
     gnn_mode: str = MISSING  # "none", "concat", "hypernetwork", or "learned_query"
+    actor_graph_mode: str = MISSING  # "shared" or "ego_entity"
+    ego_gnn_topology: str = MISSING  # "star" or "full"
     z_dim: int = MISSING
     hypernet_actor_feature_dim: int = MISSING
     stochastic_z: bool = MISSING

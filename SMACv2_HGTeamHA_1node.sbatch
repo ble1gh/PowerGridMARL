@@ -15,7 +15,7 @@
 #   gpu:h200_3g.71gb  — 71 GB (grn026, 8 slices)
 #   gpu:h200          — 141 GB full card (grn027-032, 8 each) — long queue
 #   gpu:1             — any available GPU (risky: may get 18 GB slice)
-#SBATCH --gres=gpu:h200_2g.35gb:1
+#SBATCH --gres=gpu:1
 
 #SBATCH -o /uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/results/slurm/SMACv2_HGTeamHA-%j.out-%N
 #SBATCH -e /uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/results/slurm/SMACv2_HGTeamHA-%j.err-%N
@@ -44,6 +44,13 @@ rsync -a \
     $PROJECT_ROOT/ $SCRDIR/PowerGridMARL/
 echo "Copy complete. Starting experiment..."
 cd $SCRDIR/PowerGridMARL
+
+# Remove SC2's bundled libstdc++ — it's too old (CXXABI_1.3.9) and conflicts
+# with PyTorch (needs CXXABI_1.3.11). Workers inherit LD_LIBRARY_PATH from SC2
+# and fail to import torch. The system libstdc++ is newer and compatible.
+# Must remove from BOTH scratch and HOME copies since SC2PATH points to HOME.
+rm -f $SCRDIR/PowerGridMARL/StarCraftII/Libs/libstdc++.so.6
+rm -f /uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/StarCraftII/Libs/libstdc++.so.6
 
 # Load required modules
 module load benchmarl/nightly
@@ -95,11 +102,18 @@ nvidia-smi
 echo "CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES"
 
 # Check if PyTorch can see GPU
-python -c "import torch; print(f'PyTorch version: {torch.__version__}'); print(f'CUDA available: {torch.cuda.is_available()}'); print(f'CUDA devices: {torch.cuda.device_count()}'); print(f'GPU Memory: {torch.cuda.get_device_properties(0).total_mem / 1024**3:.1f} GB')"
+python -c "import torch; print(f'PyTorch version: {torch.__version__}'); print(f'CUDA available: {torch.cuda.is_available()}'); print(f'CUDA devices: {torch.cuda.device_count()}'); print(f'GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB')"
 
 # Start background GPU monitoring
 nvidia-smi dmon -d 10 -s pucvmet -f $SCRDIR/gpu_usage.log &
 GPU_MONITOR_PID=$!
+
+# Set SC2PATH for PySC2
+export SC2PATH=/uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/StarCraftII
+
+# Scrub SC2's Libs/ from LD_LIBRARY_PATH so spawned workers don't pick up the
+# old bundled libstdc++. SC2 binary adds this on launch; we strip it proactively.
+export LD_LIBRARY_PATH=$(echo "$LD_LIBRARY_PATH" | tr ':' '\n' | grep -v 'StarCraftII/Libs' | paste -sd ':')
 
 # ============================================================================
 # Run experiment — HGTeamHA on SMACv2 Protoss 10v10
@@ -124,7 +138,7 @@ python run_hgteam_mlp.py \
     --task protoss_10_vs_10 \
     --seed 20 \
     --project-name "SMACv2Variable_HGTeamHA" \
-    --wandb-name "HGTeamHA_SMACv2_10v10_$(date +%Y%m%d)_${SLURM_JOB_ID}_coop_encoder_vib" \
+    --wandb-name "HGTeamHA_SMACv2_10v10_$(date +%Y%m%d)_${SLURM_JOB_ID}_coop_encoder_star_minib2" \
     --results-dir "$RESULTS_DIR" \
     --max-n-frames 10000000 \
     --lr 5e-4 \
@@ -135,11 +149,13 @@ python run_hgteam_mlp.py \
     --n-envs-per-worker 16 \
     --frames-per-batch 8192 \
     --minibatch-size 512 \
-    --n-minibatch-iters 3 \
+    --n-minibatch-iters 2 \
     --entropy-coef 0.01 \
     --algorithm happo \
     --fixed-order false \
     --gnn-mode concat \
+    --actor-graph-mode ego_entity \
+    --ego-gnn-topology star \
     --embedding-entropy-coef 0 \
     --embedding-diversity-coef 0 \
     --stochastic-z true \
@@ -154,7 +170,7 @@ python run_hgteam_mlp.py \
     --lmbda 0.95 \
     --critic-use-other-actions true \
     --encoder-update-mode coop_encoder \
-    --use_vib true \
+    --use-vib false \
 
 # Stop GPU monitoring
 kill $GPU_MONITOR_PID 2>/dev/null || true

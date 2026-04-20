@@ -14,6 +14,8 @@ share_critic_across_groups: True
 centralised_value_per_agent: True
 critic_embed_dim: 32
 gnn_mode: "learned_query"
+actor_graph_mode: "shared"
+ego_gnn_topology: "star"
 z_dim: 32
 hypernet_actor_feature_dim: 64
 stochastic_z: True

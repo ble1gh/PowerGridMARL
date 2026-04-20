@@ -652,6 +652,8 @@ class HGTeamSACConfig(AlgorithmConfig):
     share_critic_across_groups: bool = MISSING
     centralised_value_per_agent: bool = MISSING
     gnn_mode: str = MISSING
+    actor_graph_mode: str = MISSING
+    ego_gnn_topology: str = MISSING
     z_dim: int = MISSING
     hypernet_actor_feature_dim: int = MISSING
     stochastic_z: bool = MISSING

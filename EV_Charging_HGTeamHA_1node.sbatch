@@ -2,7 +2,7 @@
 #SBATCH --account=rai
 #SBATCH --partition=rai-gpu-grn
 #SBATCH --qos=rai-gpu-grn
-#SBATCH --time=30:00:00
+#SBATCH --time=60:00:00
 #SBATCH --nodes=1
 #SBATCH -n 1
 #SBATCH --cpus-per-task=16
@@ -15,8 +15,8 @@
 #   gpu:h200_3g.71gb  — 71 GB (grn026, 8 slices)
 #   gpu:h200          — 141 GB full card (grn027-032, 8 each) — long queue
 #   gpu:1             — any available GPU (risky: may get 18 GB slice)
-#SBATCH --gres=gpu:h200_3g.71gb:1
-# #SBATCH --gres=gpu:h200
+# #SBATCH --gres=gpu:h200_3g.71gb:1
+#SBATCH --gres=gpu:h200:1
 
 #SBATCH -o /uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/results/slurm/HGTeamHAslurmjob-%j.out-%N
 #SBATCH -e /uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/results/slurm/HGTeamHAslurmjob-%j.err-%N
@@ -109,18 +109,18 @@ GPU_MONITOR_PID=$!
 python run_hgteam_mlp.py \
     --seed 20 \
     --project-name "PowerGridworldVariable_VPP" \
-    --wandb-name "HGTeamHA_$(date +%Y%m%d)_${SLURM_JOB_ID}_lmbda0.99_accumulated_1iter_minib2048_lr5e-4" \
+    --wandb-name "HGTeamHA_$(date +%Y%m%d)_${SLURM_JOB_ID}_lmbda0.99_separate_forward_2iter_minib2048_lr3e-4_novib" \
     --results-dir "$RESULTS_DIR" \
-    --max-n-frames 10000000 \
-    --lr 5e-4 \
-    --lr-encoder 5e-4 \
-    --encoder-n-optimizer-steps 1 \
+    --max-n-frames 50000000 \
+    --lr 3e-4 \
+    --lr-encoder 3e-4 \
+    --encoder-n-optimizer-steps 2 \
     --evaluation-interval 24576 \
     --evaluation-episodes 20 \
     --n-envs-per-worker 32 \
-    --frames-per-batch 12288 \
+    --frames-per-batch 24576 \
     --minibatch-size 2048 \
-    --n-minibatch-iters 1 \
+    --n-minibatch-iters 2 \
     --entropy-coef 0.01 \
     --algorithm happo \
     --fixed-order false \
@@ -137,12 +137,12 @@ python run_hgteam_mlp.py \
     --stochastic-z-query true \
     --scale-lb 0.0001 \
     --reward-scale 100000 \
-    --use-vib true \
+    --use-vib false \
     --vib-warmup-frames 500000 \
     --embedding-viz-interval 5 \
     --lmbda 0.99 \
     --critic-use-other-actions true \
-    --encoder-update-mode accumulated \
+    --encoder-update-mode separate_forward \
     
 # Stop GPU monitoring
 kill $GPU_MONITOR_PID 2>/dev/null || true

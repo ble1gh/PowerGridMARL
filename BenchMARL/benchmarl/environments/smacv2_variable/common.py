@@ -42,19 +42,35 @@ class VariableSmacv2Env(EnvBase):
     - Flat active_mask across all types
     - Per-type participation scores (1.0 for alive, 0.0 for dead/padded)
     - Per-capita reward broadcasting (D2)
+    - Optional entity-decomposed observations (entity_obs=True)
     """
+
+    # Observation layout for Protoss (obs_all_health, obs_own_pos, use_unit_ranges):
+    # move_feats(4) | enemy_feats(n_enemies * entity_dim) | ally_feats(n_allies * entity_dim) | own_feats(7)
+    MOVE_FEATS_DIM = 4
+    OWN_FEATS_DIM = 7
+    ENTITY_FEATS_DIM = 9  # [visible/shootable, dist, rx, ry, health, shield, t0, t1, t2]
+
+    # Type-bit encoding for Protoss units (3 bits in entity features[-3:])
+    _TYPE_BIT_MAP = {
+        (True, False, False): "stalker",
+        (False, True, False): "zealot",
+        (False, False, True): "colossus",
+    }
 
     def __init__(
         self,
         base_env: EnvBase,
         max_per_type: dict[str, int],
         device: DEVICE_TYPING = "cpu",
+        entity_obs: bool = False,
     ):
         super().__init__(device=device, batch_size=torch.Size([]))
         self.base_env = base_env
         self.max_per_type = OrderedDict(max_per_type)
         self.type_names = list(self.max_per_type.keys())
         self.max_total = sum(self.max_per_type.values())
+        self.entity_obs = entity_obs
 
         # Dimensions from base env
         base_obs = base_env.observation_spec
@@ -68,6 +84,17 @@ class VariableSmacv2Env(EnvBase):
             base_obs["state"].shape[-1] if "state" in base_obs.keys() else None
         )
         self._episode_limit = getattr(base_env, "episode_limit", 200)
+
+        # Entity obs dimensions (derived from n_units)
+        self._n_enemies = self.n_units  # SMACv2: n_enemies == n_units (from config)
+        self._n_allies = self.n_units - 1  # each agent sees n_units-1 allies
+        # Max allies per type: the total ally count is n_units-1
+        # We allocate max_per_type[t] - 1 for the agent's own type (it's an ally
+        # to itself minus 1), and max_per_type[t] for other types.  But the
+        # simplest correct approach is: max allies of type t = max_per_type[t]
+        # (an agent can never see itself as an ally, but another slot of the
+        # same type can).  The actual count varies per agent; padding handles it.
+        self._max_allies_per_type = dict(self.max_per_type)  # copy
 
         # Per-episode type assignment (updated on reset)
         self._type_assignments: list[str] = []
@@ -99,22 +126,39 @@ class VariableSmacv2Env(EnvBase):
         rew = Composite(device=self.device)
 
         for tn, mc in self.max_per_type.items():
-            obs[tn] = Composite(
-                observation=Unbounded(shape=(mc, self._obs_dim)),
+            per_agent_obs = dict(
+                observation=Unbounded(shape=(self._obs_dim,)),
                 action_mask=Unbounded(
-                    shape=(mc, self._n_actions), dtype=torch.bool
+                    shape=(self._n_actions,), dtype=torch.bool
                 ),
-                active_mask=Unbounded(shape=(mc,), dtype=torch.bool),
-                device=self.device,
+                active_mask=Unbounded(shape=(), dtype=torch.bool),
             )
+            if self.entity_obs:
+                per_agent_obs["entity_enemy"] = Unbounded(
+                    shape=(self._n_enemies, self.ENTITY_FEATS_DIM)
+                )
+                per_agent_obs["entity_self"] = Unbounded(
+                    shape=(self.OWN_FEATS_DIM,)
+                )
+                per_agent_obs["move_feats"] = Unbounded(
+                    shape=(self.MOVE_FEATS_DIM,)
+                )
+                for ally_tn in self.type_names:
+                    per_agent_obs[f"entity_{ally_tn}_ally"] = Unbounded(
+                        shape=(self._max_allies_per_type[ally_tn], self.ENTITY_FEATS_DIM)
+                    )
+            obs[tn] = Composite(
+                per_agent_obs,
+                device=self.device,
+            ).expand(mc)
             act[tn] = Composite(
-                action=Categorical(n=self._n_actions, shape=(mc,)),
+                action=Categorical(n=self._n_actions, shape=()),
                 device=self.device,
-            )
+            ).expand(mc)
             rew[tn] = Composite(
-                reward=Unbounded(shape=(mc, 1)),
+                reward=Unbounded(shape=(1,)),
                 device=self.device,
-            )
+            ).expand(mc)
             obs.set(
                 f"{tn}_participation_score",
                 Unbounded(shape=(mc, 1)),
@@ -229,6 +273,86 @@ class VariableSmacv2Env(EnvBase):
                 flat[i] = a[li]
         return flat
 
+    def _decompose_obs(
+        self, obs_per_type: dict[str, torch.Tensor], active_t: dict[str, torch.Tensor]
+    ) -> dict[str, dict[str, torch.Tensor]]:
+        """Decompose flat observations into entity tensors per agent group.
+
+        For each agent in each type group, the flat obs is sliced into:
+        - move_feats: (4,)
+        - entity_enemy: (n_enemies, 9)
+        - entity_{T}_ally: (max_allies_T, 9) for each type T
+        - entity_self: (7,)
+
+        Ally features are routed to per-type tensors by parsing the 3 type
+        bits in each ally's features.  Out-of-range allies (all zeros) are
+        left as zeros in their respective type tensor.
+        """
+        ed = self.ENTITY_FEATS_DIM
+        result = {}
+
+        for tn in self.type_names:
+            mc = self.max_per_type[tn]
+            flat = obs_per_type[tn]  # (mc, obs_dim)
+            alive = active_t[tn]  # (mc,)
+
+            # Slice flat obs
+            move = flat[:, :self.MOVE_FEATS_DIM]  # (mc, 4)
+            enemy_start = self.MOVE_FEATS_DIM
+            enemy_end = enemy_start + self._n_enemies * ed
+            enemy_flat = flat[:, enemy_start:enemy_end]  # (mc, n_enemies*9)
+            enemy = enemy_flat.reshape(mc, self._n_enemies, ed)
+
+            ally_start = enemy_end
+            ally_end = ally_start + self._n_allies * ed
+            ally_flat = flat[:, ally_start:ally_end]  # (mc, n_allies*9)
+            ally = ally_flat.reshape(mc, self._n_allies, ed)
+
+            own_start = ally_end
+            own = flat[:, own_start:own_start + self.OWN_FEATS_DIM]  # (mc, 7)
+
+            # Route allies to per-type tensors by parsing type bits
+            ally_typed = {}
+            for at in self.type_names:
+                ally_typed[at] = torch.zeros(
+                    mc, self._max_allies_per_type[at], ed,
+                    device=flat.device, dtype=flat.dtype,
+                )
+
+            # For each agent slot, iterate over its ally features and route
+            # by type bits.  Vectorized over the ally dimension.
+            # Type bits are the last 3 features of each ally entity.
+            type_bits = ally[:, :, -3:]  # (mc, n_allies, 3)
+            ally_active = ally.abs().sum(-1) > 0  # (mc, n_allies)
+
+            # Counters for slot assignment (per agent, per ally type)
+            for at_idx, at in enumerate(self.type_names):
+                # Build mask: ally is of this type if its type bit is set
+                # type_bits[:, :, at_idx] > 0.5 AND ally is active
+                is_type = (type_bits[:, :, at_idx] > 0.5) & ally_active  # (mc, n_allies)
+
+                max_at = self._max_allies_per_type[at]
+                # For each agent slot, scatter matching allies into the typed tensor
+                for agent_i in range(mc):
+                    if not alive[agent_i]:
+                        continue
+                    indices = is_type[agent_i].nonzero(as_tuple=True)[0]
+                    n_fill = min(len(indices), max_at)
+                    if n_fill > 0:
+                        ally_typed[at][agent_i, :n_fill] = ally[agent_i, indices[:n_fill]]
+
+            group_result = {
+                "move_feats": move,
+                "entity_enemy": enemy,
+                "entity_self": own,
+            }
+            for at in self.type_names:
+                group_result[f"entity_{at}_ally"] = ally_typed[at]
+
+            result[tn] = group_result
+
+        return result
+
     # ------------------------------------------------------------------ #
     #  Output tensordict construction                                     #
     # ------------------------------------------------------------------ #
@@ -277,6 +401,13 @@ class VariableSmacv2Env(EnvBase):
             td.set((tn, "active_mask"), active_t[tn])
             td.set(f"{tn}_participation_score", participation[tn])
 
+        # Entity-decomposed observations
+        if self.entity_obs:
+            entity_data = self._decompose_obs(obs_t, active_t)
+            for tn in self.type_names:
+                for key, val in entity_data[tn].items():
+                    td.set((tn, key), val)
+
         td.set("active_mask", flat_mask)
 
         # State
@@ -298,7 +429,10 @@ class VariableSmacv2Env(EnvBase):
 
         # Reward: per-capita broadcast to alive agents (D2)
         if with_reward:
-            r = base_td.get(("agents", "reward"), default=None)
+            # Base SMACv2Env puts reward at root level, not under ("agents", "reward")
+            r = base_td.get("reward", default=None)
+            if r is None:
+                r = base_td.get(("agents", "reward"), default=None)
             if r is not None:
                 # In SMAC, all agents get the same team reward
                 team_r = r[0] if r.ndim >= 2 else r.mean()
@@ -309,6 +443,11 @@ class VariableSmacv2Env(EnvBase):
                     rew = torch.zeros(mc, 1, device=self.device)
                     rew[active_t[tn]] = per_capita
                     td.set((tn, "reward"), rew)
+            else:
+                # Fallback: zero reward (should not happen in normal operation)
+                for tn in self.type_names:
+                    mc = self.max_per_type[tn]
+                    td.set((tn, "reward"), torch.zeros(mc, 1, device=self.device))
 
         return td
 
@@ -370,7 +509,7 @@ class Smacv2VariableClass(TaskClass):
 
     # Keys consumed by this wrapper (popped before passing to SMACv2Env)
     _WRAPPER_KEYS = frozenset(
-        {"max_stalkers", "max_zealots", "max_colossi", "proximity_threshold"}
+        {"max_stalkers", "max_zealots", "max_colossi", "proximity_threshold", "entity_obs"}
     )
 
     def get_env_fun(
@@ -387,6 +526,7 @@ class Smacv2VariableClass(TaskClass):
         max_zealots = config.pop("max_zealots", 8)
         max_colossi = config.pop("max_colossi", 4)
         config.pop("proximity_threshold", None)
+        entity_obs = config.pop("entity_obs", False)
 
         max_per_type = OrderedDict(
             [
@@ -406,6 +546,7 @@ class Smacv2VariableClass(TaskClass):
                 base_env=base_env,
                 max_per_type=max_per_type,
                 device=device,
+                entity_obs=entity_obs,
             )
 
         return _make_env
@@ -435,9 +576,12 @@ class Smacv2VariableClass(TaskClass):
         obs = env.observation_spec.clone()
         spec = Composite()
         for tn in env.type_names:
-            spec[tn] = Composite(
-                action_mask=obs[tn]["action_mask"].clone(),
-            )
+            group_spec = obs[tn].clone()
+            # Keep only action_mask
+            for k in list(group_spec.keys()):
+                if k != "action_mask":
+                    del group_spec[k]
+            spec[tn] = group_spec
         return spec
 
     def observation_spec(self, env: EnvBase) -> Composite:
@@ -465,7 +609,7 @@ class Smacv2VariableClass(TaskClass):
     def get_reward_sum_transform(self, env: EnvBase) -> Transform:
         group_map = self.group_map(env)
         in_keys = [(group, "reward") for group in group_map.keys()]
-        out_keys = [(group, "reward_sum") for group in group_map.keys()]
+        out_keys = [(group, "episode_reward") for group in group_map.keys()]
         return RewardSum(in_keys=in_keys, out_keys=out_keys)
 
     @staticmethod
