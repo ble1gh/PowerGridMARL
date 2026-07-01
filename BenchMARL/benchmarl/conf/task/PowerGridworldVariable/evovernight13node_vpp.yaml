@@ -10,11 +10,11 @@ control_timedelta: 1800 #seconds
 
 # Variable agent configuration
 # Min/max number of each agent type (sampled uniformly at each episode reset)
-min_EVs: 10
-max_EVs: 20
+min_EVs: 15
+max_EVs: 15
 min_PVs: 25
 max_PVs: 25
-min_Storage: 5
+min_Storage: 8
 max_Storage: 8
 
 # Possible buses where each agent type can be located

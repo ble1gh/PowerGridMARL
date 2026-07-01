@@ -1,0 +1,13 @@
+---
+description: HGTeam algorithm family — PPO-style, HAPPO, SAC
+globs: BenchMARL/benchmarl/algorithms/**/*.py
+alwaysApply: false
+---
+
+# BenchMARL — algorithms
+
+- **Classes**: `HGTeamBase` / `HGTeam` ([`HGTeam.py`](../../BenchMARL/benchmarl/algorithms/HGTeam.py)), `HGTeamHA` ([`HGTeamHA.py`](../../BenchMARL/benchmarl/algorithms/HGTeamHA.py)), `HGTeamSAC` ([`HGTeamSAC.py`](../../BenchMARL/benchmarl/algorithms/HGTeamSAC.py)). Embeddings / hypernet / SNI: [`hgteam_modules.py`](../../BenchMARL/benchmarl/algorithms/hgteam_modules.py) (same folder—not `models/`).
+- **Config**: [`BenchMARL/benchmarl/conf/`](../../BenchMARL/benchmarl/conf/) + [`run_hgteam_mlp.py`](../../run_hgteam_mlp.py) / [`run_hgteam_experiment.py`](../../run_hgteam_experiment.py); CLI overrides YAML.
+- **Theory / paper**: Credit assignment, HAPPO factor, coop encoder phases (**D2, D8, D11/D12** in [`paper/outline.md`](../../paper/outline.md)) — cross-check before changing loss or update order ([`docs/agent_quickstart.md`](../../docs/agent_quickstart.md)).
+- **Models**: [`benchmarl/models/`](../../BenchMARL/benchmarl/models/) (separate rule).
+- **Check**: [`test_grad_tracking.py`](../../test_grad_tracking.py), [`test_shared_gnn.py`](../../test_shared_gnn.py), or short smoke.

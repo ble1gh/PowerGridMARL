@@ -1,0 +1,23 @@
+---
+description: Required smoke-test procedure for MARL pipeline changes
+alwaysApply: true
+---
+
+# Pipeline Smoke Tests
+
+When changing BenchMARL algorithms/models, PowerGridworld envs, SMACv2 envs, runner scripts, or sbatch pipeline settings, run the narrowest relevant smoke tests before final response. Do not assume existing smoke scripts pass; report exact pass/fail results and any skipped checks.
+
+## Test Selection
+
+- **HeteroGNN/model changes**: run `python smoke_test_heterognn_entity.py`.
+- **EdgeWeightedHGT changes**: run `python smoke_test_edgeweightedhgt.py`; for pipeline wiring also run `python smoke_test_vpp_pipeline.py --critic-model edgeweightedhgt --tier synthetic` or the narrowest relevant opt-in tier.
+- **SMACv2 variable/entity changes**: run `python smoke_test_smacv2_variable.py`; it includes the discrete action-edge CUDA preflight when CUDA is available. Run `python smoke_test_ego_entity.py` when ego-entity paths are touched.
+- **VPP / PowerGridworld / HGTeamHA changes**: run `python smoke_test_vpp_pipeline.py` first. Use `python smoke_test_vpp_pipeline.py --tier integration` before recommending an sbatch run or after touching collector/training-loop behavior.
+- **HGTeamSAC changes**: run `python smoke_test_hgteamsac.py`, but do not assume it is healthy. If it fails, capture the root traceback and state whether the failure predates or is unrelated to your changes.
+
+## Validation Rules
+
+- Run from the repo root with the BenchMARL environment loaded (`module load benchmarl/nightly` on CHPC).
+- Also run `ruff check` on touched Python files.
+- For long or unavailable checks, say exactly what was not run and why.
+- If a smoke test exposes a new failure, stop and investigate before claiming the pipeline is ready for sbatch.

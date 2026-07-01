@@ -1,0 +1,37 @@
+---
+description: CHPC (U of Utah) cluster rules — SLURM, storage, login-node safety
+alwaysApply: true
+---
+
+# CHPC environment
+
+This repo runs on **University of Utah CHPC** (general clusters: Granite, Notchpeak, Kingspeak, Lonepeak; protected: Redwood for PHI/PII only). Shared NFS `$HOME`, SLURM scheduler, LMOD modules. Full upstream ruleset: [`/uufs/chpc.utah.edu/sys/etc/agents/claude/etc/CLAUDE.md`](/uufs/chpc.utah.edu/sys/etc/agents/claude/etc/CLAUDE.md).
+
+## Hard rules
+- **Never run heavy jobs on login nodes** — Arbiter throttles and notifies users. Use `sbatch` / `salloc`.
+- **Never modify or write to `/sys`** (including `/uufs/chpc.utah.edu/sys/...`). It's read-only system state.
+- **Sensitive data (PHI/PII) only on Redwood** — never on general clusters.
+- Every job script MUST specify `--nodes`, `--ntasks`, `--account`, `--time`.
+- Before any job submission, consult the **`partition-selection`** skill and run `mychpc batch` to copy `--partition` / `--qos` / `--account` verbatim — do not guess them.
+- Do not unload the sticky base module `chpc/1.0`.
+- No secrets (W&B tokens, API keys) in git — env vars only.
+
+## Storage
+| Path | Quota | Auto-delete |
+|---|---|---|
+| `$HOME` | 50 GB | never |
+| `/scratch/general/nfs1` | 595 TB shared | 60 days inactive |
+| `/scratch/general/vast` | 50 TB/user | 60 days inactive |
+| `/scratch/local/$USER/$SLURM_JOB_ID` | node-local | ephemeral |
+
+Use scratch for I/O-heavy work, copy results back to `$HOME` / project space.
+
+## Common commands
+- `sbatch script.sh` · `salloc -t 1:00:00 -N 1 -n 4`
+- `sinfo` · `squeue -u $USER` · `sacct -j <id>`
+- `module avail <name>` · `module load <name>/<ver>`
+- `mychpc batch` · `mychpc storage`
+- Cross-cluster queries: `sbatch -M CLUSTER ...`, `squeue -M CLUSTER ...`, `sacct -M CLUSTER ...`.
+
+## Available CHPC skills
+Personal skills at `~/.cursor/skills/` (symlinked to `/uufs/chpc.utah.edu/sys/etc/agents/skills`): `partition-tree`, `slurm-utilization-audit`, `job-triage`, `software-environments`, `storage-placement`. Load the relevant one before writing job scripts, triaging failures, or choosing storage tiers.

@@ -1,0 +1,8 @@
+results/
+StarCraftII/
+__pycache__/
+*.py[cod]
+*.bak
+*.log
+.cursor/papers/
+.cursor/debug-*.log

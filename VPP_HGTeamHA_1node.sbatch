@@ -5,7 +5,7 @@
 #SBATCH --time=60:00:00
 #SBATCH --nodes=1
 #SBATCH -n 1
-#SBATCH --cpus-per-task=16
+#SBATCH --cpus-per-task=8
 #SBATCH --mem=32GB
 #
 # GPU Request:
@@ -19,15 +19,17 @@
 #SBATCH --gres=gpu:h200:1
 
 #SBATCH -o /uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/results/slurm/HGTeamHAslurmjob-%j.out-%N
-#SBATCH -e /uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/results/slurm/HGTeamHAslurmjob-%j.err-%N
+#SBATCH -e /uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/results/slurm/HGTeamHAslurmjob-%j.out-%N
 # #SBATCH --exclude=grn030
 
 
 PROJECT_ROOT=/uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL
 RESULTS_ROOT=$PROJECT_ROOT/results
 RESULTS_DIR=$RESULTS_ROOT/HGTeamHAresults_$(date +%Y%m%d)_${SLURM_JOB_ID}
+SCR_RESULTS_DIR=/scratch/general/vast/$USER/$SLURM_JOB_ID/run_results
 
 mkdir -p "$RESULTS_DIR"
+mkdir -p "$SCR_RESULTS_DIR"
 
 
 # Set up the temporary directory
@@ -46,12 +48,14 @@ rsync -a \
     $PROJECT_ROOT/ $SCRDIR/PowerGridMARL/
 echo "Copy complete. Starting experiment..."
 cd $SCRDIR/PowerGridMARL
+echo "Scratch results directory: $SCR_RESULTS_DIR"
+echo "Scratch checkpoint directory (expected): $SCR_RESULTS_DIR/checkpoints"
 
 # Load required modules
 module load benchmarl/nightly
 
 export PYTHONPATH=$SCRDIR/PowerGridMARL/PowerGridworld:$SCRDIR/PowerGridMARL/BenchMARL:$PYTHONPATH
-export WANDB_DIR="$RESULTS_DIR/wandb"
+export WANDB_DIR="$SCR_RESULTS_DIR/wandb"
 
 # Enable GPU usage — respect SLURM's assignment (required for MIG slices)
 # MIG slices use UUID-based device IDs; hardcoding "0" breaks them.
@@ -109,19 +113,19 @@ GPU_MONITOR_PID=$!
 python run_hgteam_mlp.py \
     --seed 20 \
     --project-name "PowerGridworldVariable_VPP" \
-    --wandb-name "HGTeamHA_$(date +%Y%m%d)_${SLURM_JOB_ID}_lmbda0.99_separate_forward_2iter_minib2048_lr3e-4_novib" \
-    --results-dir "$RESULTS_DIR" \
+    --wandb-name "HGTeamHA_$(date +%Y%m%d)_${SLURM_JOB_ID}_fixedpop_coop_encoder_otheractions_heterognn_H0.1_freeze1M" \
+    --results-dir "$SCR_RESULTS_DIR" \
     --max-n-frames 50000000 \
     --lr 3e-4 \
     --lr-encoder 3e-4 \
-    --encoder-n-optimizer-steps 2 \
+    --encoder-n-optimizer-steps 1 \
     --evaluation-interval 24576 \
     --evaluation-episodes 20 \
-    --n-envs-per-worker 32 \
+    --n-envs-per-worker 8 \
     --frames-per-batch 24576 \
     --minibatch-size 2048 \
     --n-minibatch-iters 2 \
-    --entropy-coef 0.01 \
+    --entropy-coef 0.05 \
     --algorithm happo \
     --fixed-order false \
     --gnn-mode concat \
@@ -135,31 +139,48 @@ python run_hgteam_mlp.py \
     --z-token-dim 32 \
     --z-query-dim 32 \
     --stochastic-z-query true \
-    --scale-lb 0.0001 \
+    --scale-lb 0.01 \
     --reward-scale 100000 \
-    --use-vib false \
-    --vib-warmup-frames 500000 \
+    --use-vib true \
+    --vib-warmup-frames 2000000 \
+    --vib-beta 0.00001 \
     --embedding-viz-interval 5 \
     --lmbda 0.99 \
     --critic-use-other-actions true \
-    --encoder-update-mode separate_forward \
-    
+    --encoder-update-mode coop_encoder \
+    --heterognn-type heterognn \
+    --encoder-freeze-after-frames 1000000 \
 # Stop GPU monitoring
 kill $GPU_MONITOR_PID 2>/dev/null || true
 
 echo "Job completed at: $(date)"
 
-# Copy the actual training results from the outputs directory
-if [ -d "$SCRDIR/PowerGridMARL/outputs" ]; then
-    cp -r $SCRDIR/PowerGridMARL/outputs/* $RESULTS_DIR/ 2>/dev/null || true
+# Copy non-checkpoint artifacts from scratch back to home results.
+# Checkpoints are intentionally left on scratch for manual promotion.
+if [ -d "$SCR_RESULTS_DIR" ]; then
+    rsync -a --exclude='checkpoints' "$SCR_RESULTS_DIR/" "$RESULTS_DIR/" 2>/dev/null || true
 fi
 
 # Copy GPU monitoring log back to home directory
 cp $SCRDIR/gpu_usage.log $RESULTS_DIR/ 2>/dev/null || true
 
 # Copy the SLURM script for reference
-cp $SCRDIR/PowerGridMARL/EV_Charging_HGTeamHA_1node.sbatch $RESULTS_DIR/ 2>/dev/null || true
+cp $PROJECT_ROOT/VPP_HGTeamHA_1node.sbatch $RESULTS_DIR/ 2>/dev/null || true
+
+# Print manual checkpoint promotion instructions into SLURM .out
+echo ""
+echo "==== CHECKPOINT LOCATION ===="
+echo "Checkpoint directory: $SCR_RESULTS_DIR/checkpoints"
+echo "To manually promote the newest checkpoint to home, run:"
+echo "mkdir -p \"$RESULTS_DIR/checkpoints_kept\" && cp \"\$(ls -1t \"$SCR_RESULTS_DIR\"/checkpoints/checkpoint_*.pt | head -n 1)\" \"$RESULTS_DIR/checkpoints_kept/\""
+echo "To promote a specific checkpoint, run:"
+echo "cp \"$SCR_RESULTS_DIR/checkpoints/checkpoint_<FRAMES>.pt\" \"$RESULTS_DIR/checkpoints_kept/\""
+echo "============================="
 
 # Clean up
 cd $PROJECT_ROOT
-rm -rf $SCRDIR
+# Keep scratch so checkpoints are available for manual promotion.
+# Set PURGE_SCRATCH_ON_EXIT=1 in the environment to delete scratch automatically.
+if [ "${PURGE_SCRATCH_ON_EXIT:-0}" = "1" ]; then
+    rm -rf $SCRDIR
+fi

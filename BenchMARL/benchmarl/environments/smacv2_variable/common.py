@@ -262,16 +262,82 @@ class VariableSmacv2Env(EnvBase):
             out[tn] = p
         return out
 
+    def _normalize_group_action(self, action: torch.Tensor, type_name: str) -> torch.Tensor:
+        """Return a 1D per-slot action tensor for one agent type.
+
+        The wrapper is single-env oriented, but TorchRL eval can preserve
+        singleton rollout/env dims. Accept shapes such as ``(mc,)``,
+        ``(mc, 1)``, ``(1, mc)``, and ``(1, mc, 1)``; reject true batched
+        actions instead of guessing which environment to use.
+        """
+        action = action.to(device=self.device, dtype=torch.long)
+        mc = self.max_per_type[type_name]
+
+        while action.ndim > 1 and action.shape[-1] == 1:
+            action = action.squeeze(-1)
+
+        if mc == 1:
+            if action.numel() != 1:
+                raise RuntimeError(
+                    f"Unsupported action shape for {type_name}: "
+                    f"{tuple(action.shape)}; expected a single action slot"
+                )
+            return action.reshape(1)
+
+        agent_axes = [dim for dim, size in enumerate(action.shape) if size == mc]
+        if len(agent_axes) != 1:
+            raise RuntimeError(
+                f"Unsupported action shape for {type_name}: {tuple(action.shape)}; "
+                f"expected exactly one agent axis of length {mc}"
+            )
+
+        agent_axis = agent_axes[0]
+        non_agent_shape = [
+            size for dim, size in enumerate(action.shape) if dim != agent_axis
+        ]
+        if any(size != 1 for size in non_agent_shape):
+            raise RuntimeError(
+                f"Unsupported batched action shape for {type_name}: {tuple(action.shape)}; "
+                "only singleton non-agent dimensions are supported"
+            )
+
+        return action.movedim(agent_axis, 0).reshape(mc)
+
     def _merge_actions(self, td: TensorDictBase) -> torch.Tensor:
         """Merge per-type discrete actions back to flat (n_units,) tensor."""
         flat = torch.zeros(self.n_units, dtype=torch.long, device=self.device)
+        actions_by_type = {}
+        for tn in self.type_names:
+            action = td.get((tn, "action"), None)
+            if action is not None:
+                actions_by_type[tn] = self._normalize_group_action(action, tn)
+
         for i, (t, li) in enumerate(
             zip(self._type_assignments, self._local_indices)
         ):
-            a = td.get((t, "action"), None)
+            a = actions_by_type.get(t, None)
             if a is not None:
                 flat[i] = a[li]
         return flat
+
+    def _team_reward_from_base(self, reward: torch.Tensor) -> torch.Tensor:
+        """Extract the scalar team reward from supported SMAC reward layouts."""
+        reward = reward.to(self.device)
+        if reward.ndim == 0 or reward.numel() == 1:
+            return reward.reshape(()).float()
+
+        squeezed = reward
+        while squeezed.ndim > 1 and squeezed.shape[-1] == 1:
+            squeezed = squeezed.squeeze(-1)
+
+        if squeezed.ndim == 1 and squeezed.shape[0] == self.n_units:
+            return squeezed[0].float()
+
+        raise RuntimeError(
+            "Unsupported SMACv2 reward shape "
+            f"{tuple(reward.shape)}; expected scalar, singleton, or per-agent "
+            f"reward with first dimension {self.n_units}"
+        )
 
     def _decompose_obs(
         self, obs_per_type: dict[str, torch.Tensor], active_t: dict[str, torch.Tensor]
@@ -435,7 +501,7 @@ class VariableSmacv2Env(EnvBase):
                 r = base_td.get(("agents", "reward"), default=None)
             if r is not None:
                 # In SMAC, all agents get the same team reward
-                team_r = r[0] if r.ndim >= 2 else r.mean()
+                team_r = self._team_reward_from_base(r)
                 n_alive = flat_mask.sum().clamp(min=1).float()
                 per_capita = team_r / n_alive
                 for tn in self.type_names:
@@ -480,6 +546,16 @@ class VariableSmacv2Env(EnvBase):
     def _set_seed(self, seed):
         if hasattr(self.base_env, "_set_seed"):
             self.base_env._set_seed(seed)
+
+    def render(self, *args, **kwargs):
+        """Forward rendering to the wrapped SMACv2 env when available."""
+        render_fn = getattr(self.base_env, "render", None)
+        if callable(render_fn):
+            return render_fn(*args, **kwargs)
+        raise AttributeError(
+            "VariableSmacv2Env base_env does not expose render(); "
+            "disable experiment rendering or use a render-capable SMACv2 env."
+        )
 
 
 # ==================================================================== #
@@ -558,7 +634,19 @@ class Smacv2VariableClass(TaskClass):
         return True
 
     def has_render(self, env: EnvBase) -> bool:
-        return True
+        current = env
+        for _ in range(8):
+            if isinstance(current, VariableSmacv2Env):
+                current = current.base_env
+                continue
+            render_fn = getattr(current, "render", None)
+            if callable(render_fn):
+                return True
+            next_env = getattr(current, "base_env", None)
+            if next_env is None or next_env is current:
+                break
+            current = next_env
+        return False
 
     def max_steps(self, env: EnvBase) -> int:
         return env.episode_limit

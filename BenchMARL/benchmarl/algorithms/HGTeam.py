@@ -5,9 +5,11 @@
 #
 
 import contextlib
+import random
 import warnings
 from collections.abc import Iterable
 from dataclasses import MISSING, dataclass
+from math import prod
 
 import torch
 import torch_geometric.nn as tgnn
@@ -32,10 +34,105 @@ from benchmarl.algorithms.hgteam_modules import (
 )
 from benchmarl.beta_param_extractor import BetaParamExtractor
 from benchmarl.independent_beta import IndependentBeta
-from benchmarl.models import HeteroGnnConfig
+from benchmarl.models import EdgeBiasedHGTConfig, EdgeWeightedHGTConfig, HeteroGnnConfig
 from benchmarl.models.common import ModelConfig
 from benchmarl.models.heterognn import HeteroGNN
 from benchmarl.tanh_normal_entropy import TanhNormalWithEntropy
+
+HETERO_GRAPH_CONFIG_TYPES = (HeteroGnnConfig, EdgeWeightedHGTConfig, EdgeBiasedHGTConfig)
+
+
+def _ema_normalize_advantages(
+    adv: torch.Tensor,
+    active_mask: torch.Tensor | None,
+    loss_module: "HGTeamLoss",
+    decay: float,
+    warmup_iters: int,
+    experiment: "Experiment" = None,  # noqa: F821
+    group: str | None = None,
+) -> None:
+    """Per-group advantage normalization against a slow-EMA reference scale.
+
+    Standard per-batch (S8a) normalization rescales advantages to unit
+    variance every iteration.  As the policy nears an optimum the *true*
+    advantage signal shrinks toward zero, so dividing by the current batch std
+    re-inflates pure critic/GAE noise back to unit scale and the policy
+    random-walks off the optimum.  This is the constant-step-size failure of
+    stochastic approximation: convergence requires the effective step to decay
+    (Robbins-Monro), and shrinking advantages are precisely that decay
+    mechanism -- which per-batch normalization destroys.
+
+    Instead we subtract the current per-group batch mean (a baseline; harmless
+    because it -> 0 near convergence) but divide by a reference scale that
+    reflects the *typical historical* signal magnitude: a running mean for the
+    first ``warmup_iters`` updates (seeded during the early healthy-signal
+    phase), then an extremely slow EMA.  Near convergence the current
+    advantages are small relative to this frozen-ish reference, so the
+    effective step size decays naturally.
+
+    The reference scale is stored as buffers on ``loss_module`` so it is
+    persisted with the per-group loss ``state_dict`` and restored on resume.
+
+    Scope: a single per-group scalar (pools all active agents for a robust
+    estimate; per-slot estimates are noisy for rarely-active slots and the
+    measured active-fraction is uniform across slots).
+
+    Modifies ``adv`` in place (a view into the batch tensordict).
+    """
+    if active_mask is not None:
+        m = active_mask
+        while m.dim() < adv.dim():
+            m = m.unsqueeze(-1)
+        m = m.expand_as(adv).bool()
+        active_vals = adv[m]
+    else:
+        m = None
+        active_vals = adv.reshape(-1)
+
+    # Need more than one active sample to estimate a scale this iteration.
+    if active_vals.numel() <= 1:
+        return
+
+    batch_mean = active_vals.mean()
+    batch_std = active_vals.std(correction=0)
+
+    count = loss_module._adv_ema_std_count
+    ref = loss_module._adv_ema_std
+    new_count = count + 1
+    if int(count.item()) < warmup_iters:
+        # Running-mean seeding over the early (healthy-signal) phase.
+        new_ref = (ref * count + batch_std) / new_count.to(ref.dtype)
+    else:
+        # Extremely slow EMA: reference tracks typical historical scale, not
+        # the shrinking current std.
+        new_ref = decay * ref + (1.0 - decay) * batch_std
+    loss_module._adv_ema_std.copy_(new_ref.detach())
+    loss_module._adv_ema_std_count.copy_(new_count)
+
+    scale = new_ref.detach().clamp(min=1e-7)
+
+    # --- Diagnostics ---
+    # ema_std/batch_std/scale_ratio: step-size (P1) and EMA-seed-poisoning
+    # health (is the reference dominated by an early transient while the raw
+    # signal has since shrunk?).  batch_mean: critic-centering / bias probe
+    # (GAE advantages should be ~mean-zero; a persistent offset flags a
+    # miscalibrated baseline, e.g. the P8 bootstrap-leakage bias).
+    if experiment is not None and group is not None:
+        experiment.logger.log(
+            {
+                f"train/adv_ema/{group}_ema_std": new_ref.item(),
+                f"train/adv_ema/{group}_batch_std": batch_std.item(),
+                f"train/adv_ema/{group}_batch_mean": batch_mean.item(),
+                f"train/adv_ema/{group}_scale_ratio": (batch_std / scale).item(),
+                f"train/adv_ema/{group}_ema_count": float(new_count.item()),
+            },
+            step=experiment.n_iters_performed,
+        )
+
+    if m is not None:
+        adv[m] = (adv[m] - batch_mean) / scale
+    else:
+        adv.copy_((adv - batch_mean) / scale)
 
 
 class HGTeamLoss(ClipPPOLoss):
@@ -205,6 +302,7 @@ class HGTeamBase(Algorithm):
         # Actor graph mode (shared vs ego_entity)
         actor_graph_mode: str = "shared",
         ego_gnn_topology: str = "star",
+        heterognn_type: str = "heterognn",
         # GNN configuration parameters
         gnn_num_layers: int = 2,
         gnn_heads: int = 4,
@@ -224,9 +322,33 @@ class HGTeamBase(Algorithm):
         use_vib: bool = False,
         vib_beta: float = 0.01,
         vib_warmup_frames: int = 500_000,
+        # Advantage normalization (slow-EMA reference scale)
+        adv_norm_ema: bool = True,
+        adv_norm_ema_decay: float = 0.999,
+        adv_norm_ema_warmup_iters: int = 10,
+        # Encoder freeze schedule (T3 ablation)
+        encoder_freeze_after_frames: int | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
+
+        # Advantage normalization mode.  When True, advantages are normalized
+        # against a slow-EMA per-group reference scale (see
+        # _ema_normalize_advantages) so the effective PPO step decays as the
+        # advantage signal vanishes.  When False, fall back to legacy per-slot
+        # per-batch normalization (S8a).
+        self.adv_norm_ema = adv_norm_ema
+        self.adv_norm_ema_decay = adv_norm_ema_decay
+        self.adv_norm_ema_warmup_iters = adv_norm_ema_warmup_iters
+
+        # Encoder freeze schedule.  None = never freeze (the shared actor GNN
+        # trains for the whole run).  0 = freeze from initialisation (the
+        # encoder is a fixed random feature map; heads/critics train on top).
+        # N > 0 = train the encoder until total_frames >= N, then freeze.
+        # Used for the T3 "frozen encoder" ablation: if training is stable with
+        # a frozen encoder, the instability is caused by encoder updates rather
+        # than the head/critic/advantage machinery.
+        self.encoder_freeze_after_frames = encoder_freeze_after_frames
 
         self.share_param_critic = share_param_critic
         self.scale_mapping = scale_mapping
@@ -250,6 +372,18 @@ class HGTeamBase(Algorithm):
         if ego_gnn_topology not in ("star", "full"):
             raise ValueError(
                 f"ego_gnn_topology must be 'star' or 'full', got '{ego_gnn_topology}'"
+            )
+        self.heterognn_type = heterognn_type
+        if heterognn_type not in ("heterognn", "edgeweightedhgt", "edgebiasedhgt"):
+            raise ValueError(
+                f"heterognn_type must be 'heterognn', 'edgeweightedhgt', or 'edgebiasedhgt', "
+                f"got '{heterognn_type}'"
+            )
+        if actor_graph_mode == "ego_entity" and heterognn_type != "heterognn":
+            warnings.warn(
+                "heterognn_type only selects the shared actor graph encoder; "
+                "actor_graph_mode='ego_entity' keeps using EgoEntityGNN.",
+                stacklevel=2,
             )
         if actor_graph_mode == "ego_entity" and gnn_mode == "none":
             raise ValueError(
@@ -411,12 +545,13 @@ class HGTeamBase(Algorithm):
         final_layer_idx = gnn_module.num_layers - 1
         if 0 <= final_layer_idx < len(gnn_module.convs):
             final_conv = gnn_module.convs[final_layer_idx]
-            for edge_key, conv_module in final_conv.convs.items():
-                # edge_key is (src, rel, dst)
-                dst = edge_key[2] if isinstance(edge_key, tuple) else None
-                if dst is not None and dst != group and dst in gnn_module.agent_groups:
-                    for p in conv_module.parameters():
-                        exclude_ptrs.add(p.data_ptr())
+            if hasattr(final_conv, "convs"):
+                for edge_key, conv_module in final_conv.convs.items():
+                    # edge_key is (src, rel, dst)
+                    dst = edge_key[2] if isinstance(edge_key, tuple) else None
+                    if dst is not None and dst != group and dst in gnn_module.agent_groups:
+                        for p in conv_module.parameters():
+                            exclude_ptrs.add(p.data_ptr())
 
         if gnn_module.output_proj is not None:
             for node_type, proj in gnn_module.output_proj.items():
@@ -435,14 +570,34 @@ class HGTeamBase(Algorithm):
         """Clone a group's observation spec, stripping ``active_mask``.
 
         ``active_mask`` is registered in the environment's observation spec so
-        that SerialEnv/ParallelEnv propagate it to the training batch.  Models,
-        however, should never see it as an input feature — it is boolean, 1-D
-        per agent, and used only for loss masking / edge filtering.
+        that SerialEnv/ParallelEnv propagate it to the training batch.  Models
+        like MLP cannot accept it as an input feature (boolean, 1-D per agent).
+
+        HeteroGNN call sites must re-add ``active_mask`` via
+        ``_restore_active_mask`` after calling this method.
         """
         group_spec = obs_spec[group].clone().to(device)
-        if "active_mask" in group_spec.keys():
+        if "active_mask" in group_spec:
             del group_spec["active_mask"]
         return group_spec
+
+    def _restore_active_mask(
+        self, model_input_spec: Composite, groups: list[str]
+    ) -> None:
+        """Copy ``active_mask`` from the env obs spec into *model_input_spec*.
+
+        HeteroGNN needs ``active_mask`` on the tensordict at runtime for
+        agent-axis inference (critical for entity-decomposed observations)
+        and for edge filtering.  ``_obs_spec_for_model`` strips it so that
+        MLP actors are not affected; GNN call sites call this method
+        afterwards to re-add it.
+        """
+        for g in groups:
+            if g in self.observation_spec and "active_mask" in self.observation_spec[g]:
+                model_input_spec[g].set(
+                    "active_mask",
+                    self.observation_spec[g]["active_mask"].clone().to(self.device),
+                )
 
     def _get_policy_for_loss(
         self, group: str, model_config: ModelConfig, continuous: bool
@@ -480,7 +635,7 @@ class HGTeamBase(Algorithm):
         if self.actor_graph_mode == "ego_entity":
             group_spec = actor_input_spec[group]
             entity_keys = [
-                k for k in group_spec.keys()
+                k for k in group_spec
                 if k.startswith("entity_") or k == "move_feats"
             ]
             for k in entity_keys:
@@ -620,7 +775,15 @@ class HGTeamBase(Algorithm):
             # Create concatenation module
             def make_concat_fn(feat_key, grp):
                 def concat_obs_embedding(feat, embedding_z):
+                    # Ego-entity GNN may prepend a batch of size 1 to entity tensors, so
+                    # embedding_z is 3D (B, N, z) while move_feats/obs from the env can be
+                    # 2D (N, d) in unbatched eval rollout. Align rank before cat on dim -1.
+                    while feat.ndim < embedding_z.ndim:
+                        feat = feat.unsqueeze(0)
+                    while embedding_z.ndim < feat.ndim:
+                        embedding_z = embedding_z.unsqueeze(0)
                     return torch.cat([feat, embedding_z], dim=-1)
+
                 return TensorDictModule(
                     concat_obs_embedding,
                     in_keys=[(grp, feat_key), (grp, "embedding_z")],
@@ -903,20 +1066,20 @@ class HGTeamBase(Algorithm):
                                 hasattr(conv, "lin_beta")
                                 and conv.lin_beta is not None
                                 and hasattr(conv.lin_beta, "weight")
+                                and conv.lin_beta.weight.grad is not None
                             ):
-                                if conv.lin_beta.weight.grad is not None:
-                                    grad_norm = conv.lin_beta.weight.grad.norm().detach()
-                                    beta_grad_norms.append(grad_norm)
-                                    # edge_key is a tuple (src, rel, dst); use relation name
-                                    try:
-                                        rel = edge_key[1]
-                                    except Exception:
-                                        rel = str(edge_key)
-                                    # Sanitize rel for logging
-                                    rel = str(rel).replace(" ", "_")
-                                    losses[f"diag_gnn_lin_beta_grad_norm_layer_{i}_{rel}"] = (
-                                        grad_norm
-                                    )
+                                grad_norm = conv.lin_beta.weight.grad.norm().detach()
+                                beta_grad_norms.append(grad_norm)
+                                # edge_key is a tuple (src, rel, dst); use relation name
+                                try:
+                                    rel = edge_key[1]
+                                except Exception:
+                                    rel = str(edge_key)
+                                # Sanitize rel for logging
+                                rel = str(rel).replace(" ", "_")
+                                losses[f"diag_gnn_lin_beta_grad_norm_layer_{i}_{rel}"] = (
+                                    grad_norm
+                                )
                         if beta_grad_norms:
                             # Log mean gradient norm per layer
                             mean_grad_norm = torch.stack(beta_grad_norms).mean()
@@ -1020,15 +1183,9 @@ class HGTeamBase(Algorithm):
                 stacklevel=2,
             )
 
-        gnn_conf = HeteroGnnConfig(
+        shared_gnn_kwargs = dict(
             topology="adjacency",
             self_loops=self.gnn_self_loops,
-            gnn_class=tgnn.TransformerConv,
-            gnn_kwargs={
-                "heads": self.gnn_heads,
-                "concat": self.gnn_concat_heads,
-                "beta": self.gnn_use_beta,
-            },
             grid_edge_keys={
                 "line_adjacency": "line_adjacency",
                 "transformer_adjacency": "transformer_adjacency",
@@ -1050,6 +1207,31 @@ class HGTeamBase(Algorithm):
             vel_features=0,
             edge_radius=0,
         )
+        if self.heterognn_type == "heterognn":
+            gnn_conf = HeteroGnnConfig(
+                gnn_class=tgnn.TransformerConv,
+                gnn_kwargs={
+                    "heads": self.gnn_heads,
+                    "concat": self.gnn_concat_heads,
+                    "beta": self.gnn_use_beta,
+                },
+                **shared_gnn_kwargs,
+            )
+        elif self.heterognn_type == "edgeweightedhgt":
+            gnn_conf = EdgeWeightedHGTConfig(
+                heads=self.gnn_heads,
+                low_rank=4,
+                edge_gate_hidden_dim=16,
+                edge_gate_num_layers=2,
+                zero_init_edge_gates=True,
+                **shared_gnn_kwargs,
+            )
+        else:
+            gnn_conf = EdgeBiasedHGTConfig(
+                heads=self.gnn_heads,
+                zero_init_edge_projections=True,
+                **shared_gnn_kwargs,
+            )
 
         # --- Input spec: all groups' observations --------------
         shared_input_spec = Composite()
@@ -1057,6 +1239,7 @@ class HGTeamBase(Algorithm):
             shared_input_spec.set(
                 g, self._obs_spec_for_model(self.observation_spec, g, self.device)
             )
+        self._restore_active_mask(shared_input_spec, all_groups)
 
         # --- Output spec: each group gets its own embedding ----
         shared_output_spec = Composite()
@@ -1185,6 +1368,45 @@ class HGTeamBase(Algorithm):
                         self.observation_spec[key].clone().to(self.device),
                     )
 
+    def _action_edge_dim_for_group(self, group: str) -> int:
+        """Feature dimension used when group actions are attached to graph edges."""
+        action_spec = self.action_spec[group, "action"]
+        if hasattr(action_spec, "n") and action_spec.n is not None:
+            return int(action_spec.n)
+
+        spec_shape = tuple(action_spec.shape)
+        n_agents = len(self.group_map[group])
+        if len(spec_shape) == 0:
+            return 1
+        trailing_shape = spec_shape[1:] if spec_shape[0] == n_agents else spec_shape
+        return int(prod(trailing_shape)) if trailing_shape else 1
+
+    def _action_edge_dims_by_group(self, groups: Iterable[str]) -> dict[str, int]:
+        """Return per-source-group edge feature dims for ``critic_use_other_actions``."""
+        return {group: self._action_edge_dim_for_group(group) for group in groups}
+
+    def _inject_action_edge_feature_dims(
+        self, edge_features_dims: dict | None, groups: Iterable[str]
+    ) -> dict:
+        """Configure per-relation edge dims for source-agent action features."""
+        groups = list(groups)
+        dims_by_group = self._action_edge_dims_by_group(groups)
+        efd = dict(edge_features_dims or {})
+        for src in groups:
+            src_dim = dims_by_group[src]
+            efd[f"{src}_self_interact"] = src_dim
+            for dst in groups:
+                if src != dst:
+                    efd[f"{src}_interact_{dst}"] = src_dim
+        if len(set(dims_by_group.values())) == 1:
+            efd["interaction"] = next(iter(dims_by_group.values()))
+        return efd
+
+    def _compute_other_actions_dim(self) -> int:
+        """Backward-compatible action edge dimension for homogeneous action spaces."""
+        first_group = next(iter(self.group_map))
+        return self._action_edge_dim_for_group(first_group)
+
 
 class HGTeam(HGTeamBase):
     """Heterogeneous Graph Team PPO - Multi Agent PPO with GNN-based agent embeddings.
@@ -1228,6 +1450,8 @@ class HGTeam(HGTeamBase):
         loss_critic_type: str,
         lmbda: float,
         minibatch_advantage: bool,
+        encoder_update_mode: str = "accumulated",
+        fixed_order: bool = False,
         critic_use_other_actions: bool = False,
         **kwargs,
     ):
@@ -1239,7 +1463,15 @@ class HGTeam(HGTeamBase):
         self.loss_critic_type = loss_critic_type
         self.lmbda = lmbda
         self.minibatch_advantage = minibatch_advantage
+        self.encoder_update_mode = encoder_update_mode
+        self.fixed_order = fixed_order
         self.critic_use_other_actions = critic_use_other_actions
+
+        if self.encoder_update_mode not in ("accumulated", "separate_forward", "coop_encoder"):
+            raise ValueError(
+                "encoder_update_mode must be one of "
+                "'accumulated', 'separate_forward', or 'coop_encoder'"
+            )
 
     def _get_loss(
         self, group: str, policy_for_loss: TensorDictModule, continuous: bool
@@ -1280,6 +1512,11 @@ class HGTeam(HGTeamBase):
             lmbda=self.lmbda,
             vectorized=False,
             deactivate_vmap=True,  # Clearly disable vmap for sparse graphs (dynamic shapes)
+        )
+        # Slow-EMA advantage-scale reference (persisted via loss state_dict).
+        loss_module.register_buffer("_adv_ema_std", torch.zeros((), device=self.device))
+        loss_module.register_buffer(
+            "_adv_ema_std_count", torch.zeros((), dtype=torch.long, device=self.device)
         )
         return loss_module, False
 
@@ -1483,21 +1720,33 @@ class HGTeam(HGTeamBase):
             # critic loss is zero (target - prediction = 0).
             vtarg[~m] = vval[~m].detach()
 
-            # --- S8a: Per-slot masked advantage normalization ---
-            # The batch has batch_size (n_envs, T) and the group adds
-            # n_agents as an additional dimension.  Shapes:
-            #   active_mask: (*batch_dims, n_agents)
-            #   adv:         (*batch_dims, n_agents, 1)
-            agent_dim = active_mask.dim() - 1  # last dim of active_mask
-            n_agents = active_mask.shape[agent_dim]
-            for slot in range(n_agents):
-                slot_active = active_mask.select(agent_dim, slot)  # (*batch_dims) bool
-                if slot_active.sum() > 1:
-                    slot_adv_view = adv.select(agent_dim, slot)  # (*batch_dims, 1)
-                    slot_vals = slot_adv_view[slot_active]  # (n_active, 1)
-                    slot_adv_view[slot_active] = (
-                        slot_vals - slot_vals.mean()
-                    ) / slot_vals.std(correction=0).clamp(min=1e-7)
+            if self.adv_norm_ema:
+                # Per-group slow-EMA reference scale (default).
+                _ema_normalize_advantages(
+                    adv,
+                    active_mask,
+                    loss,
+                    self.adv_norm_ema_decay,
+                    self.adv_norm_ema_warmup_iters,
+                    experiment=self.experiment,
+                    group=group,
+                )
+            else:
+                # --- S8a: Per-slot masked advantage normalization (legacy) ---
+                # The batch has batch_size (n_envs, T) and the group adds
+                # n_agents as an additional dimension.  Shapes:
+                #   active_mask: (*batch_dims, n_agents)
+                #   adv:         (*batch_dims, n_agents, 1)
+                agent_dim = active_mask.dim() - 1  # last dim of active_mask
+                n_agents = active_mask.shape[agent_dim]
+                for slot in range(n_agents):
+                    slot_active = active_mask.select(agent_dim, slot)  # (*batch_dims) bool
+                    if slot_active.sum() > 1:
+                        slot_adv_view = adv.select(agent_dim, slot)  # (*batch_dims, 1)
+                        slot_vals = slot_adv_view[slot_active]  # (n_active, 1)
+                        slot_adv_view[slot_active] = (
+                            slot_vals - slot_vals.mean()
+                        ) / slot_vals.std(correction=0).clamp(min=1e-7)
         else:
             # No active_mask — fall back to standard per-slot normalization.
             # This path is reached when the environment does not provide
@@ -1509,6 +1758,17 @@ class HGTeam(HGTeamBase):
                 stacklevel=2,
             )
             adv = batch.get((group, "advantage"))
+            if self.adv_norm_ema:
+                _ema_normalize_advantages(
+                    adv,
+                    None,
+                    loss,
+                    self.adv_norm_ema_decay,
+                    self.adv_norm_ema_warmup_iters,
+                    experiment=self.experiment,
+                    group=group,
+                )
+                return batch
             agent_dim = adv.dim() - 2  # second-to-last: (*batch_dims, n_agents, 1)
             n_agents = adv.shape[agent_dim]
             for slot in range(n_agents):
@@ -1533,17 +1793,143 @@ class HGTeam(HGTeamBase):
 
         return loss_vals
 
-    def _compute_other_actions_dim(self) -> int:
-        """Action dimension for a single agent (used for edge_features_dims)."""
-        # All agent types have the same 1-d continuous action in this env
-        first_group = next(iter(self.group_map))
-        return self.action_spec[first_group, "action"].shape[-1]
+    def train_groups(self, experiment, batch, current_frames: int):
+        """Train groups with configurable encoder/head phase ordering.
+
+        Modes:
+          - accumulated: standard single-phase updates (default behavior)
+          - separate_forward: head/critic phase first, then encoder-only phase
+          - coop_encoder: encoder-only phase first, then head/critic phase
+        """
+        for group in experiment.train_group_map:
+            group_batch = batch.exclude(*experiment._get_excluded_keys(group))
+            group_batch = self.process_batch(group, group_batch)
+            if not self.has_rnn:
+                group_batch = group_batch.reshape(-1)
+            group_buffer = experiment.replay_buffers[group]
+            group_buffer.extend(group_batch.to(group_buffer.storage.device))
+
+        groups = list(experiment.train_group_map.keys())
+        if self.fixed_order:
+            group_order = groups
+        else:
+            group_order = groups.copy()
+            random.shuffle(group_order)
+
+        def _run_group_updates(order: list[str]):
+            for group in order:
+                training_tds = []
+                for _ in range(experiment.config.n_optimizer_steps(self.on_policy)):
+                    for _ in range(
+                        -(
+                            -experiment.config.train_batch_size(self.on_policy)
+                            // experiment.config.train_minibatch_size(self.on_policy)
+                        )
+                    ):
+                        training_tds.append(experiment._optimizer_loop(group))
+                training_td = torch.stack(training_tds)
+                experiment.logger.log_training(group, training_td, step=experiment.n_iters_performed)
+                experiment._on_train_end(training_td, group)
+
+        def _set_phase_trainability(
+            *,
+            train_encoder: bool,
+            train_heads: bool,
+            train_critic: bool,
+        ):
+            for group in groups:
+                loss_module = experiment.losses[group]
+
+                # Actor params -> split into encoder (shared GNN + EmbeddingProcessor) vs heads
+                actor_params = list(loss_module.actor_network_params.flatten_keys().values())
+                encoder_param_ptrs = set()
+                if self._shared_actor_gnn is not None:
+                    encoder_param_ptrs |= {p.data_ptr() for p in self._shared_actor_gnn.parameters()}
+                for m in loss_module.actor_network.modules():
+                    if isinstance(m, EmbeddingProcessor):
+                        encoder_param_ptrs |= {p.data_ptr() for p in m.parameters()}
+
+                for p in actor_params:
+                    if p.data_ptr() in encoder_param_ptrs:
+                        p.requires_grad_(train_encoder)
+                    else:
+                        p.requires_grad_(train_heads)
+
+                # Critic params
+                critic_params = list(loss_module.critic_network_params.flatten_keys().values())
+                for p in critic_params:
+                    p.requires_grad_(train_critic)
+
+        # Snapshot original requires_grad flags and restore at the end
+        reqgrad_snapshot: dict[int, bool] = {}
+        for group in groups:
+            lm = experiment.losses[group]
+            for p in lm.actor_network_params.flatten_keys().values():
+                reqgrad_snapshot[p.data_ptr()] = p.requires_grad
+            for p in lm.critic_network_params.flatten_keys().values():
+                reqgrad_snapshot[p.data_ptr()] = p.requires_grad
+
+        try:
+            if self.encoder_update_mode == "accumulated":
+                _set_phase_trainability(
+                    train_encoder=True,
+                    train_heads=True,
+                    train_critic=True,
+                )
+                _run_group_updates(group_order)
+            elif self.encoder_update_mode == "separate_forward":
+                # Phase 1: heads + critic (encoder frozen)
+                _set_phase_trainability(
+                    train_encoder=False,
+                    train_heads=True,
+                    train_critic=True,
+                )
+                _run_group_updates(group_order)
+                # Phase 2: encoder only
+                _set_phase_trainability(
+                    train_encoder=True,
+                    train_heads=False,
+                    train_critic=False,
+                )
+                _run_group_updates(group_order)
+            else:  # coop_encoder
+                # Phase 0: cooperative encoder-only update
+                _set_phase_trainability(
+                    train_encoder=True,
+                    train_heads=False,
+                    train_critic=False,
+                )
+                _run_group_updates(group_order)
+                # Phase 1: head + critic specialization
+                _set_phase_trainability(
+                    train_encoder=False,
+                    train_heads=True,
+                    train_critic=True,
+                )
+                _run_group_updates(group_order)
+        finally:
+            # Restore original trainability flags
+            for group in groups:
+                lm = experiment.losses[group]
+                for p in lm.actor_network_params.flatten_keys().values():
+                    p.requires_grad_(reqgrad_snapshot.get(p.data_ptr(), p.requires_grad))
+                for p in lm.critic_network_params.flatten_keys().values():
+                    p.requires_grad_(reqgrad_snapshot.get(p.data_ptr(), p.requires_grad))
+
+        # Exploration schedule should advance once per iteration (not per phase)
+        for group in groups:
+            if isinstance(experiment.group_policies[group], TensorDictSequential):
+                explore_layer = experiment.group_policies[group][-1]
+            else:
+                explore_layer = experiment.group_policies[group]
+            if hasattr(explore_layer, "step"):
+                explore_layer.step(current_frames)
 
     def get_critic(self, group: str) -> TensorDictModule:
         """Build or return the cached critic module for *group*.
 
-        Uses a shared HeteroGNN critic when ``share_critic_across_groups``
-        is True or the critic config is HeteroGnnConfig (default).  Falls
+        Uses a shared heterogeneous graph critic when ``share_critic_across_groups``
+        is True or the critic config is a hetero-graph model.  Falls
         back to a per-type MLP critic otherwise.
 
         Args:
@@ -1556,13 +1942,15 @@ class HGTeam(HGTeamBase):
         n_agents = len(self.group_map[group])
 
         # ================================================================
-        # Shared critic path — always used for HeteroGNN critics so that
+        # Shared critic path — always used for hetero-graph critics so that
         # the critic graph contains cross-group interaction edges.
         # ================================================================
-        if self.share_critic_across_groups or isinstance(self.critic_model_config, HeteroGnnConfig):
+        if self.share_critic_across_groups or isinstance(
+            self.critic_model_config, HETERO_GRAPH_CONFIG_TYPES
+        ):
             if not self.share_param_critic:
                 raise ValueError(
-                    "Using a HeteroGNN critic or sharing critic across groups "
+                    "Using a heterogeneous graph critic or sharing critic across groups "
                     "requires share_param_critic=True"
                 )
             return self._get_shared_critic(group, n_agents)
@@ -1594,16 +1982,19 @@ class HGTeam(HGTeamBase):
                 {group: self._obs_spec_for_model(self.observation_spec, group, self.device)}
             )
             # Include root-level graph keys the GNN needs
-            if isinstance(self.critic_model_config, HeteroGnnConfig):
+            if isinstance(self.critic_model_config, HETERO_GRAPH_CONFIG_TYPES):
+                self._restore_active_mask(critic_input_spec, [group])
                 self._add_graph_keys_to_spec(critic_input_spec)
 
         # Build model
         critic_config = self.critic_model_config
-        if self.centralised_value_per_agent and isinstance(critic_config, HeteroGnnConfig):
+        if self.centralised_value_per_agent and isinstance(
+            critic_config, HETERO_GRAPH_CONFIG_TYPES
+        ):
             critic_config.prune_non_agent_final_layer = True
 
         # Per-type key overrides
-        if isinstance(critic_config, HeteroGnnConfig):
+        if isinstance(critic_config, HETERO_GRAPH_CONFIG_TYPES):
             import copy
 
             critic_config = copy.deepcopy(critic_config)
@@ -1614,10 +2005,10 @@ class HGTeam(HGTeamBase):
                 critic_config.node_features_keys["agents"] = f"{group}_{orig_key}"
             # Inject action edge features dims for critic_use_other_actions
             if self.critic_use_other_actions:
-                action_dim = self._compute_other_actions_dim()
-                efd = dict(critic_config.edge_features_dims or {})
-                efd["interaction"] = action_dim
-                critic_config.edge_features_dims = efd
+                critic_config.edge_features_dims = self._inject_action_edge_feature_dims(
+                    critic_config.edge_features_dims,
+                    critic_config.agent_groups or [group],
+                )
 
         value_module = critic_config.get_model(
             input_spec=critic_input_spec,
@@ -1631,7 +2022,9 @@ class HGTeam(HGTeamBase):
             action_spec=self.action_spec,
         )
         # Enable action edge features on the critic GNN
-        if self.critic_use_other_actions and isinstance(critic_config, HeteroGnnConfig):
+        if self.critic_use_other_actions and isinstance(
+            critic_config, HETERO_GRAPH_CONFIG_TYPES
+        ):
             value_module._use_action_edge_features = True
 
         if self.share_param_critic and not self.centralised_value_per_agent:
@@ -1654,7 +2047,7 @@ class HGTeam(HGTeamBase):
 
         Architecture::
 
-            Per-type obs ──► Native HeteroGNN (each type = own node type)
+            Per-type obs ──► Native hetero-graph model (each type = own node type)
             Graph keys   ──►   with per-type input projections
                                           │
                                   Per-type state_values
@@ -1678,13 +2071,14 @@ class HGTeam(HGTeamBase):
                 )
 
             # Add graph keys for ALL types
-            if isinstance(self.critic_model_config, HeteroGnnConfig):
+            if isinstance(self.critic_model_config, HETERO_GRAPH_CONFIG_TYPES):
+                self._restore_active_mask(critic_input_spec, type_order)
                 self._add_graph_keys_to_spec(critic_input_spec)
 
             # Build per-type node_features_keys and dims from the base config
             critic_config = copy.deepcopy(self.critic_model_config)
 
-            if isinstance(critic_config, HeteroGnnConfig):
+            if isinstance(critic_config, HETERO_GRAPH_CONFIG_TYPES):
                 # Set agent_groups so the GNN knows all types
                 critic_config.agent_groups = list(type_order)
 
@@ -1717,10 +2111,10 @@ class HGTeam(HGTeamBase):
                 # dims so TransformerConv allocates edge_dim weights for
                 # agent-agent interaction edges.
                 if self.critic_use_other_actions:
-                    action_dim = self._compute_other_actions_dim()
-                    efd = dict(critic_config.edge_features_dims or {})
-                    efd["interaction"] = action_dim
-                    critic_config.edge_features_dims = efd
+                    critic_config.edge_features_dims = self._inject_action_edge_feature_dims(
+                        critic_config.edge_features_dims,
+                        type_order,
+                    )
 
             # Output spec: per-type state_value
             if self.centralised_value_per_agent:
@@ -1800,6 +2194,8 @@ class HGTeamConfig(AlgorithmConfig):
     scale_lb: float = MISSING
     use_tanh_normal: bool = MISSING
     minibatch_advantage: bool = MISSING
+    encoder_update_mode: str = MISSING
+    fixed_order: bool = MISSING
     use_beta: bool = MISSING
     beta_min_param: float = MISSING
 
@@ -1809,6 +2205,7 @@ class HGTeamConfig(AlgorithmConfig):
     gnn_mode: str = MISSING  # "none", "concat", "hypernetwork", or "learned_query"
     actor_graph_mode: str = MISSING  # "shared" or "ego_entity"
     ego_gnn_topology: str = MISSING  # "star" or "full"
+    heterognn_type: str = MISSING  # "heterognn", "edgeweightedhgt", or "edgebiasedhgt"
     z_dim: int = MISSING
     hypernet_actor_feature_dim: int = MISSING
     stochastic_z: bool = MISSING
@@ -1842,6 +2239,14 @@ class HGTeamConfig(AlgorithmConfig):
     use_vib: bool = MISSING
     vib_beta: float = MISSING
     vib_warmup_frames: int = MISSING
+
+    # Advantage normalization (slow-EMA reference scale)
+    adv_norm_ema: bool = MISSING
+    adv_norm_ema_decay: float = MISSING
+    adv_norm_ema_warmup_iters: int = MISSING
+
+    # Encoder freeze schedule (T3 ablation): None=never, 0=from init, N=after N frames
+    encoder_freeze_after_frames: int | None = MISSING
 
     @staticmethod
     def associated_class() -> type[Algorithm]:

@@ -1,0 +1,13 @@
+---
+description: PowerGridworld gridworld package — physics, DERs, OpenDSS
+globs: PowerGridworld/**/*.py
+alwaysApply: false
+---
+
+# PowerGridworld
+
+- **Role**: Feeder + DER simulation consumed as **`gridworld`** when [`PowerGridworld`](../../PowerGridworld/) is on `PYTHONPATH` / `sys.path` (BenchMARL envs: `from gridworld import MultiAgentEnv`).
+- **OpenDSS**: [`opendss.py`](../../PowerGridworld/gridworld/distribution_system/opendss.py) → **`import opendssdirect as dss`**. Poetry pins **`opendssdirect-py`** in [`PowerGridworld/pyproject.toml`](../../PowerGridworld/pyproject.toml); MARL requirements pin **`dss-python`** (+ backend) in [`requirements-benchmarl-*.txt`](../../requirements-benchmarl-3.10.3.txt). Ensure the active env can **`import opendssdirect`** (add **`opendssdirect-py`** if needed).
+- **Entry**: [`multiagent_env.py`](../../PowerGridworld/gridworld/multiagent_env.py) (`MultiAgentEnv`, `reward_transform`, penalties / VPP flags in `common_config`). DERs: [`gridworld/agents/`](../../PowerGridworld/gridworld/agents/) (`vehicles/`, `pv/`, `energy_storage/`, …) + [`gridworld.base`](../../PowerGridworld/gridworld/base.py).
+- **MARL boundary**: Spec / mask / TensorDict changes need the matching BenchMARL [`PowerGridworldVariable/common.py`](../../BenchMARL/benchmarl/environments/PowerGridworldVariable/common.py) or [`PowerGridworldGraph/common.py`](../../BenchMARL/benchmarl/environments/PowerGridworldGraph/common.py).
+- **Check**: `pytest test_bus_connectivity.py -q` or a relevant `smoke_test_*.py`.

@@ -115,7 +115,7 @@ create_json: True
 # Absolute path to the folder where the experiment will log.
 # If null, this will default to the hydra output dir (if using hydra) or to the current folder when the script is run (if not).
 # If you are reloading an experiment with "restore_file", this will default to the reloaded experiment folder.
-save_folder: null
+save_folder: /uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/results/checkpoints/
 # Absolute path to a checkpoint file where the experiment was saved. If null the experiment is started fresh.
 restore_file: null
 # Map location given to `torch.load()` when reloading.
@@ -124,7 +124,7 @@ restore_file: null
 restore_map_location: null
 # Interval for experiment saving in terms of collected frames (this should be a multiple of on/off_policy_collected_frames_per_batch).
 # Set it to 0 to disable checkpointing
-checkpoint_interval: 0
+checkpoint_interval: 245760
 # Whether to checkpoint when the experiment is done
 checkpoint_at_end: False
 # How many checkpoints to keep. As new checkpoints are taken, temporally older checkpoints are deleted to keep this number of

@@ -1,0 +1,49 @@
+name: edgeweightedhgt
+
+# Generic smoke-test-safe defaults. VPP/PowerGridworld configs should override
+# grid_edge_keys, edge_features_dims, agent_node_index_key, and node_features_*.
+topology: full
+self_loops: True
+
+cat_observations_to_output: False
+
+position_key: null
+pos_features: 0
+velocity_key: null
+vel_features: 0
+exclude_pos_from_node_features: null
+edge_radius: null
+
+edge_features_key: null
+agent_node_index_key: null
+
+agent_groups: null
+node_types: null
+node_features_keys: null
+edge_types: null
+node_features_dims: null
+edge_features_dims:
+  interaction: 0
+grid_edge_keys: null
+exclude_observations_from_node_features: False
+prune_non_agent_final_layer: False
+gnn_hidden_dim: null
+num_layers: 1
+
+activation_class: torch.nn.ReLU
+activation_kwargs: null
+norm_class: null
+norm_kwargs: null
+
+heads: 1
+low_rank: 4
+edge_gate_hidden_dim: 32
+edge_gate_num_layers: 2
+edge_gate_activation_class: torch.nn.ReLU
+edge_gate_activation_kwargs: null
+edge_gate_scale: 1.0
+zero_init_edge_gates: True
+modulate_attention: True
+modulate_message: True
+allow_missing_edge_features: False
+dropout: 0.0

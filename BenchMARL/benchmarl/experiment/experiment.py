@@ -14,6 +14,7 @@ import shutil
 import time
 import warnings
 from collections import OrderedDict, deque
+from collections.abc import Collection
 from dataclasses import MISSING, dataclass
 from pathlib import Path
 from typing import Any
@@ -286,7 +287,8 @@ class ExperimentConfig:
         if self.max_n_frames is not None and self.max_n_iters is not None:
             warnings.warn(
                 f"max_n_frames and max_n_iters have both been set. The experiment will terminate after "
-                f"{self.get_max_n_iters(on_policy)} iterations ({self.get_max_n_frames(on_policy)} frames)."
+                f"{self.get_max_n_iters(on_policy)} iterations ({self.get_max_n_frames(on_policy)} frames).",
+                stacklevel=2,
             )
 
 
@@ -325,7 +327,8 @@ class Experiment(CallbackNotifier):
         if isinstance(task, Task):
             warnings.warn(
                 "Call `.get_task()` or `.get_from_yaml()` on your task Enum before passing it to the experiment. "
-                "If you do not do this, benchmarl will load the default task config from yaml."
+                "If you do not do this, benchmarl will load the default task config from yaml.",
+                stacklevel=2,
             )
             task = task.get_task()
         self.task = task
@@ -478,27 +481,27 @@ class Experiment(CallbackNotifier):
                 group=group,
                 transforms=self.task.get_replay_buffer_transforms(self.test_env, group),
             )
-            for group in self.group_map.keys()
+            for group in self.group_map
         }
         self.losses = {
-            group: self.algorithm.get_loss_and_updater(group)[0] for group in self.group_map.keys()
+            group: self.algorithm.get_loss_and_updater(group)[0] for group in self.group_map
         }
         self.target_updaters = {
-            group: self.algorithm.get_loss_and_updater(group)[1] for group in self.group_map.keys()
+            group: self.algorithm.get_loss_and_updater(group)[1] for group in self.group_map
         }
         self.optimizers = {
             group: {
                 loss_name: torch.optim.Adam(params, lr=self.config.lr, eps=self.config.adam_eps)
                 for loss_name, params in self.algorithm.get_parameters(group).items()
             }
-            for group in self.group_map.keys()
+            for group in self.group_map
         }
 
     def _setup_collector(self):
         self.policy = self.algorithm.get_policy_for_collection()
 
         self.group_policies = {}
-        for group in self.group_map.keys():
+        for group in self.group_map:
             group_policy = self.policy.select_subsequence(out_keys=[(group, "action")])
             assert len(group_policy) == 1
             self.group_policies.update({group: group_policy[0]})
@@ -751,21 +754,42 @@ class Experiment(CallbackNotifier):
         share_critic = getattr(self.algorithm, "share_critic_across_groups", False)
         shared_actor_gnn = getattr(self.algorithm, "gnn_mode", "none") != "none"
         if not (share_critic or shared_actor_gnn):
-            for other_group in self.group_map.keys():
+            for other_group in self.group_map:
                 if other_group != group:
                     excluded_keys += [other_group, ("next", other_group)]
         excluded_keys += ["info", (group, "info"), ("next", group, "info")]
         return excluded_keys
 
-    def _optimizer_loop(self, group: str) -> TensorDictBase:
+    def _optimizer_loop(
+        self,
+        group: str,
+        loss_names: Collection[str] | None = None,
+        step_target_updater: bool = True,
+    ) -> TensorDictBase:
         subdata = self.replay_buffers[group].sample().to(self.config.train_device)
         loss_vals = self.losses[group](subdata)
         training_td = loss_vals.detach()
         loss_vals = self.algorithm.process_loss_vals(group, loss_vals, batch=subdata)
+        active_loss_names = set(loss_names) if loss_names is not None else None
 
         for loss_name, loss_value in loss_vals.items():
-            if loss_name in self.optimizers[group].keys():
+            if loss_name in self.optimizers[group] and (
+                active_loss_names is None or loss_name in active_loss_names
+            ):
                 optimizer = self.optimizers[group][loss_name]
+                trainable_params = [
+                    param
+                    for param_group in optimizer.param_groups
+                    for param in param_group["params"]
+                    if param.requires_grad
+                ]
+                if not trainable_params or not loss_value.requires_grad:
+                    raise RuntimeError(
+                        "Selected loss cannot be optimized: "
+                        f"group={group}, loss_name={loss_name}, "
+                        f"loss_requires_grad={loss_value.requires_grad}, "
+                        f"trainable_params={len(trainable_params)}"
+                    )
 
                 loss_value.backward()
 
@@ -790,9 +814,9 @@ class Experiment(CallbackNotifier):
                 )
 
                 # Extract gradient norms from retain_grad() refs stored by HGTeamLoss.
-                # Only after loss_objective backward, since that's the actor loss
+                # Only after actor/objective backward, since that's the loss
                 # whose graph flows through embedding_z and participation scores.
-                if loss_name == "loss_objective":
+                if loss_name in ("loss_objective", "loss_actor"):
                     loss_module = self.losses[group]
                     if hasattr(loss_module, "_grad_embedding_z_ref"):
                         z = loss_module._grad_embedding_z_ref
@@ -814,7 +838,7 @@ class Experiment(CallbackNotifier):
                 optimizer.step()
                 optimizer.zero_grad()
         self.replay_buffers[group].update_tensordict_priority(subdata)
-        if self.target_updaters[group] is not None:
+        if step_target_updater and self.target_updaters[group] is not None:
             self.target_updaters[group].step()
 
         callback_loss = self._on_train_step(subdata, group)
@@ -883,7 +907,8 @@ class Experiment(CallbackNotifier):
             except NotImplementedError:
                 warnings.warn(
                     "`experiment.evaluation_static` set to true but the environment does not allow to set seeds."
-                    "Static evaluation is not guaranteed."
+                    "Static evaluation is not guaranteed.",
+                    stacklevel=2,
                 )
         evaluation_start = time.time()
         with set_exploration_type(
@@ -934,6 +959,7 @@ class Experiment(CallbackNotifier):
                     "The environment does not support rendering rollout figures. "
                     "The rollout figure will not be logged.",
                     UserWarning,
+                    stacklevel=2,
                 )
 
         evaluation_time = time.time() - evaluation_start
@@ -976,7 +1002,7 @@ class Experiment(CallbackNotifier):
             state_dict (dict): the state dict
 
         """
-        for group in self.group_map.keys():
+        for group in self.group_map:
             self.losses[group].load_state_dict(state_dict[f"loss_{group}"])
             if state_dict[f"buffer_{group}"] is not None:
                 self.replay_buffers[group].load_state_dict(state_dict[f"buffer_{group}"])

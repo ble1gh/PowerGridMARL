@@ -4,19 +4,23 @@
 #  LICENSE file in the root directory of this source tree.
 #
 import contextlib
-from typing import List
 
 import pytest
 import torch
 import torch_geometric.nn
-
 from benchmarl.hydra_config import load_model_config_from_hydra
 from benchmarl.models import GnnConfig, TransformerConfig, model_config_registry
-
-from benchmarl.models.common import output_has_agent_dim, SequenceModelConfig
+from benchmarl.models.common import SequenceModelConfig, output_has_agent_dim
 from hydra import compose, initialize
-
 from torchrl.data.tensor_specs import Composite, Unbounded
+
+GRAPH_MODEL_NAMES = {"gnn", "edgeweightedhgt"}
+
+
+def _is_graph_model_name(model_name) -> bool:
+    if isinstance(model_name, list):
+        return any(name in GRAPH_MODEL_NAMES for name in model_name)
+    return model_name in GRAPH_MODEL_NAMES
 
 
 def _get_input_and_output_specs(
@@ -144,15 +148,17 @@ def test_models_forward_shape(
 ):
     if not input_has_agent_dim and not centralised:
         pytest.skip()  # this combination should never happen
-    if ("gnn" in model_name) and (
+    if _is_graph_model_name(model_name) and (
         not input_has_agent_dim
-        or (isinstance(model_name, list) and model_name[0] != "gnn")
+        or (isinstance(model_name, list) and model_name[0] not in GRAPH_MODEL_NAMES)
     ):
-        pytest.skip("gnn model needs agent dim as input")
+        pytest.skip("graph model needs agent dim as input")
+    if model_name == "edgeweightedhgt" and centralised and not share_params:
+        pytest.skip("EdgeWeightedHGT centralised critics use shared parameters")
 
     torch.manual_seed(0)
 
-    if isinstance(model_name, List):
+    if isinstance(model_name, list):
         config = SequenceModelConfig(
             model_configs=[
                 model_config_registry[config].get_from_yaml() for config in model_name
@@ -295,11 +301,13 @@ def test_share_params_between_models(
 ):
     if not input_has_agent_dim and not centralised:
         pytest.skip()  # this combination should never happen
-    if ("gnn" in model_name) and (
+    if _is_graph_model_name(model_name) and (
         not input_has_agent_dim
-        or (isinstance(model_name, list) and model_name[0] != "gnn")
+        or (isinstance(model_name, list) and model_name[0] not in GRAPH_MODEL_NAMES)
     ):
-        pytest.skip("gnn model needs agent dim as input")
+        pytest.skip("graph model needs agent dim as input")
+    if model_name == "edgeweightedhgt" and centralised and not share_params:
+        pytest.skip("EdgeWeightedHGT centralised critics use shared parameters")
 
     torch.manual_seed(0)
 
@@ -311,7 +319,7 @@ def test_share_params_between_models(
         n_agents=n_agents,
     )
 
-    if isinstance(model_name, List):
+    if isinstance(model_name, list):
         config = SequenceModelConfig(
             model_configs=[
                 model_config_registry[config].get_from_yaml() for config in model_name
@@ -345,7 +353,7 @@ def test_share_params_between_models(
         action_spec=None,
     )
     model.share_params_with(second_model)
-    for param, second_param in zip(model.parameters(), second_model.parameters()):
+    for param, second_param in zip(model.parameters(), second_model.parameters(), strict=False):
         assert torch.eq(param, second_param).all()
 
 

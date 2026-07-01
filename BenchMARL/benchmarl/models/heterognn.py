@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import importlib
 import inspect
 from dataclasses import MISSING, dataclass
@@ -134,12 +135,11 @@ class HeteroGNN(Model):
             self.edge_types = []
             for g1 in self.agent_groups:
                 for g2 in self.agent_groups:
-                    if g1 == g2:
-                        # Intra-type: e.g. (EV, EV_self_interact, EV)
-                        rel = f"{g1}_self_interact"
-                    else:
-                        # Cross-type: e.g. (EV, EV_interact_PV, PV)
-                        rel = f"{g1}_interact_{g2}"
+                    rel = (
+                        f"{g1}_self_interact"
+                        if g1 == g2
+                        else f"{g1}_interact_{g2}"
+                    )
                     self.edge_types.append((g1, rel, g2))
 
             if self.grid_edge_keys:
@@ -173,17 +173,35 @@ class HeteroGNN(Model):
             self.pos_features += 1  # We will add also 1-dimensional distance
         self.edge_features = self.pos_features + self.vel_features
 
+        # Per-group agent counts (from spec shape, e.g. .expand(mc) -> shape (mc,))
+        self.n_agents_per_group = {
+            group: self.input_spec[group].shape[0]
+            for group in self.agent_groups
+            if len(self.input_spec[group].shape) > 0
+        }
+
         # Calculate input features per agent group (supports heterogeneous dims)
         self.input_features_per_group = {}
         for group in self.agent_groups:
             dim = 0
+            n_agents_in_group = len(self.input_spec[group].shape)
             # Add explicit node feature dimensions for this group
             if self.node_features_dims and group in self.node_features_dims:
                 dim += self.node_features_dims[group]
             # Add observation dimensions if not excluded
             if not self.exclude_observations_from_node_features:
+                def _spec_feature_dim(spec_shape):
+                    if len(spec_shape) == 0:
+                        return 1
+                    if len(spec_shape) == 1:
+                        # Per-agent scalar: shape=(n_agents,)
+                        return 1
+                    # Group leaf specs include the agent dimension first.
+                    # Flatten any trailing entity axes into a per-agent feature vector.
+                    return int(prod(spec_shape[1:]))
+
                 dim += sum(
-                    spec.shape[-1]
+                    _spec_feature_dim(spec.shape)
                     for key, spec in self.input_spec.items(True, True)
                     if _unravel_key_to_tuple(key)[-1]
                     not in (position_key, velocity_key, "active_mask")
@@ -192,6 +210,7 @@ class HeteroGNN(Model):
                         or _unravel_key_to_tuple(key)[-1] != self.agent_node_index_key
                     )
                     and group in _unravel_key_to_tuple(key)
+                    and len(spec.shape) >= n_agents_in_group
                 )
             if self.position_key is not None and not self.exclude_pos_from_node_features:
                 dim += self.pos_features - 1
@@ -241,7 +260,10 @@ class HeteroGNN(Model):
                     # In _forward: ... if key not in (pos, vel)
                     if key_tuple[-1] in (self.position_key, self.velocity_key):
                         continue
-                    obs_dim += spec.shape[-1]
+                    if len(spec.shape) <= 1:
+                        obs_dim += 1
+                    else:
+                        obs_dim += int(prod(spec.shape[1:]))
 
             if obs_dim >= self.output_features:
                 raise ValueError(
@@ -389,6 +411,15 @@ class HeteroGNN(Model):
             device=self.device,
             n_agents=self.n_agents,
         )
+        self.edge_index_by_group = {
+            group: _get_edge_index(
+                topology=self.topology,
+                self_loops=self.self_loops,
+                device=self.device,
+                n_agents=n_agents,
+            )
+            for group, n_agents in self.n_agents_per_group.items()
+        }
         # Unified key-resolution cache: {(suffix, group): resolved_full_key}
         # Populated on first forward pass, eliminates repeated key-tree scans.
         self._resolved_keys = {}
@@ -465,51 +496,49 @@ class HeteroGNN(Model):
                     f"Edge type {edge} refers to undefined node types. Available node_types: {self.node_types}"
                 )
 
-        if not self.exclude_observations_from_node_features:
+        if not self.exclude_observations_from_node_features and len(self.agent_groups) <= 1:
             # In multi-group mode, different groups may have different n_agents,
             # so we skip the shape validation that assumes a single n_agents.
-            if len(self.agent_groups) <= 1:
-                input_shape = None
-                for input_key, input_spec in self.input_spec.items(True, True):
-                    # Skip validation for special keys
-                    key_leaf = _unravel_key_to_tuple(input_key)[-1]
-                    if key_leaf in (self.position_key, self.velocity_key):
-                        continue
-                    if (
-                        self.agent_node_index_key is not None
-                        and key_leaf == self.agent_node_index_key
-                    ):
-                        continue
-                    # Always skip known edge index keys injected by environment
-                    if key_leaf == "agent_grid_edge_index":
-                        continue
-                    if key_leaf == "active_mask":
-                        continue
-                    if self.grid_edge_keys is not None and key_leaf in self.grid_edge_keys.values():
-                        continue
-                    if (
-                        self.node_features_keys is not None
-                        and key_leaf in self.node_features_keys.values()
-                    ):
-                        continue
+            input_shape = None
+            for input_key, input_spec in self.input_spec.items(True, True):
+                # Skip validation for special keys
+                key_leaf = _unravel_key_to_tuple(input_key)[-1]
+                if key_leaf in (self.position_key, self.velocity_key):
+                    continue
+                if (
+                    self.agent_node_index_key is not None
+                    and key_leaf == self.agent_node_index_key
+                ):
+                    continue
+                # Always skip known edge index keys injected by environment
+                if key_leaf == "agent_grid_edge_index":
+                    continue
+                if key_leaf == "active_mask":
+                    continue
+                if self.grid_edge_keys is not None and key_leaf in self.grid_edge_keys.values():
+                    continue
+                if (
+                    self.node_features_keys is not None
+                    and key_leaf in self.node_features_keys.values()
+                ):
+                    continue
 
-                    if len(input_spec.shape) == 2:
-                        if input_shape is None:
-                            input_shape = input_spec.shape[:-1]
-                        else:
-                            if input_spec.shape[:-1] != input_shape:
-                                raise ValueError(
-                                    f"GNN inputs should all have the same shape up to the last dimension, got {self.input_spec}"
-                                )
-                    else:
+                if len(input_spec.shape) == 2:
+                    if input_shape is None:
+                        input_shape = input_spec.shape[:-1]
+                    elif input_spec.shape[:-1] != input_shape:
                         raise ValueError(
-                            f"GNN input value {input_key} from {self.input_spec} has an invalid shape"
+                            f"GNN inputs should all have the same shape up to the last dimension, got {self.input_spec}"
                         )
-
-                if input_shape is not None and input_shape[-1] != self.n_agents:
+                else:
                     raise ValueError(
-                        f"The second to last input spec dimension should be the number of agents, got {self.input_spec}"
+                        f"GNN input value {input_key} from {self.input_spec} has an invalid shape"
                     )
+
+            if input_shape is not None and input_shape[-1] != self.n_agents:
+                raise ValueError(
+                    f"The second to last input spec dimension should be the number of agents, got {self.input_spec}"
+                )
         if (
             self.output_has_agent_dim
             and len(self.agent_groups) <= 1
@@ -544,6 +573,31 @@ class HeteroGNN(Model):
         obs_dict = {}  # Store observations for concatenation if needed
         active_masks = {}  # Per-group boolean active masks for edge filtering
 
+        n_batch_dims = len(tensordict.batch_size)
+
+        def _flatten_group_feature(feat: Tensor | None, group: str) -> Tensor | None:
+            """Flatten trailing entity axes to per-agent features.
+
+            Converts tensors shaped ``(..., n_agents, d1, d2, ...)`` to
+            ``(..., n_agents, d1*d2*...)`` so they can be concatenated with
+            2D per-agent features (e.g., flat observations, node attributes).
+            """
+            if feat is None:
+                return None
+            if feat.dim() == 0:
+                return feat.view(1)
+
+            am = active_masks.get(group)
+            agent_axis = am.dim() - 1 if am is not None else n_batch_dims
+
+            if feat.dim() <= agent_axis + 1:
+                # Scalar per-agent feature: (..., n_agents) -> (..., n_agents, 1)
+                return feat.unsqueeze(-1)
+            if feat.dim() == agent_axis + 2:
+                # Already (..., n_agents, feature_dim)
+                return feat
+            return feat.flatten(start_dim=agent_axis + 1)
+
         # Gather inputs for each agent group (node type)
         for group in self.agent_groups:
             # Collect active_mask for edge filtering (inactive agents excluded from message passing)
@@ -576,7 +630,10 @@ class HeteroGNN(Model):
                 ]
 
             if self.cat_observations_to_output and observations:
-                obs_dict[group] = torch.cat(observations, dim=-1)
+                flattened_obs = [
+                    _flatten_group_feature(obs, group) for obs in observations
+                ]
+                obs_dict[group] = torch.cat(flattened_obs, dim=-1)
 
             input_list = []
 
@@ -587,11 +644,13 @@ class HeteroGNN(Model):
                 full_key = self._resolve_key(all_keys, key, None)
                 if full_key:
                     explicit_feats = tensordict.get(full_key)
-                    input_list.append(explicit_feats)
+                    input_list.append(_flatten_group_feature(explicit_feats, group))
 
             # Add observations if not excluded (independent of explicit features)
             if not self.exclude_observations_from_node_features:
-                input_list.extend(observations)
+                input_list.extend(
+                    _flatten_group_feature(obs, group) for obs in observations
+                )
 
             # Retrieve position and velocity for this group
             pos = None
@@ -601,14 +660,14 @@ class HeteroGNN(Model):
                 if pos_key:
                     pos = tensordict.get(pos_key)
                     if not self.exclude_pos_from_node_features:
-                        input_list.append(pos)
+                        input_list.append(_flatten_group_feature(pos, group))
                     pos_dict[group] = pos
 
             if self.velocity_key is not None:
                 vel_key = self._resolve_key(all_keys, self.velocity_key, group)
                 if vel_key:
                     vel = tensordict.get(vel_key)
-                    input_list.append(vel)
+                    input_list.append(_flatten_group_feature(vel, group))
                     vel_dict[group] = vel
 
             if not input_list and self.use_dummy_node_features:
@@ -645,10 +704,64 @@ class HeteroGNN(Model):
         # Legacy support
         if self.edge_features_key is not None and not edge_attr_dense_dict:
             full_edge_key = self._resolve_key(all_keys, self.edge_features_key, None)
-            val = tensordict.get(full_edge_key)
-            # Default legacy name 'edge'
-            if val is not None:
-                edge_attr_dense_dict["edge"] = val
+            if full_edge_key is not None:
+                val = tensordict.get(full_edge_key)
+                # Default legacy name 'edge'
+                if val is not None:
+                    edge_attr_dense_dict["edge"] = val
+
+        def _action_spec_for_group(group: str):
+            try:
+                return self.action_spec[group, "action"]
+            except (KeyError, TypeError):
+                return None
+
+        def _edge_feature_dim_for_group(group: str) -> int:
+            action_spec = _action_spec_for_group(group)
+            if action_spec is not None and getattr(action_spec, "n", None) is not None:
+                return int(action_spec.n)
+            for rel in (f"{group}_self_interact", "interaction"):
+                dim = self.edge_features_dims.get(rel)
+                if dim is not None and dim > 0:
+                    return int(dim)
+            return 1
+
+        def _prepare_action_features(group: str, actions: Tensor) -> Tensor:
+            n_agents = x_dict[group].shape[-2]
+            action_spec = _action_spec_for_group(group)
+            n_actions = getattr(action_spec, "n", None)
+
+            if n_actions is not None:
+                if (
+                    actions.dim() >= 2
+                    and actions.shape[-2] == n_agents
+                    and actions.shape[-1] == int(n_actions)
+                    and actions.is_floating_point()
+                ):
+                    prepared = actions.float()
+                else:
+                    if actions.shape[-1] != n_agents:
+                        raise ValueError(
+                            f"Action tensor for group {group} has shape {tuple(actions.shape)}; "
+                            f"expected final dim to be n_agents={n_agents} for categorical actions."
+                        )
+                    prepared = F.one_hot(actions.long(), num_classes=int(n_actions)).float()
+            elif actions.dim() >= 2 and actions.shape[-2] == n_agents:
+                prepared = actions.reshape(*actions.shape[:-2], n_agents, -1).float()
+            elif actions.shape[-1] == n_agents:
+                prepared = actions.unsqueeze(-1).float()
+            else:
+                raise ValueError(
+                    f"Action tensor for group {group} has shape {tuple(actions.shape)}; "
+                    f"could not infer an agent axis of size {n_agents}."
+                )
+
+            if prepared.shape[-2] != n_agents:
+                raise ValueError(
+                    f"Prepared action features for group {group} have agent dim "
+                    f"{prepared.shape[-2]}, expected {n_agents}."
+                )
+            return prepared
 
         agent_grid_edge_indices = {}
         if self.agent_node_index_key is not None:
@@ -661,10 +774,11 @@ class HeteroGNN(Model):
             # Fallback: single shared agent_grid_edge_index (backward compat)
             if not agent_grid_edge_indices:
                 full_agent_idx_key = self._resolve_key(all_keys, self.agent_node_index_key, None)
-                val = tensordict.get(full_agent_idx_key)
-                if val is not None:
-                    # Assign to first (or only) agent group for backward compat
-                    agent_grid_edge_indices[self.agent_groups[0]] = val
+                if full_agent_idx_key is not None:
+                    val = tensordict.get(full_agent_idx_key)
+                    if val is not None:
+                        # Assign to first (or only) agent group for backward compat
+                        agent_grid_edge_indices[self.agent_groups[0]] = val
 
         # Ensure all inputs are on the correct device
         x_dict = {k: v.to(device) for k, v in x_dict.items()}
@@ -705,6 +819,11 @@ class HeteroGNN(Model):
         edge_index = self.edge_index
         if edge_index is not None:
             edge_index = edge_index.to(device)
+        edge_index_by_group = {
+            group: group_edge_index.to(device)
+            for group, group_edge_index in self.edge_index_by_group.items()
+            if group_edge_index is not None
+        }
 
         # Collect per-group action tensors for action-edge-features
         # (critic_use_other_actions via edge attributes).
@@ -712,15 +831,15 @@ class HeteroGNN(Model):
         action_dict = None
         if getattr(self, "_use_action_edge_features", False):
             action_dict = {}
-            act_dim = self.edge_features_dims.get("interaction", 1)
             for group in self.agent_groups:
                 act_key = self._resolve_key(all_keys, "action", group)
                 act_val = tensordict.get(act_key) if act_key is not None else None
                 if act_val is not None:
-                    action_dict[group] = act_val.to(device)
+                    action_dict[group] = _prepare_action_features(group, act_val.to(device))
                 else:
                     # Fallback: zero actions (setup/warmup calls or vmap passes
                     # where action values are not populated).
+                    act_dim = _edge_feature_dim_for_group(group)
                     action_dict[group] = torch.zeros(
                         *x_dict[group].shape[:-1], act_dim, device=device
                     )
@@ -730,6 +849,7 @@ class HeteroGNN(Model):
             pos_dict=pos_dict,
             vel_dict=vel_dict,
             edge_index=edge_index,
+            edge_index_by_group=edge_index_by_group,
             edge_attr_dense_dict=edge_attr_dense_dict,
             agent_grid_edge_indices=agent_grid_edge_indices,
             self_loops=self.self_loops,
@@ -749,10 +869,8 @@ class HeteroGNN(Model):
         for i, conv in enumerate(self.convs):
             edge_attr = None
             if self.edge_features > 0 or self.edge_features_dims:
-                try:
+                with contextlib.suppress(KeyError):
                     edge_attr = data_batch.edge_attr_dict
-                except KeyError:
-                    pass
 
             if edge_attr is not None:
                 x_dict_out = conv(x_dict_out, data_batch.edge_index_dict, edge_attr)
@@ -799,9 +917,12 @@ class HeteroGNN(Model):
                         res = res * am.float()
 
                     # Concatenate original observations if requested
-                    if self.cat_observations_to_output and not self.centralised:
-                        if group in obs_dict:
-                            res = torch.cat([res, obs_dict[group]], dim=-1)
+                    if (
+                        self.cat_observations_to_output
+                        and not self.centralised
+                        and group in obs_dict
+                    ):
+                        res = torch.cat([res, obs_dict[group]], dim=-1)
 
                     if self.centralised:
                         res = res.mean(dim=-2)
@@ -832,10 +953,12 @@ class HeteroGNN(Model):
         """Find the first nested key in *keys* ending with *key*, optionally scoped to *group*."""
         for k in keys:
             k_tuple = _unravel_key_to_tuple(k)
-            if k_tuple[-1] == key:
-                if group is None or group in k_tuple:
-                    if k_tuple[0] != "next":
-                        return k
+            if (
+                k_tuple[-1] == key
+                and (group is None or group in k_tuple)
+                and k_tuple[0] != "next"
+            ):
+                return k
         # If group is None, try looser match
         if group is None:
             for k in keys:
@@ -869,6 +992,7 @@ def _get_edge_index(topology: str, self_loops: bool, n_agents: int, device: str)
 def _tensordict_to_hetero_data(
     x_dict: dict[str, Tensor],
     edge_index: Tensor | None,
+    edge_index_by_group: dict[str, Tensor] | None,
     self_loops: bool,
     device: str,
     edge_types: list[tuple],
@@ -883,6 +1007,25 @@ def _tensordict_to_hetero_data(
     active_masks: dict[str, Tensor] | None = None,
     action_dict: dict[str, Tensor] | None = None,
 ) -> torch_geometric.data.Batch:
+    def _validate_edge_bounds(
+        edge_idx: Tensor,
+        src_size: int,
+        dst_size: int,
+        rel_name: str,
+    ) -> None:
+        if edge_idx.numel() == 0:
+            return
+        src_min = int(edge_idx[0].min().item())
+        src_max = int(edge_idx[0].max().item())
+        dst_min = int(edge_idx[1].min().item())
+        dst_max = int(edge_idx[1].max().item())
+        if src_min < 0 or src_max >= src_size or dst_min < 0 or dst_max >= dst_size:
+            raise IndexError(
+                f"Edge index for relation {rel_name} is out of bounds: "
+                f"src range [{src_min}, {src_max}] with src_size={src_size}, "
+                f"dst range [{dst_min}, {dst_max}] with dst_size={dst_size}."
+            )
+
     # Infer batch size — prefer grid adjacencies (shape ...batch, N, N, F)
     # over x_dict, because agent tensors might have extra dims (e.g. LSTM states)
     if edge_attr_dense_dict:
@@ -992,6 +1135,17 @@ def _tensordict_to_hetero_data(
 
         local_src = agent_grid_edge_index_flat[:, 0, :].reshape(-1)
         local_dst = agent_grid_edge_index_flat[:, 1, :].reshape(-1)
+        if local_src.numel() > 0:
+            src_min = int(local_src.min().item())
+            src_max = int(local_src.max().item())
+            dst_min = int(local_dst.min().item())
+            dst_max = int(local_dst.max().item())
+            if src_min < 0 or src_max >= n_mapped_agents or dst_min < 0 or dst_max >= n_grid_nodes:
+                raise IndexError(
+                    f"Agent-grid edge index for group {group} is out of bounds: "
+                    f"agent range [{src_min}, {src_max}] with n_agents={n_mapped_agents}, "
+                    f"grid range [{dst_min}, {dst_max}] with n_grid_nodes={n_grid_nodes}."
+                )
 
         global_src = local_src + b_idx * n_mapped_agents
         global_dst = local_dst + b_idx * n_grid_nodes
@@ -1007,8 +1161,13 @@ def _tensordict_to_hetero_data(
         # 1. Predefined simple topology (for agent-agent interaction edges)
         is_src_agent = src in agent_groups
         is_dst_agent = dst in agent_groups
+        simple_edge_index = (
+            edge_index_by_group.get(src)
+            if edge_index_by_group is not None and src in edge_index_by_group
+            else edge_index
+        )
         if (
-            edge_index is not None
+            simple_edge_index is not None
             and src in x_dict
             and dst in x_dict
             and src == dst
@@ -1016,9 +1175,11 @@ def _tensordict_to_hetero_data(
         ):
             x_src = x_dict[src]
             n_agents = x_src.shape[-2]
-            n_edges = edge_index.shape[1]
+            n_edges = simple_edge_index.shape[1]
             batch_repeat = torch.repeat_interleave(b, n_edges)
-            batch_edge_index = edge_index.repeat(1, batch_size) + batch_repeat * n_agents
+            batch_edge_index = (
+                simple_edge_index.repeat(1, batch_size) + batch_repeat * n_agents
+            )
             current_edge_index = batch_edge_index
             can_build_edge = True
 
@@ -1095,6 +1256,11 @@ def _tensordict_to_hetero_data(
                 can_build_edge = True
 
         if can_build_edge and current_edge_index is not None:
+            if src in x_dict and dst in x_dict:
+                src_size = batch_size * x_dict[src].shape[-2]
+                dst_size = batch_size * x_dict[dst].shape[-2]
+                _validate_edge_bounds(current_edge_index, src_size, dst_size, rel)
+
             # --- Active mask edge filtering for agent-agent edges ---
             # Remove edges where source or destination is an inactive agent.
             if active_masks is not None and is_src_agent and is_dst_agent:
@@ -1128,6 +1294,15 @@ def _tensordict_to_hetero_data(
                     # Flatten actions to (batch_size * n_src, action_dim)
                     act_dim = src_actions.shape[-1]
                     act_flat = src_actions.reshape(-1, act_dim)  # (B*n_src, d)
+                    if current_edge_index.numel() > 0:
+                        src_min = int(current_edge_index[0].min().item())
+                        src_max = int(current_edge_index[0].max().item())
+                        if src_min < 0 or src_max >= act_flat.shape[0]:
+                            raise IndexError(
+                                f"Action edge lookup for relation {rel} is out of bounds: "
+                                f"src range [{src_min}, {src_max}] with "
+                                f"action rows={act_flat.shape[0]} for group {src}."
+                            )
                     # Look up sender action for each edge
                     edge_act = act_flat[current_edge_index[0]]  # (n_edges, d)
                     # Zero self-loop actions (src == dst node index means self-loop)

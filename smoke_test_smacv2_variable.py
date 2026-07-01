@@ -17,7 +17,6 @@ from tensordict import TensorDict
 from torchrl.data import Categorical, Composite, Unbounded
 from torchrl.envs import EnvBase
 
-
 # ====================================================================
 #  Mock base environment (mimics SMACv2Env interface)
 # ====================================================================
@@ -239,7 +238,10 @@ def test_env_creation():
     """Step 2a: Verify wrapper env creation and spec structure."""
     from benchmarl.environments.smacv2_variable.common import VariableSmacv2Env
 
-    base = FakeSMACv2BaseEnv(n_units=10, obs_dim=120, n_actions=18)
+    # Entity decomposition assumes:
+    # obs_dim = move(4) + enemies(10*9) + allies((10-1)*9) + own(7) = 182
+    # for the 10v10 mock setup.
+    base = FakeSMACv2BaseEnv(n_units=10, obs_dim=182, n_actions=18)
     env = VariableSmacv2Env(
         base_env=base,
         max_per_type={"stalker": 8, "zealot": 8, "colossus": 4},
@@ -426,6 +428,95 @@ def test_action_merging():
     print("  [PASS] Action merging")
 
 
+def test_action_merging_rank_variants():
+    """Verify eval-time singleton action dims merge to flat actions."""
+    from benchmarl.environments.smacv2_variable.common import VariableSmacv2Env
+
+    types = [0, 0, 0, 1, 1, 1, 2]
+    base = FakeSMACv2BaseEnv(n_units=7, n_enemies=7, unit_types=types, obs_dim=80, n_actions=14)
+    env = VariableSmacv2Env(
+        base_env=base,
+        max_per_type={"stalker": 5, "zealot": 5, "colossus": 3},
+    )
+    base_td = env.reset()
+
+    actions_by_type = {
+        "stalker": torch.tensor([1, 2, 3, 0, 0], dtype=torch.long),
+        "zealot": torch.tensor([4, 5, 6, 0, 0], dtype=torch.long),
+        "colossus": torch.tensor([7, 0, 0], dtype=torch.long),
+    }
+    expected = torch.tensor([1, 2, 3, 4, 5, 6, 7])
+    variants = (
+        lambda x: x,
+        lambda x: x.unsqueeze(-1),
+        lambda x: x.unsqueeze(0),
+        lambda x: x.unsqueeze(0).unsqueeze(-1),
+    )
+
+    for variant in variants:
+        td = base_td.clone()
+        for tn, actions in actions_by_type.items():
+            td.set((tn, "action"), variant(actions))
+        flat = env._merge_actions(td)
+        assert flat.shape == (7,)
+        assert (flat == expected).all(), f"Expected {expected}, got {flat}"
+
+    print("  [PASS] action merging rank variants")
+
+
+def test_action_merging_rejects_batched_actions():
+    """Verify true multi-env action batches fail with a clear error."""
+    from benchmarl.environments.smacv2_variable.common import VariableSmacv2Env
+
+    types = [0, 0, 0, 1, 1, 1, 2]
+    base = FakeSMACv2BaseEnv(n_units=7, n_enemies=7, unit_types=types, obs_dim=80, n_actions=14)
+    env = VariableSmacv2Env(
+        base_env=base,
+        max_per_type={"stalker": 5, "zealot": 5, "colossus": 3},
+    )
+    td = env.reset()
+    td.set(("stalker", "action"), torch.zeros(2, 5, dtype=torch.long))
+    td.set(("zealot", "action"), torch.zeros(5, dtype=torch.long))
+    td.set(("colossus", "action"), torch.zeros(3, dtype=torch.long))
+
+    try:
+        env._merge_actions(td)
+    except RuntimeError as err:
+        assert "Unsupported batched action shape" in str(err)
+    else:
+        raise AssertionError("Expected _merge_actions to reject non-singleton batch dims")
+
+    print("  [PASS] action merging rejects batched actions")
+
+
+def test_reward_shape_guard():
+    """Verify supported reward layouts are explicit and unsupported ranks fail."""
+    from benchmarl.environments.smacv2_variable.common import VariableSmacv2Env
+
+    base = FakeSMACv2BaseEnv(n_units=7, n_enemies=7, obs_dim=80, n_actions=14)
+    env = VariableSmacv2Env(
+        base_env=base,
+        max_per_type={"stalker": 5, "zealot": 5, "colossus": 3},
+    )
+
+    scalar = env._team_reward_from_base(torch.tensor(0.5))
+    singleton = env._team_reward_from_base(torch.tensor([0.25]))
+    per_agent = env._team_reward_from_base(torch.full((7, 1), 0.125))
+    assert scalar.shape == torch.Size([])
+    assert torch.isclose(scalar, torch.tensor(0.5))
+    assert torch.isclose(singleton, torch.tensor(0.25))
+    assert torch.isclose(per_agent, torch.tensor(0.125))
+
+    try:
+        env._team_reward_from_base(torch.zeros(2, 7))
+    except RuntimeError as err:
+        assert "Unsupported SMACv2 reward shape" in str(err)
+    else:
+        raise AssertionError("Expected reward shape guard to reject batched rewards")
+
+    print("  [PASS] reward shape guard")
+
+
 def test_task_class_specs():
     """Step 2f: Verify TaskClass observation/action/state/info specs."""
     from benchmarl.environments.smacv2_variable.common import (
@@ -433,7 +524,9 @@ def test_task_class_specs():
         VariableSmacv2Env,
     )
 
-    base = FakeSMACv2BaseEnv(n_units=10, obs_dim=120, n_actions=18)
+    # Entity decomposition expects this flat observation layout:
+    # 4 (move) + 10*9 (enemies) + 9*9 (allies) + 7 (self) = 182
+    base = FakeSMACv2BaseEnv(n_units=10, obs_dim=182, n_actions=18)
     env = VariableSmacv2Env(
         base_env=base,
         max_per_type={"stalker": 8, "zealot": 8, "colossus": 4},
@@ -455,9 +548,9 @@ def test_task_class_specs():
     # action_mask removed
     assert ("stalker", "action_mask") not in obs_spec.keys(True, True)
     # state removed
-    assert "state" not in obs_spec.keys()
+    assert "state" not in obs_spec
     # info removed
-    assert "info" not in obs_spec.keys()
+    assert "info" not in obs_spec
 
     # action_mask_spec
     am_spec = tc.action_mask_spec(env)
@@ -466,7 +559,7 @@ def test_task_class_specs():
     # state_spec
     state_spec = tc.state_spec(env)
     assert state_spec is not None
-    assert "state" in state_spec.keys()
+    assert "state" in state_spec
 
     # info_spec
     info_spec = tc.info_spec(env)
@@ -510,21 +603,24 @@ def test_gnn_forward_pass():
     """
     from benchmarl.environments.smacv2_variable.common import VariableSmacv2Env
 
-    base = FakeSMACv2BaseEnv(n_units=10, obs_dim=120, n_actions=18)
+    # Entity decomposition expects this flat observation layout:
+    # 4 (move) + 10*9 (enemies) + 9*9 (allies) + 7 (self) = 182
+    base = FakeSMACv2BaseEnv(n_units=10, obs_dim=182, n_actions=18)
     env = VariableSmacv2Env(
         base_env=base,
         max_per_type={"stalker": 8, "zealot": 8, "colossus": 4},
+        entity_obs=True,
     )
 
     td = env.reset()
 
     # Import GNN components
     import torch_geometric.nn as tgnn
-    from benchmarl.models.heterognn import HeteroGNN, HeteroGnnConfig
+    from benchmarl.models.heterognn import HeteroGNN
 
     group_names = list(env.max_per_type.keys())
     hidden_dim = 64
-    obs_dim = 120
+    obs_dim = 182
 
     # Build edge types: intra-type + inter-type (no grid)
     edge_types = []
@@ -545,36 +641,41 @@ def test_gnn_forward_pass():
             if g1 != g2:
                 edge_features_dims[f"{g1}_interact_{g2}"] = 0
 
-    # Build input/output specs for the GNN (only stalker group for this model instance)
-    # Mimic HGTeam's _obs_spec_for_model: group sub-spec with shape=(n_agents,)
+    # Build input/output specs for all groups (matches multi-group HGTeam use).
     primary_group = "stalker"
     mc = env.max_per_type[primary_group]
-    input_spec = Composite(
-        {
-            primary_group: Composite(
-                {"observation": Unbounded(shape=(mc, obs_dim))},
-                shape=(mc,),
-            ),
-        }
-    )
-    output_spec = Composite(
-        {
-            primary_group: Composite(
-                {"embedding": Unbounded(shape=(mc, hidden_dim))},
-                shape=(mc,),
-            ),
-        }
-    )
-
-    # Dummy action spec (required by Model base class)
-    action_spec = Composite(
-        {
-            primary_group: Composite(
-                {"action": Categorical(n=18, shape=(mc,))},
-                shape=(mc,),
-            ),
-        }
-    )
+    input_spec = Composite()
+    output_spec = Composite()
+    action_spec = Composite()
+    for g in group_names:
+        g_td = td.get(g)
+        n_g = env.max_per_type[g]
+        input_spec[g] = Composite(
+            {
+                "observation": Unbounded(shape=(n_g, obs_dim)),
+                "move_feats": Unbounded(shape=g_td.get("move_feats").shape),
+                "entity_enemy": Unbounded(shape=g_td.get("entity_enemy").shape),
+                "entity_self": Unbounded(shape=g_td.get("entity_self").shape),
+                "entity_stalker_ally": Unbounded(
+                    shape=g_td.get("entity_stalker_ally").shape
+                ),
+                "entity_zealot_ally": Unbounded(
+                    shape=g_td.get("entity_zealot_ally").shape
+                ),
+                "entity_colossus_ally": Unbounded(
+                    shape=g_td.get("entity_colossus_ally").shape
+                ),
+            },
+            shape=(n_g,),
+        )
+        output_spec[g] = Composite(
+            {"embedding": Unbounded(shape=(n_g, hidden_dim))},
+            shape=(n_g,),
+        )
+        action_spec[g] = Composite(
+            {"action": Categorical(n=18, shape=(n_g,))},
+            shape=(n_g,),
+        )
 
     # Create the GNN model with all required Model base class args
     gnn = HeteroGNN(
@@ -617,31 +718,179 @@ def test_gnn_forward_pass():
 
     # Build input tensordict for the GNN
     gnn_input = TensorDict({}, batch_size=torch.Size([]))
+    entity_keys = (
+        "move_feats",
+        "entity_enemy",
+        "entity_self",
+        "entity_stalker_ally",
+        "entity_zealot_ally",
+        "entity_colossus_ally",
+    )
     for tn in group_names:
         gnn_input.set((tn, "observation"), td.get((tn, "observation")))
+        for k in entity_keys:
+            gnn_input.set((tn, k), td.get((tn, k)))
         gnn_input.set((tn, "active_mask"), td.get((tn, "active_mask")))
 
     # Forward pass
     gnn_output = gnn(gnn_input)
 
-    # Check output: look for stalker output
-    out_keys = list(gnn_output.keys(True, True))
-    stalker_out = None
-    for key in out_keys:
-        val = gnn_output.get(key)
-        if isinstance(val, torch.Tensor) and val.shape[0] == mc:
-            stalker_out = val
-            break
-
-    assert stalker_out is not None, (
-        f"No stalker output found. Keys: {out_keys}"
-    )
+    # Check output for the primary group embedding.
+    stalker_out = gnn_output.get(("stalker", "embedding"))
     assert stalker_out.shape[0] == mc, f"Expected {mc} stalker outputs, got {stalker_out.shape}"
     assert stalker_out.ndim == 2, f"Expected 2D output, got shape {stalker_out.shape}"
     assert stalker_out.shape[-1] > 0, "Output feature dim must be > 0"
     assert torch.isfinite(stalker_out).all(), "GNN output contains non-finite values"
 
     print("  [PASS] GNN forward pass with SMACv2 data")
+
+
+def test_discrete_action_edge_features():
+    """Verify SMACv2 discrete actions are safe as critic edge features."""
+    import torch_geometric.nn as tgnn
+    from benchmarl.environments.smacv2_variable.common import VariableSmacv2Env
+    from benchmarl.models.heterognn import HeteroGNN
+
+    def _run(device):
+        base = FakeSMACv2BaseEnv(
+            n_units=10,
+            obs_dim=182,
+            n_actions=18,
+            device="cpu",
+        )
+        env = VariableSmacv2Env(
+            base_env=base,
+            max_per_type={"stalker": 8, "zealot": 8, "colossus": 4},
+            entity_obs=True,
+        )
+
+        td = env.reset()
+        td = _random_actions(td, env.type_names)
+        group_names = list(env.max_per_type.keys())
+        hidden_dim = 32
+        n_actions = 18
+
+        edge_types = []
+        edge_features_dims = {}
+        for src in group_names:
+            edge_types.append((src, f"{src}_self_interact", src))
+            edge_features_dims[f"{src}_self_interact"] = n_actions
+            for dst in group_names:
+                if src != dst:
+                    rel = f"{src}_interact_{dst}"
+                    edge_types.append((src, rel, dst))
+                    edge_features_dims[rel] = n_actions
+        edge_features_dims["interaction"] = n_actions
+
+        input_spec = Composite(device=device)
+        output_spec = Composite(device=device)
+        action_spec = Composite(device=device)
+        for g in group_names:
+            g_td = td.get(g)
+            n_g = env.max_per_type[g]
+            input_spec[g] = Composite(
+                {
+                    "observation": Unbounded(shape=(182,), device=device),
+                    "active_mask": Unbounded(shape=(), dtype=torch.bool, device=device),
+                    "move_feats": Unbounded(
+                        shape=g_td.get("move_feats").shape[1:], device=device
+                    ),
+                    "entity_enemy": Unbounded(
+                        shape=g_td.get("entity_enemy").shape[1:], device=device
+                    ),
+                    "entity_self": Unbounded(
+                        shape=g_td.get("entity_self").shape[1:], device=device
+                    ),
+                    "entity_stalker_ally": Unbounded(
+                        shape=g_td.get("entity_stalker_ally").shape[1:], device=device
+                    ),
+                    "entity_zealot_ally": Unbounded(
+                        shape=g_td.get("entity_zealot_ally").shape[1:], device=device
+                    ),
+                    "entity_colossus_ally": Unbounded(
+                        shape=g_td.get("entity_colossus_ally").shape[1:], device=device
+                    ),
+                },
+                device=device,
+            ).expand(n_g)
+            output_spec[g] = Composite(
+                {"state_value": Unbounded(shape=(1,), device=device)},
+                device=device,
+            ).expand(n_g)
+            action_spec[g] = Composite(
+                {"action": Categorical(n=n_actions, shape=(), device=device)},
+                device=device,
+            ).expand(n_g)
+
+        gnn = HeteroGNN(
+            topology="adjacency",
+            self_loops=True,
+            gnn_class=tgnn.TransformerConv,
+            gnn_kwargs={"heads": 2, "concat": False, "beta": True},
+            edge_features_dims=edge_features_dims,
+            node_features_keys={},
+            node_features_dims={},
+            agent_node_index_key=None,
+            agent_groups=group_names,
+            node_types=group_names,
+            edge_types=edge_types,
+            exclude_observations_from_node_features=False,
+            cat_observations_to_output=False,
+            num_layers=2,
+            prune_non_agent_final_layer=True,
+            gnn_hidden_dim=hidden_dim,
+            pos_features=0,
+            vel_features=0,
+            edge_radius=0,
+            position_key=None,
+            exclude_pos_from_node_features=None,
+            velocity_key=None,
+            edge_features_key=None,
+            grid_edge_keys={},
+            input_spec=input_spec,
+            output_spec=output_spec,
+            agent_group="stalker",
+            n_agents=env.max_per_type["stalker"],
+            device=device,
+            input_has_agent_dim=True,
+            centralised=False,
+            share_params=True,
+            action_spec=action_spec,
+            model_index=0,
+            is_critic=True,
+        )
+        gnn._use_action_edge_features = True
+
+        gnn_input = TensorDict({}, batch_size=torch.Size([]), device=device)
+        entity_keys = (
+            "observation",
+            "active_mask",
+            "move_feats",
+            "entity_enemy",
+            "entity_self",
+            "entity_stalker_ally",
+            "entity_zealot_ally",
+            "entity_colossus_ally",
+            "action",
+        )
+        for tn in group_names:
+            for k in entity_keys:
+                gnn_input.set((tn, k), td.get((tn, k)).to(device))
+
+        out = gnn(gnn_input)
+        for tn in group_names:
+            val = out.get((tn, "state_value"))
+            assert val.shape == (env.max_per_type[tn], 1), (
+                f"{tn}: expected {(env.max_per_type[tn], 1)}, got {val.shape}"
+            )
+            assert torch.isfinite(val).all(), f"{tn}: non-finite output"
+
+    _run("cpu")
+    if torch.cuda.is_available():
+        _run("cuda")
+        print("  [PASS] discrete action edge features (CPU + CUDA)")
+    else:
+        print("  [PASS] discrete action edge features (CPU; CUDA unavailable)")
 
 
 def test_log_info():
@@ -673,6 +922,43 @@ def test_log_info():
     print("  [PASS] log_info metrics")
 
 
+def test_render_capability_and_passthrough():
+    """Verify has_render reports correctly and wrapper forwards render calls."""
+    from benchmarl.environments.smacv2_variable.common import (
+        Smacv2VariableClass,
+        VariableSmacv2Env,
+    )
+
+    class RenderableFakeSMACv2BaseEnv(FakeSMACv2BaseEnv):
+        def render(self, mode="rgb_array"):
+            assert mode == "rgb_array"
+            return torch.zeros(8, 8, 3, dtype=torch.uint8, device=self.device)
+
+    task_class = Smacv2VariableClass.__new__(Smacv2VariableClass)
+
+    env_yes = VariableSmacv2Env(
+        base_env=RenderableFakeSMACv2BaseEnv(n_units=10, obs_dim=120, n_actions=18),
+        max_per_type={"stalker": 8, "zealot": 8, "colossus": 4},
+    )
+    assert task_class.has_render(env_yes) is True
+    frame = env_yes.render(mode="rgb_array")
+    assert frame.shape == (8, 8, 3)
+
+    env_no = VariableSmacv2Env(
+        base_env=FakeSMACv2BaseEnv(n_units=10, obs_dim=120, n_actions=18),
+        max_per_type={"stalker": 8, "zealot": 8, "colossus": 4},
+    )
+    assert task_class.has_render(env_no) is False
+    try:
+        env_no.render(mode="rgb_array")
+    except AttributeError:
+        pass
+    else:
+        raise AssertionError("Expected env without base render() to raise AttributeError")
+
+    print("  [PASS] render capability + passthrough")
+
+
 # ====================================================================
 #  Main
 # ====================================================================
@@ -690,10 +976,15 @@ def main():
         ("Step 2c: Active mask counts", test_active_mask_counts),
         ("Step 2d: Step cycle", test_step_cycle),
         ("Step 2e: Action merging", test_action_merging),
+        ("Step 2e.1: Action merging rank variants", test_action_merging_rank_variants),
+        ("Step 2e.2: Action merging rejects batches", test_action_merging_rejects_batched_actions),
+        ("Step 2e.3: Reward shape guard", test_reward_shape_guard),
         ("Step 2f: TaskClass specs", test_task_class_specs),
         ("Step 2g: 20v20 scenario", test_20v20_scenario),
         ("Step 2h: log_info metrics", test_log_info),
+        ("Step 2i: render capability + passthrough", test_render_capability_and_passthrough),
         ("Step 3: GNN forward pass", test_gnn_forward_pass),
+        ("Step 4: discrete action-edge features", test_discrete_action_edge_features),
     ]
 
     for name, test_fn in tests:
@@ -710,8 +1001,8 @@ def main():
     print(f"Results: {passed} passed, {failed} failed out of {len(tests)}")
 
     if errors:
-        print(f"\nFailures:")
-        for name, e, tb in errors:
+        print("\nFailures:")
+        for name, _e, tb in errors:
             print(f"\n--- {name} ---")
             print(tb)
 

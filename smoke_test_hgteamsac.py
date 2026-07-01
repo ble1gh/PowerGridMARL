@@ -1,3 +1,4 @@
+import argparse
 import os
 import sys
 
@@ -8,22 +9,18 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(os.path.join(ROOT, "BenchMARL"))
 sys.path.append(os.path.join(ROOT, "PowerGridworld"))
 
-from benchmarl.algorithms import HGTeamSACConfig
-from benchmarl.environments.PowerGridworldVariable.common import PowerGridworldVariableTask
-from benchmarl.experiment import Experiment, ExperimentConfig
-from benchmarl.models import HeteroGnnConfig, TransformerConfig
+from benchmarl.algorithms import HGTeamSACConfig  # noqa: E402
+from benchmarl.environments.PowerGridworldVariable.common import (  # noqa: E402
+    PowerGridworldVariableTask,
+)
+from benchmarl.experiment import Experiment, ExperimentConfig  # noqa: E402
+from benchmarl.models import EdgeWeightedHGTConfig, HeteroGnnConfig, TransformerConfig  # noqa: E402
 
 
-def build_experiment() -> Experiment:
-    critic_model_config = HeteroGnnConfig(
+def build_critic_model_config(critic_model: str):
+    common_kwargs = dict(
         topology="adjacency",
         self_loops=True,
-        gnn_class=tgnn.TransformerConv,
-        gnn_kwargs={
-            "heads": 1,
-            "concat": False,
-            "beta": True,
-        },
         grid_edge_keys={
             "line_adjacency": "line_adjacency",
             "transformer_adjacency": "transformer_adjacency",
@@ -55,6 +52,32 @@ def build_experiment() -> Experiment:
         vel_features=0,
         edge_radius=0,
     )
+    if critic_model == "heterognn":
+        return HeteroGnnConfig(
+            gnn_class=tgnn.TransformerConv,
+            gnn_kwargs={
+                "heads": 1,
+                "concat": False,
+                "beta": True,
+            },
+            **common_kwargs,
+        )
+    if critic_model == "edgeweightedhgt":
+        return EdgeWeightedHGTConfig(
+            heads=2,
+            low_rank=4,
+            edge_gate_hidden_dim=16,
+            edge_gate_num_layers=2,
+            zero_init_edge_gates=True,
+            **common_kwargs,
+        )
+    raise ValueError(f"Unknown critic_model={critic_model}")
+
+
+def build_experiment(
+    encoder_update_mode: str = "coop_encoder", critic_model: str = "heterognn"
+) -> Experiment:
+    critic_model_config = build_critic_model_config(critic_model)
 
     actor_model_config = TransformerConfig(
         d_model=64,
@@ -95,6 +118,7 @@ def build_experiment() -> Experiment:
     algorithm_config.lr_actor = 3e-4
     algorithm_config.lr_encoder = 1e-4
     algorithm_config.lr_critic = 3e-4
+    algorithm_config.encoder_update_mode = encoder_update_mode
 
     task = PowerGridworldVariableTask.EVOVERNIGHT13NODE_VPP.get_from_yaml()
     task.config["reward_scale"] = 100
@@ -134,10 +158,34 @@ def build_experiment() -> Experiment:
     )
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run a low-frame HGTeamSAC smoke test.")
+    parser.add_argument(
+        "--encoder-update-mode",
+        choices=("accumulated", "separate_forward", "coop_encoder"),
+        default="coop_encoder",
+        help="HGTeamSAC encoder update schedule to validate.",
+    )
+    parser.add_argument(
+        "--critic-model",
+        choices=("heterognn", "edgeweightedhgt"),
+        default="heterognn",
+        help="Critic graph model to smoke-test; defaults preserve existing behavior.",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
+    args = parse_args()
     print("Building HGTeamSAC smoke-test experiment")
-    experiment = build_experiment()
-    print("Starting smoke test: 16 frames, CPU-only, no logging")
+    experiment = build_experiment(
+        encoder_update_mode=args.encoder_update_mode,
+        critic_model=args.critic_model,
+    )
+    print(
+        "Starting smoke test: 16 frames, CPU-only, no logging, "
+        f"encoder_update_mode={args.encoder_update_mode}, critic_model={args.critic_model}"
+    )
     experiment.run()
     print("Smoke test completed")
 

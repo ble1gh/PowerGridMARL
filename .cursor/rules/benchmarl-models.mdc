@@ -1,0 +1,13 @@
+---
+description: BenchMARL model backbones — GNN, transformer, ego-entity
+globs: BenchMARL/benchmarl/models/**/*.py
+alwaysApply: false
+---
+
+# BenchMARL — models
+
+- **Here**: [`heterognn.py`](../../BenchMARL/benchmarl/models/heterognn.py) (`active_mask` → **edge filter**, omitted from feature concat), [`edgeweightedHGT.py`](../../BenchMARL/benchmarl/models/edgeweightedHGT.py) (opt-in low-rank edge-conditioned HGT), [`transformer.py`](../../BenchMARL/benchmarl/models/transformer.py), [`ego_entity_gnn.py`](../../BenchMARL/benchmarl/models/ego_entity_gnn.py) when used.
+- **Elsewhere**: [`hgteam_modules.py`](../../BenchMARL/benchmarl/algorithms/hgteam_modules.py) is under **`algorithms/`** (algorithms-scoped rule).
+- **Specs**: Match env `CompositeSpec`; **`active_mask`** is metadata ([`docs/agent_quickstart.md`](../../docs/agent_quickstart.md)).
+- **Algorithms**: Coordinate logits / shapes with `benchmarl/algorithms/*`.
+- **Check**: [`test_shared_gnn.py`](../../test_shared_gnn.py) or short smoke. For `EdgeWeightedHGT`, run [`smoke_test_edgeweightedhgt.py`](../../smoke_test_edgeweightedhgt.py).

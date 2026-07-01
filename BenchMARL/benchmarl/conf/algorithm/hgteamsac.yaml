@@ -16,6 +16,7 @@ critic_embed_dim: 32
 gnn_mode: "learned_query"
 actor_graph_mode: "shared"
 ego_gnn_topology: "star"
+heterognn_type: "heterognn"
 z_dim: 32
 hypernet_actor_feature_dim: 64
 stochastic_z: True
@@ -62,3 +63,5 @@ critic_use_mu: True            # Feed mu to Q-network for direct gradient path
 lr_actor: 0.0003       # Transformer parameters
 lr_encoder: 0.0001     # GNN (encoder) parameters
 lr_critic: 0.0003      # Q-network parameters
+encoder_update_mode: "coop_encoder"  # Options: "accumulated", "separate_forward", "coop_encoder"
+fixed_order: False                   # Random group ordering each epoch (True = fixed order)

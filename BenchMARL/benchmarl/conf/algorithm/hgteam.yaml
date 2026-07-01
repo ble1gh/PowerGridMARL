@@ -13,6 +13,8 @@ scale_mapping: "biased_softplus_1.0"
 scale_lb: 0.0001
 use_tanh_normal: True
 minibatch_advantage: True
+encoder_update_mode: "coop_encoder"  # Options: "accumulated", "separate_forward", "coop_encoder"
+fixed_order: False                   # Random group ordering each epoch (True = fixed order)
 use_beta: False
 beta_min_param: 1.
 
@@ -23,6 +25,7 @@ critic_embed_dim: 32
 gnn_mode: "learned_query"  # Options: "none", "concat", "hypernetwork", "learned_query"
 actor_graph_mode: "shared"  # Options: "shared" (PowerGrid-style), "ego_entity" (per-agent ego graphs)
 ego_gnn_topology: "star"    # Options: "star" (self-node hub), "full" (all-to-all entity edges)
+heterognn_type: "heterognn" # Options: "heterognn", "edgeweightedhgt", "edgebiasedhgt"
 z_dim: 32
 hypernet_actor_feature_dim: 64
 stochastic_z: True
@@ -52,3 +55,19 @@ stochastic_z_query: False # Whether z_query uses reparameterized stochastic samp
 use_vib: False
 vib_beta: 0.001           # Maximum KL coefficient (reached after warm-up)
 vib_warmup_frames: 500000 # Linearly anneal beta from 0 to vib_beta over this many frames
+
+# Advantage normalization (slow-EMA reference scale)
+# When True, advantages are normalized against a per-group slow-EMA reference
+# std (running-mean seeded for the first adv_norm_ema_warmup_iters updates,
+# then EMA with decay adv_norm_ema_decay) instead of per-batch unit-variance
+# normalization, so the effective PPO step decays as the advantage signal
+# vanishes. False = legacy per-slot per-batch (S8a) normalization.
+adv_norm_ema: True
+adv_norm_ema_decay: 0.999
+adv_norm_ema_warmup_iters: 10
+
+# Encoder freeze schedule (T3 frozen-encoder ablation).
+# null = never freeze (default). 0 = freeze the shared actor GNN from init
+# (fixed random feature map; heads/critics still train). N = train the encoder
+# until total_frames >= N, then freeze.
+encoder_freeze_after_frames: null

@@ -16,7 +16,7 @@ from benchmarl.environments.PowerGridworldVariable.common import PowerGridworldV
 from benchmarl.environments.smacv2_variable.common import Smacv2VariableTask
 from benchmarl.experiment import Experiment, ExperimentConfig
 from benchmarl.experiment.embedding_viz_callback import EmbeddingVizCallback
-from benchmarl.models import HeteroGnnConfig, MlpConfig
+from benchmarl.models import EdgeBiasedHGTConfig, EdgeWeightedHGTConfig, HeteroGnnConfig, MlpConfig
 
 
 def parse_args():
@@ -56,6 +56,12 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--evaluation-interval", type=int, default=12288)
     parser.add_argument("--evaluation-episodes", type=int, default=5)
+    parser.add_argument(
+        "--render",
+        type=lambda x: x.lower() != "false",
+        default=None,
+        help="Override evaluation rendering (true/false). Default: experiment yaml value.",
+    )
     parser.add_argument("--n-envs-per-worker", type=int, default=32)
     parser.add_argument("--frames-per-batch", type=int, default=12288)
     parser.add_argument("--minibatch-size", type=int, default=256)
@@ -113,6 +119,34 @@ def parse_args():
     parser.add_argument("--vib-beta", type=float, default=0.01)
     parser.add_argument("--vib-warmup-frames", type=int, default=500_000)
 
+    # --- Advantage normalization (slow-EMA reference scale) ---
+    parser.add_argument(
+        "--adv-norm-ema",
+        type=lambda x: x.lower() != "false",
+        default=None,
+        help="Normalize advantages against a per-group slow-EMA reference scale "
+        "(overrides yaml). False = legacy per-slot per-batch (S8a) normalization.",
+    )
+    parser.add_argument(
+        "--adv-norm-ema-decay",
+        type=float,
+        default=None,
+        help="EMA decay for the advantage-scale reference (higher = slower; overrides yaml)",
+    )
+    parser.add_argument(
+        "--adv-norm-ema-warmup-iters",
+        type=int,
+        default=None,
+        help="Running-mean seeding iterations before the slow EMA takes over (overrides yaml)",
+    )
+    parser.add_argument(
+        "--encoder-freeze-after-frames",
+        type=int,
+        default=None,
+        help="Freeze the shared actor GNN once total_frames >= this value (overrides yaml). "
+        "0 = freeze from init (T3 frozen-encoder ablation); omit/null = never freeze.",
+    )
+
     # --- Algorithm selection ---
     parser.add_argument(
         "--algorithm",
@@ -152,6 +186,17 @@ def parse_args():
         type=lambda x: x.lower() != "false",
         default=None,
         help="Condition critic on other agents' actions via GNN edge features (overrides yaml)",
+    )
+    parser.add_argument(
+        "--heterognn-type",
+        type=str,
+        default="heterognn",
+        choices=["heterognn", "edgeweightedhgt", "edgebiasedhgt"],
+        help=(
+            "Shared hetero-graph backbone: "
+            "'heterognn' (TransformerConv), 'edgeweightedhgt' (low-rank HGT), "
+            "or 'edgebiasedhgt' (additive-bias HGT)"
+        ),
     )
 
     # --- HAPPO-specific ---
@@ -212,15 +257,9 @@ def main():
     # dimensions. The "agents" placeholder in node_features_keys/dims is
     # automatically replaced with per-type keys (e.g., EV, PV, Storage) at
     # runtime by HGTeam._get_shared_critic().
-    critic_gnn_config = HeteroGnnConfig(
+    _shared_critic_gnn_kwargs = dict(
         topology="adjacency",
         self_loops=True,
-        gnn_class=tgnn.TransformerConv,
-        gnn_kwargs={
-            "heads": 2,
-            "concat": False,
-            "beta": True,
-        },
         grid_edge_keys={
             "line_adjacency": "line_adjacency",
             "transformer_adjacency": "transformer_adjacency",
@@ -252,6 +291,31 @@ def main():
         vel_features=0,
         edge_radius=0,
     )
+    if args.heterognn_type == "heterognn":
+        critic_gnn_config = HeteroGnnConfig(
+            gnn_class=tgnn.TransformerConv,
+            gnn_kwargs={
+                "heads": 2,
+                "concat": False,
+                "beta": True,
+            },
+            **_shared_critic_gnn_kwargs,
+        )
+    elif args.heterognn_type == "edgeweightedhgt":
+        critic_gnn_config = EdgeWeightedHGTConfig(
+            heads=2,
+            low_rank=4,
+            edge_gate_hidden_dim=16,
+            edge_gate_num_layers=2,
+            zero_init_edge_gates=True,
+            **_shared_critic_gnn_kwargs,
+        )
+    else:
+        critic_gnn_config = EdgeBiasedHGTConfig(
+            heads=2,
+            zero_init_edge_projections=True,
+            **_shared_critic_gnn_kwargs,
+        )
 
     # critic_model_config = critic_gnn_config
 
@@ -302,6 +366,7 @@ def main():
         algorithm_config.critic_use_other_actions = args.critic_use_other_actions
     if args.lmbda is not None:
         algorithm_config.lmbda = args.lmbda
+    algorithm_config.heterognn_type = args.heterognn_type
     algorithm_config.gnn_mode = args.gnn_mode
     algorithm_config.actor_graph_mode = args.actor_graph_mode
     algorithm_config.ego_gnn_topology = args.ego_gnn_topology
@@ -319,6 +384,20 @@ def main():
     algorithm_config.use_vib = args.use_vib
     algorithm_config.vib_beta = args.vib_beta
     algorithm_config.vib_warmup_frames = args.vib_warmup_frames
+
+    # Advantage normalization (slow-EMA reference scale): override yaml if set.
+    # SAC has no advantage normalization, so only apply to PPO/HAPPO configs.
+    if args.algorithm != "sac":
+        if args.adv_norm_ema is not None:
+            algorithm_config.adv_norm_ema = args.adv_norm_ema
+        if args.adv_norm_ema_decay is not None:
+            algorithm_config.adv_norm_ema_decay = args.adv_norm_ema_decay
+        if args.adv_norm_ema_warmup_iters is not None:
+            algorithm_config.adv_norm_ema_warmup_iters = args.adv_norm_ema_warmup_iters
+        # encoder_freeze_after_frames: 0 is meaningful (freeze from init), so
+        # only the explicit None ("not passed") falls back to the yaml default.
+        if args.encoder_freeze_after_frames is not None:
+            algorithm_config.encoder_freeze_after_frames = args.encoder_freeze_after_frames
 
     # 3. Task
     _TASK_MAP = {
@@ -347,6 +426,8 @@ def main():
     experiment_config.evaluation_episodes = args.evaluation_episodes
     experiment_config.max_n_frames = args.max_n_frames
     experiment_config.evaluation_interval = args.evaluation_interval
+    if args.render is not None:
+        experiment_config.render = args.render
     experiment_config.project_name = args.project_name
     experiment_config.loggers = ["wandb"]
     experiment_config.save_folder = str(results_dir)

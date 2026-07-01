@@ -1,0 +1,14 @@
+---
+description: BenchMARL TorchRL wrappers for PowerGridworld Variable / Graph
+globs: BenchMARL/benchmarl/environments/PowerGridworld*/**/*.py
+alwaysApply: false
+---
+
+# BenchMARL — PowerGridworld envs
+
+- **Role**: `gridworld.MultiAgentEnv` → TorchRL: `Task` / `TaskClass` from [`environments/common.py`](../../BenchMARL/benchmarl/environments/common.py), `CompositeSpec`, transforms, padding / **`active_mask`**.
+- **Variable**: [`PowerGridworldVariable/common.py`](../../BenchMARL/benchmarl/environments/PowerGridworldVariable/common.py) — `VariableAgentMultiAgentEnv`; **`active_mask`** on specs for masks / GNN edges only (not a stacked observation channel).
+- **Graph**: [`PowerGridworldGraph/common.py`](../../BenchMARL/benchmarl/environments/PowerGridworldGraph/common.py) — `PaddedMultiAgentEnv`, `_init_graph_structure`.
+- **Scenarios**: e.g. [`evovernight13node_vpp.py`](../../BenchMARL/benchmarl/environments/PowerGridworldVariable/evovernight13node_vpp.py) + siblings.
+- **Invariants**: Reward / adv / mask edits → read [`docs/agent_quickstart.md`](../../docs/agent_quickstart.md) + [`paper/outline.md`](../../paper/outline.md) (D2, D6–D8, S8a).
+- **Check**: env smoke or `run_*` with small `--max-n-frames`.

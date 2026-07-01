@@ -1,0 +1,21 @@
+# Large or generated artifacts — keep Cursor index / search focused
+# (Patterns are gitignore-style; repo root relative.)
+
+results/
+StarCraftII/
+
+# Experiment tracking and caches
+**/wandb/
+__pycache__/
+**/__pycache__/
+.ruff_cache/
+.pytest_cache/
+**/.pytest_cache/
+
+# Timestamped / hashed local training run directories at repo root
+# hgteamhappo_*/
+
+
+# Model checkpoints and large binaries
+**/checkpoints/
+*.ckpt

@@ -15,10 +15,11 @@
 #   gpu:h200_3g.71gb  — 71 GB (grn026, 8 slices)
 #   gpu:h200          — 141 GB full card (grn027-032, 8 each) — long queue
 #   gpu:1             — any available GPU (risky: may get 18 GB slice)
-#SBATCH --gres=gpu:1
+# #SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:h200_3g.71gb:1
 
 #SBATCH -o /uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/results/slurm/SMACv2_HGTeamHA-%j.out-%N
-#SBATCH -e /uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/results/slurm/SMACv2_HGTeamHA-%j.err-%N
+#SBATCH -e /uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/results/slurm/SMACv2_HGTeamHA-%j.out-%N
 
 
 PROJECT_ROOT=/uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL
@@ -138,7 +139,7 @@ python run_hgteam_mlp.py \
     --task protoss_10_vs_10 \
     --seed 20 \
     --project-name "SMACv2Variable_HGTeamHA" \
-    --wandb-name "HGTeamHA_SMACv2_10v10_$(date +%Y%m%d)_${SLURM_JOB_ID}_coop_encoder_star_minib2" \
+    --wandb-name "HGTeamHA_SMACv2_10v10_$(date +%Y%m%d)_${SLURM_JOB_ID}_coop_encoder_star_vib1e-5_warmup2M_edgebiasedhgt" \
     --results-dir "$RESULTS_DIR" \
     --max-n-frames 10000000 \
     --lr 5e-4 \
@@ -170,7 +171,10 @@ python run_hgteam_mlp.py \
     --lmbda 0.95 \
     --critic-use-other-actions true \
     --encoder-update-mode coop_encoder \
-    --use-vib false \
+    --use-vib true \
+    --vib-warmup-frames 2000000 \
+    --vib-beta 0.00001 \
+    --heterognn-type edgebiasedhgt \
 
 # Stop GPU monitoring
 kill $GPU_MONITOR_PID 2>/dev/null || true

@@ -39,7 +39,12 @@ from tensordict.nn import TensorDictModule, TensorDictSequential
 from torchrl.objectives import ClipPPOLoss, LossModule, ValueEstimators
 
 from benchmarl.algorithms.common import Algorithm, AlgorithmConfig
-from benchmarl.algorithms.HGTeam import HGTeam, HGTeamBase, HGTeamLoss
+from benchmarl.algorithms.HGTeam import (
+    HGTeam,
+    HGTeamBase,
+    HGTeamLoss,
+    _ema_normalize_advantages,
+)
 from benchmarl.algorithms.hgteam_modules import EmbeddingProcessor
 
 
@@ -212,6 +217,11 @@ class HGTeamHAPPO(HGTeamBase):
             vectorized=False,
             deactivate_vmap=True,
         )
+        # Slow-EMA advantage-scale reference (persisted via loss state_dict).
+        loss_module.register_buffer("_adv_ema_std", torch.zeros((), device=self.device))
+        loss_module.register_buffer(
+            "_adv_ema_std_count", torch.zeros((), dtype=torch.long, device=self.device)
+        )
         return loss_module, False
 
     def _get_parameters(self, group: str, loss: ClipPPOLoss) -> dict[str, Iterable]:
@@ -329,18 +339,30 @@ class HGTeamHAPPO(HGTeamBase):
             adv[~m] = 0.0
             vtarg[~m] = vval[~m].detach()
 
-            # --- S8a: Per-slot masked advantage normalization ---
-            # See HGTeam.process_batch for full rationale.
-            agent_dim = active_mask.dim() - 1  # last dim of active_mask
-            n_agents = active_mask.shape[agent_dim]
-            for slot in range(n_agents):
-                slot_active = active_mask.select(agent_dim, slot)  # (*batch_dims) bool
-                if slot_active.sum() > 1:
-                    slot_adv_view = adv.select(agent_dim, slot)  # (*batch_dims, 1)
-                    slot_vals = slot_adv_view[slot_active]  # (n_active, 1)
-                    slot_adv_view[slot_active] = (
-                        slot_vals - slot_vals.mean()
-                    ) / slot_vals.std(correction=0).clamp(min=1e-7)
+            if self.adv_norm_ema:
+                # Per-group slow-EMA reference scale (default).
+                _ema_normalize_advantages(
+                    adv,
+                    active_mask,
+                    loss,
+                    self.adv_norm_ema_decay,
+                    self.adv_norm_ema_warmup_iters,
+                    experiment=self.experiment,
+                    group=group,
+                )
+            else:
+                # --- S8a: Per-slot masked advantage normalization (legacy) ---
+                # See HGTeam.process_batch for full rationale.
+                agent_dim = active_mask.dim() - 1  # last dim of active_mask
+                n_agents = active_mask.shape[agent_dim]
+                for slot in range(n_agents):
+                    slot_active = active_mask.select(agent_dim, slot)  # (*batch_dims) bool
+                    if slot_active.sum() > 1:
+                        slot_adv_view = adv.select(agent_dim, slot)  # (*batch_dims, 1)
+                        slot_vals = slot_adv_view[slot_active]  # (n_active, 1)
+                        slot_adv_view[slot_active] = (
+                            slot_vals - slot_vals.mean()
+                        ) / slot_vals.std(correction=0).clamp(min=1e-7)
         else:
             # No active_mask — fall back to standard per-slot normalization.
             warnings.warn(
@@ -350,15 +372,35 @@ class HGTeamHAPPO(HGTeamBase):
                 stacklevel=2,
             )
             adv = batch.get((group, "advantage"))
-            agent_dim = adv.dim() - 2  # second-to-last: (*batch_dims, n_agents, 1)
-            n_agents = adv.shape[agent_dim]
-            for slot in range(n_agents):
-                slot_adv_view = adv.select(agent_dim, slot)  # (*batch_dims, 1)
-                if slot_adv_view.numel() > 1:
-                    slot_adv_view.copy_(
-                        (slot_adv_view - slot_adv_view.mean())
-                        / slot_adv_view.std(correction=0).clamp(min=1e-7)
-                    )
+            if self.adv_norm_ema:
+                _ema_normalize_advantages(
+                    adv,
+                    None,
+                    loss,
+                    self.adv_norm_ema_decay,
+                    self.adv_norm_ema_warmup_iters,
+                    experiment=self.experiment,
+                    group=group,
+                )
+            else:
+                agent_dim = adv.dim() - 2  # second-to-last: (*batch_dims, n_agents, 1)
+                n_agents = adv.shape[agent_dim]
+                for slot in range(n_agents):
+                    slot_adv_view = adv.select(agent_dim, slot)  # (*batch_dims, 1)
+                    if slot_adv_view.numel() > 1:
+                        slot_adv_view.copy_(
+                            (slot_adv_view - slot_adv_view.mean())
+                            / slot_adv_view.std(correction=0).clamp(min=1e-7)
+                        )
+
+        # --- Bound the normalized advantage magnitude ---
+        # With critic_use_other_actions the centralized critic is
+        # non-stationary (its value landscape shifts as peer policies move),
+        # which can produce extreme outlier advantages that survive S8a
+        # normalization and drive a ratio-explosion feedback loop.  Post-norm
+        # advantages are ~N(0,1), so +-10 is a 10-sigma guard that never fires
+        # in healthy training but breaks the divergence loop when it starts.
+        batch.get((group, "advantage")).clamp_(-10.0, 10.0)
 
         return batch
 
@@ -371,11 +413,185 @@ class HGTeamHAPPO(HGTeamBase):
         return loss_vals
 
     # Reuse HGTeam's critic and shared-critic helpers (inherited from
-    # HGTeamBase, but get_critic is defined on HGTeam).
+    # HGTeamBase, but get_critic is defined on HGTeam). Action-edge helpers
+    # live on HGTeamBase.
     get_critic = HGTeam.get_critic
     _get_shared_critic = HGTeam._get_shared_critic
-    _compute_other_actions_dim = HGTeam._compute_other_actions_dim
     _split_shared_gnn_param_groups = HGTeam._split_shared_gnn_param_groups
+
+    # ------------------------------------------------------------------
+    # Encoder freeze schedule (T3 ablation)
+    # ------------------------------------------------------------------
+
+    def _encoder_frozen(self, total_frames: int) -> bool:
+        """Return True when the shared actor GNN should be held fixed.
+
+        See ``encoder_freeze_after_frames``: None => never frozen, 0 => frozen
+        from initialisation, N => frozen once ``total_frames >= N``.
+        """
+        f = self.encoder_freeze_after_frames
+        if f is None:
+            return False
+        return total_frames >= f
+
+    # ------------------------------------------------------------------
+    # Phase-decomposition diagnostics (T1 / T2)
+    # ------------------------------------------------------------------
+
+    def _sni_logprob(
+        self,
+        experiment: "Experiment",  # noqa: F821
+        group: str,
+        data: TensorDictBase,
+    ) -> torch.Tensor:
+        """Log-prob of ``data``'s actions under group's current actor (SNI).
+
+        Uses deterministic embeddings (z=mu) when VIB is active so the value
+        is consistent with the importance ratios used elsewhere.  No grad.
+        """
+        lm = experiment.losses[group]
+        ep = None
+        for _m in lm.actor_network.modules():
+            if isinstance(_m, EmbeddingProcessor):
+                ep = _m
+                break
+        ctx_params = (
+            lm.actor_network_params.to_module(lm.actor_network)
+            if lm.functional
+            else contextlib.nullcontext()
+        )
+        sni_ctx = ep.deterministic_mode() if ep is not None else contextlib.nullcontext()
+        with torch.no_grad(), sni_ctx, ctx_params:
+            dist = lm.actor_network.get_dist(data)
+        action = data.get((group, "action"))
+        return dist.log_prob(action)
+
+    @staticmethod
+    def _masked_active_mean(
+        value: torch.Tensor, data: TensorDictBase, group: str
+    ) -> float:
+        """Mean of ``value`` over active agents (per ``active_mask``)."""
+        amask = data.get((group, "active_mask"), None)
+        if amask is None:
+            return value.float().mean().item()
+        am = amask.float()
+        while am.dim() < value.dim():
+            am = am.unsqueeze(-1)
+        am = am.expand_as(value)
+        return ((value * am).sum() / am.sum().clamp(min=1)).item()
+
+    def _log_encoder_grad_alignment(
+        self,
+        experiment: "Experiment",  # noqa: F821
+        groups: list[str],
+        gbuf_full: dict[str, TensorDictBase],
+        old_lp: dict[str, torch.Tensor],
+        group_advs: dict[str, torch.Tensor],
+        chunk_size: int,
+        train_device,
+    ) -> None:
+        """T2: pairwise cosine similarity of per-group encoder gradients.
+
+        For each group, compute the gradient of its *own* clipped surrogate
+        gain w.r.t. the shared actor-GNN parameters in isolation (one
+        minibatch), then log pairwise cosines.  Persistently negative cosines
+        mean the groups pull the shared representation in opposing directions
+        -- genuine mixed-motive conflict at the encoder, which a shared
+        cooperative objective cannot resolve and which would motivate
+        game-theoretic gradient corrections over a simple two-timescale fix.
+        Positive cosines mean the cooperative encoder objective is well-posed
+        and the instability is a dynamics (step-size/timescale) problem.
+        """
+        gnn_params = [p for p in self._shared_actor_gnn.parameters() if p.requires_grad]
+        if not gnn_params:
+            return
+
+        def _zero():
+            for p in gnn_params:
+                p.grad = None
+
+        grad_vecs: dict[str, torch.Tensor] = {}
+        try:
+            for g in groups:
+                n = min(chunk_size, gbuf_full[g].shape[0])
+                if n <= 0:
+                    continue
+                data = gbuf_full[g][:n].to(train_device)
+                lm = experiment.losses[g]
+                ep = None
+                for _m in lm.actor_network.modules():
+                    if isinstance(_m, EmbeddingProcessor):
+                        ep = _m
+                        break
+                ctx_params = (
+                    lm.actor_network_params.to_module(lm.actor_network)
+                    if lm.functional
+                    else contextlib.nullcontext()
+                )
+                sni_ctx = (
+                    ep.deterministic_mode() if ep is not None else contextlib.nullcontext()
+                )
+                _zero()
+                with sni_ctx, ctx_params:
+                    dist = lm.actor_network.get_dist(data)
+                action = data.get((g, "action"))
+                new_lp = dist.log_prob(action)
+
+                old = old_lp[g][:n].to(train_device)
+                while old.dim() < new_lp.dim():
+                    old = old.unsqueeze(-1)
+                while old.dim() > new_lp.dim():
+                    old = old.squeeze(-1)
+                ratio = torch.exp((new_lp - old).clamp(-10.0, 10.0))
+                clipped = torch.clamp(ratio, 1.0 - self.clip_epsilon, 1.0 + self.clip_epsilon)
+
+                adv = group_advs[g][:n].to(train_device)
+                while adv.dim() > ratio.dim():
+                    adv = adv.squeeze(-1)
+                while adv.dim() < ratio.dim():
+                    adv = adv.unsqueeze(-1)
+                gain = torch.min(ratio * adv, clipped * adv)
+
+                amask = data.get((g, "active_mask"), None)
+                if amask is not None:
+                    am = amask.float()
+                    while am.dim() < gain.dim():
+                        am = am.unsqueeze(-1)
+                    obj = (gain * am).sum() / am.sum().clamp(min=1)
+                else:
+                    obj = gain.mean()
+
+                obj.backward()
+                grad_vecs[g] = torch.cat(
+                    [
+                        p.grad.detach().reshape(-1)
+                        if p.grad is not None
+                        else torch.zeros(p.numel(), device=train_device)
+                        for p in gnn_params
+                    ]
+                )
+            _zero()
+
+            glist = [g for g in groups if g in grad_vecs and grad_vecs[g].norm() > 0]
+            log_dict: dict[str, float] = {}
+            cosvals = []
+            for i in range(len(glist)):
+                for j in range(i + 1, len(glist)):
+                    a, b = grad_vecs[glist[i]], grad_vecs[glist[j]]
+                    cos = (torch.dot(a, b) / (a.norm() * b.norm()).clamp(min=1e-12)).item()
+                    log_dict[f"train/coop_encoder/grad_cos_{glist[i]}_{glist[j]}"] = cos
+                    cosvals.append(cos)
+            if cosvals:
+                log_dict["train/coop_encoder/grad_cos_mean"] = sum(cosvals) / len(cosvals)
+                log_dict["train/coop_encoder/grad_cos_min"] = min(cosvals)
+                experiment.logger.log(log_dict, step=experiment.n_iters_performed)
+        except Exception as _e:  # diagnostics must never kill a training run
+            warnings.warn(
+                f"coop_encoder grad-alignment diagnostic (T2) failed: {_e}",
+                stacklevel=2,
+            )
+        finally:
+            _zero()
 
     # ------------------------------------------------------------------
     # Cooperative encoder update (Phase 0 — runs before HAPPO head updates)
@@ -517,6 +733,13 @@ class HGTeamHAPPO(HGTeamBase):
                     lp_chunks.append(dist_old.log_prob(action).cpu())
                 old_lp_sni[g] = torch.cat(lp_chunks, dim=0)
 
+        # --- T2: per-group encoder-gradient alignment (once per iteration) ---
+        # Done before the optimization epochs so it sees the pre-update
+        # gradients; isolated per-group backward passes on one minibatch.
+        self._log_encoder_grad_alignment(
+            experiment, groups, gbuf_full, old_lp_sni, group_advs, chunk_size, train_device
+        )
+
         # Logging accumulators
         _log_coop_obj = 0.0
         _log_encoder_loss = 0.0
@@ -529,6 +752,18 @@ class HGTeamHAPPO(HGTeamBase):
         _per_group_ratio_sum: dict[str, float] = {g: 0.0 for g in groups}
         _per_group_clip_count: dict[str, float] = {g: 0.0 for g in groups}
         _per_group_total_count: dict[str, float] = {g: 0.0 for g in groups}
+
+        # Diagnostic A: per-slot ratio tracking (group, slot_idx) -> running stats.
+        # Identifies whether ratio_max is driven by a small set of slots
+        # (e.g. rare-active slots) rather than the bulk of agents.
+        _per_slot_ratio_sum: dict[tuple[str, int], float] = {}
+        _per_slot_ratio_max: dict[tuple[str, int], float] = {}
+        _per_slot_active_count: dict[tuple[str, int], float] = {}
+        # Diagnostic B: collect active per-agent ratios for distribution shape.
+        # Per-iteration list of (small) tensors; converted to a flat tensor at
+        # the end to compute quantiles.  Memory bound is buf_len * sum(n_agents)
+        # per epoch, accumulated -- typically O(MB) for VPP/SMAC scales.
+        _ratio_samples: list[torch.Tensor] = []
 
         clip_eps = self.clip_epsilon
 
@@ -565,7 +800,11 @@ class HGTeamHAPPO(HGTeamBase):
                     action = gdata_mb.get((g, "action"))
                     new_lp = dist_new.log_prob(action)
 
-                    log_ratio = new_lp - old_lp_mb
+                    # Clamp the log-ratio before exp() to prevent inf/NaN when
+                    # the encoder has drifted far from the behavior policy.
+                    # The PPO clip below still governs update magnitude; this is
+                    # purely an overflow guard (exp(10) ~= 2.2e4).
+                    log_ratio = (new_lp - old_lp_mb).clamp(-10.0, 10.0)
                     ratio = torch.exp(log_ratio)
                     clipped_ratio = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps)
 
@@ -599,6 +838,38 @@ class HGTeamHAPPO(HGTeamBase):
                             _per_group_ratio_sum[g] += g_ratio_sum
                             _per_group_clip_count[g] += g_clip_count
                             _per_group_total_count[g] += g_active_n
+
+                            # Diagnostic A: per-slot stats.  active_mask shape is
+                            # (*batch_dims, n_slots); we squeeze ratio to match
+                            # so we can index a slot the same way.
+                            ratio_slot_view = ratio
+                            while ratio_slot_view.dim() > amask.dim():
+                                ratio_slot_view = ratio_slot_view.squeeze(-1)
+                            n_slots = amask.shape[-1]
+                            for s in range(n_slots):
+                                slot_mask = amask[..., s].bool()
+                                if not slot_mask.any():
+                                    continue
+                                slot_ratio = ratio_slot_view[..., s][slot_mask]
+                                key = (g, s)
+                                _per_slot_ratio_sum[key] = (
+                                    _per_slot_ratio_sum.get(key, 0.0)
+                                    + slot_ratio.sum().item()
+                                )
+                                _per_slot_active_count[key] = (
+                                    _per_slot_active_count.get(key, 0.0)
+                                    + float(slot_ratio.numel())
+                                )
+                                slot_max = slot_ratio.max().item()
+                                if slot_max > _per_slot_ratio_max.get(key, 0.0):
+                                    _per_slot_ratio_max[key] = slot_max
+
+                            # Diagnostic B: collect active ratios for quantiles.
+                            am_bool = amask.bool()
+                            while am_bool.dim() < ratio.dim():
+                                am_bool = am_bool.unsqueeze(-1)
+                            am_bool = am_bool.expand_as(ratio)
+                            _ratio_samples.append(ratio[am_bool].detach().cpu())
                     else:
                         coop_obj_num = coop_obj_num + gain.sum()
                         total_active_count = total_active_count + torch.tensor(
@@ -613,6 +884,8 @@ class HGTeamHAPPO(HGTeamBase):
                             _per_group_ratio_sum[g] += ratio.sum().item()
                             _per_group_clip_count[g] += (ratio != clipped_ratio).sum().item()
                             _per_group_total_count[g] += n_el
+                            # Diagnostic B: collect ratios for quantile stats.
+                            _ratio_samples.append(ratio.detach().reshape(-1).cpu())
 
                     # VIB KL with active_mask
                     if self.use_vib:
@@ -679,6 +952,44 @@ class HGTeamHAPPO(HGTeamBase):
             if self.use_vib:
                 log_dict["train/coop_encoder/vib_kl_masked"] = _log_vib_kl / _n_iters
                 log_dict["train/coop_encoder/vib_beta_eff"] = beta_eff
+
+            # --- Diagnostic A: per-slot ratio summaries ---
+            # Logs ratio_max and active_fraction per (group, slot_idx) so we can
+            # see whether ratio_max is concentrated on a few rare-active slots.
+            # active_fraction is per-slot share of the buffer where the slot is
+            # active (averaged across all minibatches in this Phase 0 call).
+            if _per_slot_active_count:
+                # Total active samples per group (summed across slots) is just
+                # the existing _per_group_total_count[g], which already counts
+                # (mb iters x active rows).  We use it as the denominator for
+                # active_fraction so it matches per-slot scale.
+                for (g, s), n_active in _per_slot_active_count.items():
+                    gc = _per_group_total_count[g]
+                    log_dict[f"train/coop_encoder/{g}_slot_{s}_ratio_max"] = (
+                        _per_slot_ratio_max.get((g, s), 0.0)
+                    )
+                    log_dict[f"train/coop_encoder/{g}_slot_{s}_ratio_mean"] = (
+                        _per_slot_ratio_sum[(g, s)] / max(n_active, 1.0)
+                    )
+                    if gc > 0:
+                        log_dict[f"train/coop_encoder/{g}_slot_{s}_active_frac"] = (
+                            n_active / gc
+                        )
+
+            # --- Diagnostic B: per-agent ratio distribution shape ---
+            # Quantiles tell us whether ratio_max reflects a heavy tail
+            # (p99 >> p50) or a uniform shift of the bulk distribution.
+            if _ratio_samples:
+                all_ratios = torch.cat(_ratio_samples)
+                if all_ratios.numel() > 0:
+                    qs = torch.tensor([0.01, 0.05, 0.5, 0.95, 0.99])
+                    quantiles = torch.quantile(all_ratios.float(), qs)
+                    log_dict["train/coop_encoder/ratio_p01"] = quantiles[0].item()
+                    log_dict["train/coop_encoder/ratio_p05"] = quantiles[1].item()
+                    log_dict["train/coop_encoder/ratio_p50"] = quantiles[2].item()
+                    log_dict["train/coop_encoder/ratio_p95"] = quantiles[3].item()
+                    log_dict["train/coop_encoder/ratio_p99"] = quantiles[4].item()
+
             experiment.logger.log(log_dict, step=experiment.n_iters_performed)
 
         # Re-freeze GNN for Phase 1 head updates
@@ -731,9 +1042,65 @@ class HGTeamHAPPO(HGTeamBase):
             group_order = groups.copy()
             random.shuffle(group_order)
 
+        # --- 2a. Encoder freeze schedule (T3 ablation) ---
+        # When frozen, the shared actor GNN is held fixed: we skip every
+        # encoder-update path below and disable its grads so the per-group
+        # optimizer (accumulated mode) cannot move it either.  Heads/critics
+        # still train on top of the (possibly random) fixed feature map.
+        # When not frozen we leave requires_grad management to the existing
+        # per-mode update paths (unchanged behavior).
+        encoder_frozen = self._encoder_frozen(experiment.total_frames)
+        if self._shared_actor_gnn is not None:
+            if encoder_frozen:
+                for p in self._shared_actor_gnn.parameters():
+                    p.requires_grad_(False)
+            experiment.logger.log(
+                {"train/encoder/frozen": float(encoder_frozen)},
+                step=experiment.n_iters_performed,
+            )
+
+        # --- T1 setup: snapshot behavior policy on a fixed per-group sample ---
+        # Decomposes total per-iteration policy movement into the encoder
+        # (Phase 0) and head (Phase 1) contributions.  HAPPO's trust-region /
+        # monotonic-improvement guarantee only governs the head movement; a
+        # large Phase-0 share (especially correlated with later instability) is
+        # direct evidence for M1/M2 (un-trust-regioned encoder displacement).
+        # The estimator is exact for the log-prob shift on the behavior actions
+        # (old-mid plus mid-final = old-final by construction); it approximates
+        # KL(pi_old || .) since the buffer actions are ~ behavior policy.
+        _t1_enabled = (
+            self.encoder_update_mode == "coop_encoder"
+            and self._shared_actor_gnn is not None
+            and not encoder_frozen
+        )
+        _t1_ref: dict[str, TensorDictBase] = {}
+        _t1_old_lp: dict[str, torch.Tensor] = {}
+        _t1_phase0: dict[str, float] = {}
+        if _t1_enabled:
+            _t1_chunk = experiment.config.train_minibatch_size(self.on_policy)
+            for g in groups:
+                gbuf = experiment.replay_buffers[g]
+                n = min(_t1_chunk, len(gbuf))
+                if n <= 0:
+                    continue
+                _t1_ref[g] = gbuf[:n].to(experiment.config.train_device)
+                _t1_old_lp[g] = self._sni_logprob(experiment, g, _t1_ref[g])
+
         # --- 2b. Phase 0: cooperative GNN update (before head updates) ---
-        if self.encoder_update_mode == "coop_encoder" and self._shared_actor_gnn is not None:
+        if (
+            self.encoder_update_mode == "coop_encoder"
+            and self._shared_actor_gnn is not None
+            and not encoder_frozen
+        ):
             self._coop_encoder_update(experiment, groups)
+
+        # --- T1: encoder-induced policy movement (post Phase 0) ---
+        if _t1_enabled:
+            for g, ref in _t1_ref.items():
+                mid_lp = self._sni_logprob(experiment, g, ref)
+                _t1_phase0[g] = self._masked_active_mean(
+                    _t1_old_lp[g] - mid_lp, ref, g
+                )
 
         # --- 3. Snapshot old log-probs for all groups ---
         # We need old log-probs to compute the importance ratio after updates.
@@ -774,6 +1141,18 @@ class HGTeamHAPPO(HGTeamBase):
                 (g_idx > 0 and self.encoder_update_mode == "accumulated")
                 or self.encoder_update_mode == "coop_encoder"
             )
+            # SNI consistency: when VIB is active the new_log_probs used for
+            # the HAPPO factor (Step 7 below) are evaluated with deterministic
+            # z=mu.  The re-evaluated old_log_probs must use the same z=mu path,
+            # otherwise the factor ratio carries a systematic bias of
+            # exp(log_prob(a|z=mu) - log_prob(a|z=sampled)) that grows with the
+            # VIB embedding variance and compounds across sequential groups.
+            _ep_snap = None
+            if self.use_vib and _need_reeval:
+                for _m in loss_module.actor_network.modules():
+                    if isinstance(_m, EmbeddingProcessor):
+                        _ep_snap = _m
+                        break
             with torch.no_grad():
                 full_data = buffer[:buf_len]
                 if _need_reeval:
@@ -787,7 +1166,12 @@ class HGTeamHAPPO(HGTeamBase):
                         max(1, -(-full_data.shape[0] // chunk_size_snap)), dim=0
                     ):
                         chunk_dev = chunk.to(experiment.config.train_device)
-                        with ctx_snap:
+                        sni_snap = (
+                            _ep_snap.deterministic_mode()
+                            if _ep_snap is not None
+                            else contextlib.nullcontext()
+                        )
+                        with sni_snap, ctx_snap:
                             dist_snap = loss_module.actor_network.get_dist(chunk_dev)
                         action_snap = chunk_dev.get((group, "action"))
                         lp_chunks.append(dist_snap.log_prob(action_snap).cpu())
@@ -854,10 +1238,12 @@ class HGTeamHAPPO(HGTeamBase):
                 storage_td[factor_key][:buf_len] = factor_vals
 
             # --- Freeze GNN if separate_forward or coop_encoder mode ---
-            if self.encoder_update_mode in ("separate_forward", "coop_encoder"):
-                if self._shared_actor_gnn is not None:
-                    for p in self._shared_actor_gnn.parameters():
-                        p.requires_grad_(False)
+            if (
+                self.encoder_update_mode in ("separate_forward", "coop_encoder")
+                and self._shared_actor_gnn is not None
+            ):
+                for p in self._shared_actor_gnn.parameters():
+                    p.requires_grad_(False)
 
             # --- Standard PPO optimizer loop for this group ---
             training_tds = []
@@ -952,6 +1338,13 @@ class HGTeamHAPPO(HGTeamBase):
             # shrinks freely, dampening subsequent groups' updates.
             # This asymmetry is required for the monotonic-improvement
             # guarantee in HAPPO (Kuba et al., 2022, Theorem 1).
+            #
+            # Clamp the (geometric-mean) log-ratio before exp() so a single
+            # collapsed group cannot drive the cumulative factor to 0 (or inf)
+            # for every downstream group.  +-4 nats keeps the factor in
+            # [~0.018, ~54.6], far outside the [1-eps, 1+eps] clip range, so
+            # healthy updates are unaffected; it only acts as a circuit breaker.
+            log_group_ratio = log_group_ratio.clamp(-4.0, 4.0)
             group_ratio = torch.exp(log_group_ratio)
             clipped_ratio = torch.clamp(
                 group_ratio,
@@ -1019,7 +1412,7 @@ class HGTeamHAPPO(HGTeamBase):
                         data = []
                         for i in idx.tolist():
                             row = [n_active_total[i].item(), cum_factor[i].item()]
-                            for grp, (n_act, f_upd) in _factor_diagnostics.items():
+                            for n_act, f_upd in _factor_diagnostics.values():
                                 row += [n_act[i].item(), f_upd[i].item()]
                             data.append(row)
                         table = wandb.Table(columns=columns, data=data)
@@ -1027,8 +1420,25 @@ class HGTeamHAPPO(HGTeamBase):
                 except ImportError:
                     pass
 
+        # --- T1: head-induced movement (post Phase 1) and phase decomposition ---
+        # In coop_encoder mode the encoder is frozen during Phase 1, so the
+        # policy change here is purely head-driven.  total = phase0 + phase1.
+        if _t1_enabled and _t1_phase0:
+            _t1_log: dict[str, float] = {}
+            for g, ref in _t1_ref.items():
+                final_lp = self._sni_logprob(experiment, g, ref)
+                total = self._masked_active_mean(_t1_old_lp[g] - final_lp, ref, g)
+                phase0 = _t1_phase0.get(g, 0.0)
+                _t1_log[f"train/phase_kl/{g}_phase0"] = phase0
+                _t1_log[f"train/phase_kl/{g}_phase1"] = total - phase0
+                _t1_log[f"train/phase_kl/{g}_total"] = total
+                if abs(total) > 1e-9:
+                    _t1_log[f"train/phase_kl/{g}_phase0_fraction"] = phase0 / total
+            if _t1_log:
+                experiment.logger.log(_t1_log, step=experiment.n_iters_performed)
+
         # --- 5. GNN encoder update ---
-        if self._shared_actor_gnn is not None:
+        if self._shared_actor_gnn is not None and not encoder_frozen:
             if self.encoder_update_mode == "accumulated":
                 # Mode C: GNN grads have been accumulated during per-group
                 # backward passes (since GNN params were in the optimizer
@@ -1069,8 +1479,6 @@ class HGTeamHAPPO(HGTeamBase):
                     if self.encoder_n_optimizer_steps is not None
                     else experiment.config.n_optimizer_steps(self.on_policy)
                 )
-                n_groups = len(group_order)
-
                 # Buffer length (same across groups)
                 buf_len = None
                 for g in groups:
@@ -1092,7 +1500,7 @@ class HGTeamHAPPO(HGTeamBase):
                         beta_eff = self.vib_beta
 
                 # Find EmbeddingProcessors for SNI (one per group)
-                _ep_map: dict[str, "EmbeddingProcessor | None"] = {}
+                _ep_map: dict[str, EmbeddingProcessor | None] = {}
                 for g in groups:
                     _ep_map[g] = None
                     lm = experiment.losses[g]
@@ -1311,6 +1719,7 @@ class HGTeamHAPPOConfig(AlgorithmConfig):
     gnn_mode: str = MISSING
     actor_graph_mode: str = MISSING
     ego_gnn_topology: str = MISSING
+    heterognn_type: str = MISSING
     z_dim: int = MISSING
     hypernet_actor_feature_dim: int = MISSING
     stochastic_z: bool = MISSING
@@ -1339,6 +1748,14 @@ class HGTeamHAPPOConfig(AlgorithmConfig):
     use_vib: bool = MISSING
     vib_beta: float = MISSING
     vib_warmup_frames: int = MISSING
+
+    # Advantage normalization (slow-EMA reference scale)
+    adv_norm_ema: bool = MISSING
+    adv_norm_ema_decay: float = MISSING
+    adv_norm_ema_warmup_iters: int = MISSING
+
+    # Encoder freeze schedule (T3 ablation): None=never, 0=from init, N=after N frames
+    encoder_freeze_after_frames: int | None = MISSING
 
     # HAPPO-specific parameters
     encoder_update_mode: str = MISSING

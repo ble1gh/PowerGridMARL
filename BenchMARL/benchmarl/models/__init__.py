@@ -13,6 +13,8 @@ from .common import (
     SequenceModelConfig,
 )
 from .deepsets import Deepsets, DeepsetsConfig
+from .edgebiasedHGT import EdgeBiasedHGT, EdgeBiasedHGTConfig
+from .edgeweightedHGT import EdgeWeightedHGT, EdgeWeightedHGTConfig
 from .gnn import Gnn, GnnConfig
 from .gru import Gru, GruConfig
 from .heterognn import HeteroGNN, HeteroGnnConfig
@@ -35,6 +37,38 @@ classes = [
     "LstmConfig",
     "Transformer",
     "TransformerConfig",
+    "EdgeBiasedHGT",
+    "EdgeBiasedHGTConfig",
+    "EdgeWeightedHGT",
+    "EdgeWeightedHGTConfig",
+]
+
+__all__ = [
+    "Cnn",
+    "CnnConfig",
+    "Deepsets",
+    "DeepsetsConfig",
+    "EdgeBiasedHGT",
+    "EdgeBiasedHGTConfig",
+    "EdgeWeightedHGT",
+    "EdgeWeightedHGTConfig",
+    "EnsembleModelConfig",
+    "Gnn",
+    "GnnConfig",
+    "Gru",
+    "GruConfig",
+    "HeteroGNN",
+    "HeteroGnnConfig",
+    "Lstm",
+    "LstmConfig",
+    "Mlp",
+    "MlpConfig",
+    "Model",
+    "ModelConfig",
+    "SequenceModel",
+    "SequenceModelConfig",
+    "Transformer",
+    "TransformerConfig",
 ]
 
 model_config_registry = {
@@ -45,4 +79,6 @@ model_config_registry = {
     "gru": GruConfig,
     "lstm": LstmConfig,
     "transformer": TransformerConfig,
+    "edgebiasedhgt": EdgeBiasedHGTConfig,
+    "edgeweightedhgt": EdgeWeightedHGTConfig,
 }

@@ -4,6 +4,7 @@
 #  to the actor GNN via mu (direct) and optionally through action (indirect).
 
 import copy
+import random
 from collections.abc import Iterable
 from dataclasses import MISSING, dataclass
 
@@ -14,12 +15,11 @@ from torchrl.data import Composite, Unbounded
 from torchrl.objectives import LossModule, SACLoss, ValueEstimators
 
 from benchmarl.algorithms.common import AlgorithmConfig
-from benchmarl.algorithms.HGTeam import HGTeamBase
+from benchmarl.algorithms.HGTeam import HETERO_GRAPH_CONFIG_TYPES, HGTeamBase
 from benchmarl.algorithms.hgteam_modules import (
     EmbeddingProcessor,
     merge_embedding_losses,
 )
-from benchmarl.models import HeteroGnnConfig
 
 # ======================================================================
 # Loss wrapper
@@ -97,18 +97,21 @@ class HGTeamSACLoss(SACLoss):
                 # Participation score (or configured feature)
                 if part_key_suffix:
                     # Try (group, key)
-                    if (g, part_key_suffix) in tensordict.keys(True, True):
-                        if (g, part_key_suffix) not in next_td.keys(True, True):
-                            next_td.set((g, part_key_suffix), tensordict.get((g, part_key_suffix)))
+                    if (
+                        (g, part_key_suffix) in tensordict.keys(True, True)
+                        and (g, part_key_suffix) not in next_td.keys(True, True)
+                    ):
+                        next_td.set((g, part_key_suffix), tensordict.get((g, part_key_suffix)))
                     # Try key at root (fallback, though unlikely for multi-agent)
-                    elif part_key_suffix in tensordict:
-                        if part_key_suffix not in next_td:
-                            next_td.set(part_key_suffix, tensordict.get(part_key_suffix))
+                    elif part_key_suffix in tensordict and part_key_suffix not in next_td:
+                        next_td.set(part_key_suffix, tensordict.get(part_key_suffix))
 
                 # Agent index
-                if (g, idx_key_suffix) in tensordict.keys(True, True):
-                    if (g, idx_key_suffix) not in next_td.keys(True, True):
-                        next_td.set((g, idx_key_suffix), tensordict.get((g, idx_key_suffix)))
+                if (
+                    (g, idx_key_suffix) in tensordict.keys(True, True)
+                    and (g, idx_key_suffix) not in next_td.keys(True, True)
+                ):
+                    next_td.set((g, idx_key_suffix), tensordict.get((g, idx_key_suffix)))
 
         # --- PRE-FORWARD: Fill missing next-actions for OTHER groups ---
         # The shared Q-network (HeteroGNN) requires inputs from ALL groups.
@@ -254,6 +257,8 @@ class HGTeamSAC(HGTeamBase):
         lr_actor: float = 3e-4,
         lr_encoder: float = 1e-4,
         lr_critic: float = 3e-4,
+        encoder_update_mode: str = "accumulated",
+        fixed_order: bool = False,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -277,9 +282,17 @@ class HGTeamSAC(HGTeamBase):
         self.lr_actor = lr_actor
         self.lr_encoder = lr_encoder
         self.lr_critic = lr_critic
+        self.encoder_update_mode = encoder_update_mode
+        self.fixed_order = fixed_order
 
         # Q-network cache (shared across groups, like _shared_gnn_critic)
         self._shared_qvalue_gnn = None
+
+        if self.encoder_update_mode not in ("accumulated", "separate_forward", "coop_encoder"):
+            raise ValueError(
+                "encoder_update_mode must be one of "
+                "'accumulated', 'separate_forward', or 'coop_encoder'"
+            )
 
     # ------------------------------------------------------------------
     # Override: _get_loss
@@ -458,6 +471,192 @@ class HGTeamSAC(HGTeamBase):
         # Embedding aux losses are already added to loss_actor in HGTeamSACLoss.forward().
         return loss_vals
 
+    def train_groups(self, experiment, batch, current_frames: int):
+        """Train SAC groups with configurable encoder/head phase ordering.
+
+        Modes:
+          - accumulated: standard end-to-end SAC updates
+          - separate_forward: heads/critic first, then encoder-only SAC actor phase
+          - coop_encoder: cooperative encoder phase first, then heads/critic
+        """
+        for group in experiment.train_group_map:
+            group_batch = batch.exclude(*experiment._get_excluded_keys(group))
+            group_batch = self.process_batch(group, group_batch)
+            if not self.has_rnn:
+                group_batch = group_batch.reshape(-1)
+            group_buffer = experiment.replay_buffers[group]
+            group_buffer.extend(group_batch.to(group_buffer.storage.device))
+
+        groups = list(experiment.train_group_map.keys())
+        if self.fixed_order:
+            group_order = groups
+        else:
+            group_order = groups.copy()
+            random.shuffle(group_order)
+
+        def _active_sac_losses(include_qvalue: bool, include_alpha: bool) -> tuple[str, ...]:
+            active_losses = ["loss_actor"]
+            if include_qvalue:
+                active_losses.append("loss_qvalue")
+            if include_alpha and not self.fixed_alpha:
+                active_losses.append("loss_alpha")
+            return tuple(active_losses)
+
+        def _run_group_updates(
+            order: list[str],
+            *,
+            loss_names: tuple[str, ...],
+            step_target_updater: bool,
+        ):
+            for group in order:
+                training_tds = []
+                for _ in range(experiment.config.n_optimizer_steps(self.on_policy)):
+                    for _ in range(
+                        -(
+                            -experiment.config.train_batch_size(self.on_policy)
+                            // experiment.config.train_minibatch_size(self.on_policy)
+                        )
+                    ):
+                        training_tds.append(
+                            experiment._optimizer_loop(
+                                group,
+                                loss_names=loss_names,
+                                step_target_updater=step_target_updater,
+                            )
+                        )
+                training_td = torch.stack(training_tds)
+                experiment.logger.log_training(group, training_td, step=experiment.n_iters_performed)
+                experiment._on_train_end(training_td, group)
+
+        def _set_phase_trainability(
+            *,
+            train_encoder: bool,
+            train_heads: bool,
+            train_critic: bool,
+            train_alpha: bool,
+        ):
+            for group in groups:
+                loss_module = experiment.losses[group]
+
+                # Actor split: encoder (shared GNN + EmbeddingProcessor) vs actor heads
+                actor_params = list(loss_module.actor_network_params.flatten_keys().values())
+                encoder_param_ptrs = set()
+                if self._shared_actor_gnn is not None:
+                    encoder_param_ptrs |= {p.data_ptr() for p in self._shared_actor_gnn.parameters()}
+                for m in loss_module.actor_network.modules():
+                    if isinstance(m, EmbeddingProcessor):
+                        encoder_param_ptrs |= {p.data_ptr() for p in m.parameters()}
+
+                for p in actor_params:
+                    if p.data_ptr() in encoder_param_ptrs:
+                        p.requires_grad_(train_encoder)
+                    else:
+                        p.requires_grad_(train_heads)
+
+                # Critic / Q params
+                qvalue_params = list(loss_module.qvalue_network_params.flatten_keys().values())
+                for p in qvalue_params:
+                    p.requires_grad_(train_critic)
+
+                # Temperature alpha
+                if hasattr(loss_module, "log_alpha"):
+                    loss_module.log_alpha.requires_grad_(train_alpha and not self.fixed_alpha)
+
+        # Snapshot original requires_grad flags for restore
+        reqgrad_snapshot: dict[int, bool] = {}
+        for group in groups:
+            lm = experiment.losses[group]
+            for p in lm.actor_network_params.flatten_keys().values():
+                reqgrad_snapshot[p.data_ptr()] = p.requires_grad
+            for p in lm.qvalue_network_params.flatten_keys().values():
+                reqgrad_snapshot[p.data_ptr()] = p.requires_grad
+            if hasattr(lm, "log_alpha"):
+                reqgrad_snapshot[lm.log_alpha.data_ptr()] = lm.log_alpha.requires_grad
+
+        try:
+            if self.encoder_update_mode == "accumulated":
+                _set_phase_trainability(
+                    train_encoder=True,
+                    train_heads=True,
+                    train_critic=True,
+                    train_alpha=not self.fixed_alpha,
+                )
+                _run_group_updates(
+                    group_order,
+                    loss_names=_active_sac_losses(include_qvalue=True, include_alpha=True),
+                    step_target_updater=True,
+                )
+            elif self.encoder_update_mode == "separate_forward":
+                # Phase 1: heads + critic first
+                _set_phase_trainability(
+                    train_encoder=False,
+                    train_heads=True,
+                    train_critic=True,
+                    train_alpha=not self.fixed_alpha,
+                )
+                _run_group_updates(
+                    group_order,
+                    loss_names=_active_sac_losses(include_qvalue=True, include_alpha=True),
+                    step_target_updater=True,
+                )
+                # Phase 2: encoder-only SAC actor objective
+                _set_phase_trainability(
+                    train_encoder=True,
+                    train_heads=False,
+                    train_critic=False,
+                    train_alpha=False,
+                )
+                _run_group_updates(
+                    group_order,
+                    loss_names=_active_sac_losses(include_qvalue=False, include_alpha=False),
+                    step_target_updater=False,
+                )
+            else:  # coop_encoder
+                # Phase 0: cooperative encoder-only SAC actor phase
+                _set_phase_trainability(
+                    train_encoder=True,
+                    train_heads=False,
+                    train_critic=False,
+                    train_alpha=False,
+                )
+                _run_group_updates(
+                    group_order,
+                    loss_names=_active_sac_losses(include_qvalue=False, include_alpha=False),
+                    step_target_updater=False,
+                )
+                # Phase 1: specialize heads + critic with encoder frozen
+                _set_phase_trainability(
+                    train_encoder=False,
+                    train_heads=True,
+                    train_critic=True,
+                    train_alpha=not self.fixed_alpha,
+                )
+                _run_group_updates(
+                    group_order,
+                    loss_names=_active_sac_losses(include_qvalue=True, include_alpha=True),
+                    step_target_updater=True,
+                )
+        finally:
+            for group in groups:
+                lm = experiment.losses[group]
+                for p in lm.actor_network_params.flatten_keys().values():
+                    p.requires_grad_(reqgrad_snapshot.get(p.data_ptr(), p.requires_grad))
+                for p in lm.qvalue_network_params.flatten_keys().values():
+                    p.requires_grad_(reqgrad_snapshot.get(p.data_ptr(), p.requires_grad))
+                if hasattr(lm, "log_alpha"):
+                    lm.log_alpha.requires_grad_(
+                        reqgrad_snapshot.get(lm.log_alpha.data_ptr(), lm.log_alpha.requires_grad)
+                    )
+
+        # Advance exploration schedule once per iteration
+        for group in groups:
+            if isinstance(experiment.group_policies[group], TensorDictSequential):
+                explore_layer = experiment.group_policies[group][-1]
+            else:
+                explore_layer = experiment.group_policies[group]
+            if hasattr(explore_layer, "step"):
+                explore_layer.step(current_frames)
+
     # ------------------------------------------------------------------
     # Q-network: shared HeteroGNN Q(obs, a, μ) across all agent types
     # ------------------------------------------------------------------
@@ -547,11 +746,11 @@ class HGTeamSAC(HGTeamBase):
                 )
 
             # Add graph keys
-            if isinstance(self.critic_model_config, HeteroGnnConfig):
+            if isinstance(self.critic_model_config, HETERO_GRAPH_CONFIG_TYPES):
                 self._add_graph_keys_to_spec(critic_input_spec)
 
             critic_config = copy.deepcopy(self.critic_model_config)
-            if isinstance(critic_config, HeteroGnnConfig):
+            if isinstance(critic_config, HETERO_GRAPH_CONFIG_TYPES):
                 critic_config.agent_groups = list(type_order)
 
                 # Build per-type node feature keys (qvalue_input replaces obs)
@@ -654,6 +853,7 @@ class HGTeamSACConfig(AlgorithmConfig):
     gnn_mode: str = MISSING
     actor_graph_mode: str = MISSING
     ego_gnn_topology: str = MISSING
+    heterognn_type: str = MISSING
     z_dim: int = MISSING
     hypernet_actor_feature_dim: int = MISSING
     stochastic_z: bool = MISSING
@@ -698,6 +898,8 @@ class HGTeamSACConfig(AlgorithmConfig):
     lr_actor: float = MISSING
     lr_encoder: float = MISSING
     lr_critic: float = MISSING
+    encoder_update_mode: str = MISSING
+    fixed_order: bool = MISSING
 
     @staticmethod
     def associated_class() -> type["HGTeamSAC"]:

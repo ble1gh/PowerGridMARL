@@ -9,8 +9,10 @@ Usage:
 """
 
 import argparse
+import json
 import os
 import sys
+import time
 
 import torch
 import torch_geometric.nn as tgnn
@@ -23,13 +25,85 @@ from benchmarl.environments.PowerGridworldVariable.common import PowerGridworldV
 from benchmarl.experiment import Experiment, ExperimentConfig
 from benchmarl.models import HeteroGnnConfig, TransformerConfig
 
+# #region agent log
+_DEBUG_LOG_PATH = "/uufs/chpc.utah.edu/common/home/u1175377/PowerGridMARL/.cursor/debug-5a524d.log"
+
+
+def _debug_log(run_id, location, data):
+    payload = {
+        "sessionId": "5a524d",
+        "runId": run_id,
+        "hypothesisId": "H5",
+        "location": location,
+        "data": data,
+        "timestamp": int(time.time() * 1000),
+    }
+    try:
+        with open(_DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload) + "\n")
+    except OSError:
+        pass
+# #endregion
+
+
 # ------------------------------------------------------------------
 # Shared helpers
 # ------------------------------------------------------------------
 
 
+_DEVICE_CACHE = None
+
+
 def _device():
-    return "cuda" if torch.cuda.is_available() else "cpu"
+    """Select CUDA if available and it has more than ``HGTEAM_SMOKE_MIN_FREE_MIB``
+    (default 3500) MiB of free memory; otherwise fall back to CPU.
+
+    The default is tuned for the CHPC login-node RTX A400 (3.68 GiB total):
+    this HGTeamHA HAPPO smoke run peaks near 3.23 GiB of GPU memory, and the
+    login node typically has a stale external process holding ~366 MiB, which
+    leaves about 3342 MiB free at startup. The threshold must sit above that
+    free value, not above the model's peak usage, otherwise CUDA is selected
+    and the run OOMs mid-backward. Override with ``HGTEAM_SMOKE_MIN_FREE_MIB``
+    on larger GPUs (e.g., ``HGTEAM_SMOKE_MIN_FREE_MIB=200`` on a compute node).
+
+    Result is cached so repeated calls in the same process stay consistent.
+    """
+    global _DEVICE_CACHE
+    if _DEVICE_CACHE is not None:
+        return _DEVICE_CACHE
+
+    if not torch.cuda.is_available():
+        _DEVICE_CACHE = "cpu"
+        # #region agent log
+        _debug_log(
+            os.environ.get("HGTEAM_SMOKE_RUN_ID", "pre-fix"),
+            "debug_hgteam_run.py:_device",
+            {"selected": "cpu", "cuda_available": False},
+        )
+        # #endregion
+        return _DEVICE_CACHE
+
+    threshold_mib = float(os.environ.get("HGTEAM_SMOKE_MIN_FREE_MIB", "3500"))
+    free_bytes, total_bytes = torch.cuda.mem_get_info()
+    free_mib = free_bytes / (1024 * 1024)
+    total_mib = total_bytes / (1024 * 1024)
+    _DEVICE_CACHE = "cpu" if free_mib < threshold_mib else "cuda"
+
+    # #region agent log
+    _debug_log(
+        os.environ.get("HGTEAM_SMOKE_RUN_ID", "pre-fix"),
+        "debug_hgteam_run.py:_device",
+        {
+            "selected": _DEVICE_CACHE,
+            "free_mib": round(free_mib, 3),
+            "total_mib": round(total_mib, 3),
+            "threshold_mib": threshold_mib,
+            "guardrail_applied": _DEVICE_CACHE == "cpu",
+        },
+    )
+    # #endregion
+
+    return _DEVICE_CACHE
 
 
 def _critic_gnn_config():
@@ -122,12 +196,13 @@ def run_ppo_test():
 
     # Minimal scale — forces evaluation early so eval-path bugs surface
     experiment_config.parallel_collection = False
-    experiment_config.on_policy_n_envs_per_worker = 2
-    experiment_config.on_policy_collected_frames_per_batch = 192
-    experiment_config.on_policy_minibatch_size = 25
-    experiment_config.on_policy_n_minibatch_iters = 2
-    experiment_config.max_n_frames = 384
-    experiment_config.evaluation_interval = 192
+    experiment_config.on_policy_n_envs_per_worker = 1
+    experiment_config.on_policy_collected_frames_per_batch = 96
+    experiment_config.on_policy_minibatch_size = 16
+    experiment_config.on_policy_n_minibatch_iters = 1
+    experiment_config.max_n_frames = 192
+    experiment_config.max_n_iters = 1
+    experiment_config.evaluation_interval = 96
 
     experiment_config.loggers = []
     experiment_config.create_json = True
@@ -225,40 +300,63 @@ def run_happo_test():
     print("=" * 60)
 
     algorithm_config = HGTeamHAPPOConfig.get_from_yaml()
-    algorithm_config.entropy_coef = 0.5
+    # Match EV_Charging_HGTeamHA_1node.sbatch HGTeamHA settings.
+    algorithm_config.entropy_coef = 0.01
     algorithm_config.gnn_mode = "concat"
     algorithm_config.embedding_entropy_coef = 0
     algorithm_config.embedding_diversity_coef = 0
     algorithm_config.stochastic_z = True
     algorithm_config.z_dim = 32
     algorithm_config.hypernet_actor_feature_dim = 64
-    algorithm_config.encoder_update_mode = "accumulated"
+    algorithm_config.split_z = False
+    algorithm_config.z_token_dim = 32
+    algorithm_config.z_query_dim = 32
+    algorithm_config.stochastic_z_query = True
+    algorithm_config.scale_lb = 0.0001
+    algorithm_config.lmbda = 0.99
+    algorithm_config.critic_use_other_actions = True
+    algorithm_config.encoder_update_mode = "coop_encoder"
+    algorithm_config.encoder_n_optimizer_steps = 2
+    algorithm_config.encoder_lr = 3e-4
     algorithm_config.fixed_order = False
+    algorithm_config.use_vib = True
+    algorithm_config.vib_warmup_frames = 1_000_000
+    algorithm_config.vib_beta = 1e-5
 
     task = PowerGridworldVariableTask.EVOVERNIGHT13NODE_VPP.get_from_yaml()
+    if hasattr(task, "config") and "reward_scale" in task.config:
+        task.config["reward_scale"] = 100000
 
     experiment_config = ExperimentConfig.get_from_yaml()
+    device = _device()
     experiment_config.sampling_device = "cpu"
-    experiment_config.train_device = _device()
-    experiment_config.collection_policy_device = _device()
+    experiment_config.train_device = device
+    experiment_config.collection_policy_device = device
     experiment_config.share_policy_params = True
-    experiment_config.lr = 5e-6
+    experiment_config.lr = 3e-4
     experiment_config.evaluation_episodes = 1
     experiment_config.evaluation_static = False
 
-    # Minimal scale
+    # Scale: rich when we can use CUDA, smoke-sized when the guardrail forces
+    # CPU so the single-core login-node fallback still finishes in ~1 minute.
     experiment_config.parallel_collection = False
-    experiment_config.on_policy_n_envs_per_worker = 2
-    experiment_config.on_policy_collected_frames_per_batch = 192
-    experiment_config.on_policy_minibatch_size = 25
-    experiment_config.on_policy_n_minibatch_iters = 2
-    experiment_config.max_n_frames = 384
-    experiment_config.evaluation_interval = 192
+    if device == "cuda":
+        frames = 192
+    else:
+        frames = 32
+    experiment_config.on_policy_n_envs_per_worker = 1
+    experiment_config.on_policy_collected_frames_per_batch = frames
+    experiment_config.on_policy_minibatch_size = 16
+    experiment_config.on_policy_n_minibatch_iters = 1
+    experiment_config.max_n_frames = frames
+    experiment_config.max_n_iters = 1
+    experiment_config.evaluation_interval = frames
 
     experiment_config.loggers = []
     experiment_config.create_json = True
     experiment_config.checkpoint_at_end = False
 
+    print("\nStarting HAPPO debug run...")
     experiment = Experiment(
         task=task,
         algorithm_config=algorithm_config,
@@ -267,8 +365,6 @@ def run_happo_test():
         seed=42,
         config=experiment_config,
     )
-
-    print("\nStarting HAPPO debug run...")
     experiment.run()
     print("HAPPO debug run completed successfully!\n")
 

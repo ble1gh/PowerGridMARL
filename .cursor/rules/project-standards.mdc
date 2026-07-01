@@ -1,0 +1,14 @@
+---
+description: Repo-wide Python, layout, safety, publication consistency
+alwaysApply: true
+---
+
+# PowerGridMARL — global
+
+- **Python / Ruff**: Root [`pyproject.toml`](../../pyproject.toml) → `target-version = "py310"`. [`PowerGridworld/pyproject.toml`](../../PowerGridworld/pyproject.toml) allows `>=3.8,<3.11`. Match **`requirements-benchmarl-*.txt`** on cluster (usually 3.10). `ruff check` / `ruff format` on touched files.
+- **Layout**: In-tree **BenchMARL** [`BenchMARL/`](../../BenchMARL/), **PowerGridworld** [`PowerGridworld/`](../../PowerGridworld/). Entrypoints at repo root (`run_*.py`, `smoke_test_*.py`). Avoid unrelated cross-tree refactors.
+- **`sys.path`**: Most runners prepend **`BenchMARL`**; many also prepend **`PowerGridworld`** for `gridworld`. Some tests use `PowerGridworld.gridworld...` from cwd ([`test_bus_connectivity.py`](../../test_bus_connectivity.py)). Copy the nearest script’s pattern.
+- **Publication**: Claims about **HGTeam** (contributions, domains, design ids **D2**, **D6–D8**, **S8a**, **D11–D12**, …) must match [`paper/outline.md`](../../paper/outline.md), [`docs/agent_quickstart.md`](../../docs/agent_quickstart.md), and code—do not drift prose from implementation.
+- **Secrets**: No API keys, W&B tokens, or credentials in git; use env vars.
+- **Map**: [`AGENTS.md`](../../AGENTS.md).
+- **Python venv** Use 'module load benchmarl/nightly' to activate the appropriate python venv to run anything in this project
