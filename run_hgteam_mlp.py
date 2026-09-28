@@ -51,6 +51,14 @@ def parse_args():
     parser.add_argument(
         "--wandb-tags", type=str, nargs="*", default=None, help="WandB tags for filtering runs"
     )
+    parser.add_argument(
+        "--wandb-entity",
+        type=str,
+        default=None,
+        help="WandB entity/team to log runs under. Default (omitted) uses the "
+        "account's default entity, NOT necessarily the intended team -- set "
+        "explicitly to avoid runs landing in the wrong entity.",
+    )
     parser.add_argument("--results-dir", type=Path, default=default_results_dir)
     parser.add_argument("--max-n-frames", type=int, default=10_000_000)
     parser.add_argument("--lr", type=float, default=5e-5)
@@ -140,11 +148,73 @@ def parse_args():
         help="Running-mean seeding iterations before the slow EMA takes over (overrides yaml)",
     )
     parser.add_argument(
+        "--adv-norm-ema-warmup-reduction",
+        type=str,
+        default=None,
+        choices=["mean", "median"],
+        help="Reduction for seeding the EMA reference over the warmup window: "
+        "'mean' (sensitive to startup spike) or 'median' (robust). Overrides yaml.",
+    )
+    parser.add_argument(
+        "--critic-lr-mult",
+        type=float,
+        default=None,
+        help="Multiply the critic learning rate by this factor relative to --lr "
+        "(overrides yaml; shared-GNN 1/N scaling preserved).",
+    )
+    parser.add_argument(
         "--encoder-freeze-after-frames",
         type=int,
         default=None,
         help="Freeze the shared actor GNN once total_frames >= this value (overrides yaml). "
         "0 = freeze from init (T3 frozen-encoder ablation); omit/null = never freeze.",
+    )
+
+    # --- Dynamic (SAC-style dual-ascent) per-group entropy regularization ---
+    # (PPO/HAPPO only; "dyn-" prefix avoids collision with the SAC-specific
+    # --alpha-init/--target-entropy/--min-alpha flags below, which configure a
+    # separate mechanism on a different algorithm/config class.)
+    parser.add_argument(
+        "--dynamic-entropy",
+        type=lambda x: x.lower() != "false",
+        default=None,
+        help="Replace the fixed entropy_coef bonus with a learned per-group "
+        "temperature adjusted by dual ascent to track --dyn-target-entropy "
+        "(overrides yaml). False (default) = legacy fixed-coefficient bonus. "
+        "PPO/HAPPO only.",
+    )
+    parser.add_argument(
+        "--dyn-target-entropy",
+        type=float,
+        default=None,
+        help="Target masked mean per-agent policy entropy (nats) for "
+        "--dynamic-entropy. Required when --dynamic-entropy is true; no safe "
+        "default exists (calibrate from logged entropy during healthy training).",
+    )
+    parser.add_argument(
+        "--dyn-alpha-init",
+        type=float,
+        default=None,
+        help="Initial value of the per-group entropy temperature alpha (overrides yaml).",
+    )
+    parser.add_argument(
+        "--dyn-alpha-lr",
+        type=float,
+        default=None,
+        help="Learning rate for the entropy temperature dual variable (overrides yaml). "
+        "None/omitted = use --lr (experiment lr); set lower for the two-timescale guarantee.",
+    )
+    parser.add_argument(
+        "--dyn-min-alpha",
+        type=float,
+        default=None,
+        help="Lower clamp on the entropy temperature alpha (overrides yaml).",
+    )
+    parser.add_argument(
+        "--dyn-max-alpha",
+        type=float,
+        default=None,
+        help="Upper clamp on the entropy temperature alpha (overrides yaml).",
     )
 
     # --- Algorithm selection ---
@@ -394,6 +464,24 @@ def main():
             algorithm_config.adv_norm_ema_decay = args.adv_norm_ema_decay
         if args.adv_norm_ema_warmup_iters is not None:
             algorithm_config.adv_norm_ema_warmup_iters = args.adv_norm_ema_warmup_iters
+        if args.adv_norm_ema_warmup_reduction is not None:
+            algorithm_config.adv_norm_ema_warmup_reduction = args.adv_norm_ema_warmup_reduction
+        if args.critic_lr_mult is not None:
+            algorithm_config.critic_lr_mult = args.critic_lr_mult
+
+        # Dynamic (SAC-style dual-ascent) per-group entropy regularization.
+        if args.dynamic_entropy is not None:
+            algorithm_config.dynamic_entropy = args.dynamic_entropy
+        if args.dyn_target_entropy is not None:
+            algorithm_config.target_entropy = args.dyn_target_entropy
+        if args.dyn_alpha_init is not None:
+            algorithm_config.alpha_init = args.dyn_alpha_init
+        if args.dyn_alpha_lr is not None:
+            algorithm_config.alpha_lr = args.dyn_alpha_lr
+        if args.dyn_min_alpha is not None:
+            algorithm_config.min_alpha = args.dyn_min_alpha
+        if args.dyn_max_alpha is not None:
+            algorithm_config.max_alpha = args.dyn_max_alpha
         # encoder_freeze_after_frames: 0 is meaningful (freeze from init), so
         # only the explicit None ("not passed") falls back to the yaml default.
         if args.encoder_freeze_after_frames is not None:
@@ -436,6 +524,8 @@ def main():
         wandb_extra["group"] = args.wandb_group
     if args.wandb_tags:
         wandb_extra["tags"] = args.wandb_tags
+    if args.wandb_entity:
+        wandb_extra["entity"] = args.wandb_entity
     experiment_config.wandb_extra_kwargs = wandb_extra
 
     if args.algorithm == "sac":

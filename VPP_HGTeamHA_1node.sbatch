@@ -109,11 +109,35 @@ python -c "import torch; print(f'PyTorch version: {torch.__version__}'); print(f
 nvidia-smi dmon -d 10 -s pucvmet -f $SCRDIR/gpu_usage.log &
 GPU_MONITOR_PID=$!
 
+# --- Run parameters (overridable via sbatch --export for sweeps) ---
+SEED="${SEED:-20}"
+WANDB_GROUP="${WANDB_GROUP:-}"
+WANDB_ENTITY="${WANDB_ENTITY:-brookpleigh-university-of-utah}"
+CRITIC_LR_MULT="${CRITIC_LR_MULT:-1.0}"
+EMA_REDUCTION="${EMA_REDUCTION:-mean}"
+EMA_WARMUP_ITERS="${EMA_WARMUP_ITERS:-10}"
+DYNAMIC_ENTROPY="${DYNAMIC_ENTROPY:-false}"
+TARGET_ENTROPY="${TARGET_ENTROPY:-0.35}"
+RUN_TAG="${RUN_TAG:-fixedpop_heterognn_H0.05_freeze1M_GAE_fix}"
+
+# Build the wandb run name (include group + seed so sweep runs are distinct)
+if [ -n "$WANDB_GROUP" ]; then
+    WANDB_NAME="HGTeamHA_$(date +%Y%m%d)_${WANDB_GROUP}_seed${SEED}_${SLURM_JOB_ID}"
+    GROUP_ARG="--wandb-group $WANDB_GROUP"
+else
+    WANDB_NAME="HGTeamHA_$(date +%Y%m%d)_${SLURM_JOB_ID}_${RUN_TAG}"
+    GROUP_ARG=""
+fi
+
+echo "Run config: seed=$SEED group=${WANDB_GROUP:-<none>} entity=$WANDB_ENTITY critic_lr_mult=$CRITIC_LR_MULT ema_reduction=$EMA_REDUCTION ema_warmup_iters=$EMA_WARMUP_ITERS dynamic_entropy=$DYNAMIC_ENTROPY target_entropy=$TARGET_ENTROPY"
+
 # Run experiment — HAPPO variant
 python run_hgteam_mlp.py \
-    --seed 20 \
+    --seed "$SEED" \
     --project-name "PowerGridworldVariable_VPP" \
-    --wandb-name "HGTeamHA_$(date +%Y%m%d)_${SLURM_JOB_ID}_fixedpop_coop_encoder_otheractions_heterognn_H0.1_freeze1M" \
+    --wandb-name "$WANDB_NAME" \
+    --wandb-entity "$WANDB_ENTITY" \
+    $GROUP_ARG \
     --results-dir "$SCR_RESULTS_DIR" \
     --max-n-frames 50000000 \
     --lr 3e-4 \
@@ -150,6 +174,11 @@ python run_hgteam_mlp.py \
     --encoder-update-mode coop_encoder \
     --heterognn-type heterognn \
     --encoder-freeze-after-frames 1000000 \
+    --adv-norm-ema-warmup-reduction "$EMA_REDUCTION" \
+    --adv-norm-ema-warmup-iters "$EMA_WARMUP_ITERS" \
+    --critic-lr-mult "$CRITIC_LR_MULT" \
+    --dynamic-entropy "$DYNAMIC_ENTROPY" \
+    --dyn-target-entropy "$TARGET_ENTROPY" \
 # Stop GPU monitoring
 kill $GPU_MONITOR_PID 2>/dev/null || true
 
