@@ -43,7 +43,10 @@ from benchmarl.algorithms.HGTeam import (
     HGTeam,
     HGTeamBase,
     HGTeamLoss,
+    _apply_dynamic_entropy,
     _ema_normalize_advantages,
+    _setup_dynamic_entropy,
+    _truncate_gae_at_activity_boundaries,
 )
 from benchmarl.algorithms.hgteam_modules import EmbeddingProcessor
 
@@ -194,7 +197,10 @@ class HGTeamHAPPO(HGTeamBase):
             actor_network=policy_for_loss,
             critic_network=self.get_critic(group),
             clip_epsilon=self.clip_epsilon,
-            entropy_coeff=self.entropy_coef,
+            # See HGTeam._get_loss: coeff=1.0 makes the masked-reduced
+            # loss_entropy equal exactly -H_g so process_loss_vals can apply
+            # the learned alpha_g weight itself.
+            entropy_coeff=1.0 if self.dynamic_entropy else self.entropy_coef,
             critic_coeff=self.critic_coef,
             loss_critic_type=self.loss_critic_type,
             normalize_advantage=False,
@@ -222,6 +228,13 @@ class HGTeamHAPPO(HGTeamBase):
         loss_module.register_buffer(
             "_adv_ema_std_count", torch.zeros((), dtype=torch.long, device=self.device)
         )
+        # Warmup-window batch_std samples for the median seeding reduction.
+        loss_module.register_buffer(
+            "_adv_ema_samples",
+            torch.zeros(max(int(self.adv_norm_ema_warmup_iters), 1), device=self.device),
+        )
+        if self.dynamic_entropy:
+            _setup_dynamic_entropy(loss_module, self)
         return loss_module, False
 
     def _get_parameters(self, group: str, loss: ClipPPOLoss) -> dict[str, Iterable]:
@@ -260,10 +273,13 @@ class HGTeamHAPPO(HGTeamBase):
                 critic_params, self._shared_gnn_critic
             )
 
-        return {
+        result = {
             "loss_objective": actor_params,
-            "loss_critic": critic_params,
+            "loss_critic": self._apply_critic_lr_mult(critic_params),
         }
+        if self.dynamic_entropy:
+            result["loss_alpha"] = self._alpha_param_group(loss)
+        return result
 
     def _get_policy_for_collection(
         self, policy_for_loss: TensorDictModule, group: str, continuous: bool
@@ -301,6 +317,10 @@ class HGTeamHAPPO(HGTeamBase):
                 nested_reward_key,
                 batch.get(("next", "reward")).unsqueeze(-1).expand((*group_shape, 1)),
             )
+
+        # P8: cut GAE bootstrap/trace at agent unplug boundaries (must precede
+        # the value_estimator pass).
+        _truncate_gae_at_activity_boundaries(batch, group)
 
         loss = self.get_loss_and_updater(group)[0]
         if self.minibatch_advantage:
@@ -347,6 +367,7 @@ class HGTeamHAPPO(HGTeamBase):
                     loss,
                     self.adv_norm_ema_decay,
                     self.adv_norm_ema_warmup_iters,
+                    warmup_reduction=self.adv_norm_ema_warmup_reduction,
                     experiment=self.experiment,
                     group=group,
                 )
@@ -379,6 +400,7 @@ class HGTeamHAPPO(HGTeamBase):
                     loss,
                     self.adv_norm_ema_decay,
                     self.adv_norm_ema_warmup_iters,
+                    warmup_reduction=self.adv_norm_ema_warmup_reduction,
                     experiment=self.experiment,
                     group=group,
                 )
@@ -408,8 +430,13 @@ class HGTeamHAPPO(HGTeamBase):
         self, group: str, loss_vals: TensorDictBase, batch: TensorDictBase = None
     ) -> TensorDictBase:
         """Post-process loss values: merge entropy loss into objective."""
-        loss_vals.set("loss_objective", loss_vals["loss_objective"] + loss_vals["loss_entropy"])
-        del loss_vals["loss_entropy"]
+        if self.dynamic_entropy:
+            _apply_dynamic_entropy(self, group, loss_vals)
+        else:
+            loss_vals.set(
+                "loss_objective", loss_vals["loss_objective"] + loss_vals["loss_entropy"]
+            )
+            del loss_vals["loss_entropy"]
         return loss_vals
 
     # Reuse HGTeam's critic and shared-critic helpers (inherited from
@@ -418,6 +445,8 @@ class HGTeamHAPPO(HGTeamBase):
     get_critic = HGTeam.get_critic
     _get_shared_critic = HGTeam._get_shared_critic
     _split_shared_gnn_param_groups = HGTeam._split_shared_gnn_param_groups
+    _apply_critic_lr_mult = HGTeam._apply_critic_lr_mult
+    _alpha_param_group = HGTeam._alpha_param_group
 
     # ------------------------------------------------------------------
     # Encoder freeze schedule (T3 ablation)
@@ -1753,9 +1782,23 @@ class HGTeamHAPPOConfig(AlgorithmConfig):
     adv_norm_ema: bool = MISSING
     adv_norm_ema_decay: float = MISSING
     adv_norm_ema_warmup_iters: int = MISSING
+    adv_norm_ema_warmup_reduction: str = MISSING  # "mean" or "median"
 
     # Encoder freeze schedule (T3 ablation): None=never, 0=from init, N=after N frames
     encoder_freeze_after_frames: int | None = MISSING
+
+    # Critic learning-rate multiplier (relative to experiment lr; 1.0 = no change)
+    critic_lr_mult: float = MISSING
+
+    # Dynamic (SAC-style dual-ascent) per-group entropy regularization.
+    # False = legacy fixed entropy_coef bonus (default). target_entropy has no
+    # safe default and must be set explicitly when dynamic_entropy=True.
+    dynamic_entropy: bool = MISSING
+    target_entropy: float | None = MISSING
+    alpha_init: float = MISSING
+    alpha_lr: float | None = MISSING
+    min_alpha: float | None = MISSING
+    max_alpha: float | None = MISSING
 
     # HAPPO-specific parameters
     encoder_update_mode: str = MISSING

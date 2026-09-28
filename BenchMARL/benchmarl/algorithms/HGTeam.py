@@ -9,6 +9,7 @@ import random
 import warnings
 from collections.abc import Iterable
 from dataclasses import MISSING, dataclass
+from math import log as math_log
 from math import prod
 
 import torch
@@ -48,6 +49,7 @@ def _ema_normalize_advantages(
     loss_module: "HGTeamLoss",
     decay: float,
     warmup_iters: int,
+    warmup_reduction: str = "mean",
     experiment: "Experiment" = None,  # noqa: F821
     group: str | None = None,
 ) -> None:
@@ -99,9 +101,22 @@ def _ema_normalize_advantages(
     count = loss_module._adv_ema_std_count
     ref = loss_module._adv_ema_std
     new_count = count + 1
-    if int(count.item()) < warmup_iters:
-        # Running-mean seeding over the early (healthy-signal) phase.
-        new_ref = (ref * count + batch_std) / new_count.to(ref.dtype)
+    idx = int(count.item())
+    if idx < warmup_iters:
+        if warmup_reduction == "median":
+            # Running-median seeding: robust to the large startup transient, so
+            # the frozen reference reflects the productive-phase scale rather
+            # than the early spike.  Samples are stored on a persisted buffer.
+            samples = loss_module._adv_ema_samples
+            if idx < samples.numel():
+                samples[idx] = batch_std.detach()
+                new_ref = samples[: idx + 1].median()
+            else:
+                # Window longer than the allocated buffer -> fall back to EMA.
+                new_ref = decay * ref + (1.0 - decay) * batch_std
+        else:
+            # Running-mean seeding over the early (healthy-signal) phase.
+            new_ref = (ref * count + batch_std) / new_count.to(ref.dtype)
     else:
         # Extremely slow EMA: reference tracks typical historical scale, not
         # the shrinking current std.
@@ -133,6 +148,139 @@ def _ema_normalize_advantages(
         adv[m] = (adv[m] - batch_mean) / scale
     else:
         adv.copy_((adv - batch_mean) / scale)
+
+
+def _truncate_gae_at_activity_boundaries(batch: TensorDictBase, group: str) -> None:
+    """Treat an agent's unplug (active->inactive) as terminal for GAE (P8 fix).
+
+    The per-group ``done``/``terminated`` keys are broadcast from the *shared*
+    env signals, so they only fire at episode boundaries.  When a slot goes
+    inactive mid-episode, its next-state value ``V(s_{t+1})`` is the untrained
+    output of a padded/zeroed slot, and GAE bootstraps + traces straight
+    through it -- contaminating the advantage of the agent's last active step
+    (bootstrap leakage).
+
+    Each contiguous active segment is an independent control episode (a real
+    terminal reward/penalty is realised at unplug), so we OR the *leaving*
+    transition ``active_t & ~active_{t+1}`` into both ``("next", group,
+    "terminated")`` (cuts the value bootstrap: delta_j = r_j - V(s_j)) and
+    ``("next", group, "done")`` (resets the trace).  GAE's backward recursion
+    means only the leaving boundary needs a marker: a later re-plug starts a
+    fresh segment automatically (nothing to the left of an entry propagates
+    into it), so arbitrary multi-segment plug/unplug patterns are handled with
+    no per-slot loop.
+
+    No-op when the group carries no ``active_mask`` (always-active
+    populations) -- such groups have no intra-episode leaving transitions.
+
+    Must run *after* the done/terminated broadcast and *before* the GAE
+    ``value_estimator`` pass.  Modifies ``batch`` in place.
+    """
+    active_now = batch.get((group, "active_mask"), None)
+    if active_now is None:
+        return
+    active_next = batch.get(("next", group, "active_mask"), None)
+    if active_next is None:
+        # Fallback: shift current mask one step along time (dim 0).  The final
+        # step's successor is unknown -> assume still active (the real episode
+        # done already truncates the batch tail).
+        active_next = active_now.clone()
+        active_next[:-1] = active_now[1:]
+
+    leaving = active_now.bool() & ~active_next.bool()  # (*batch, n_agents)
+    if not bool(leaving.any()):
+        return
+
+    term_key = ("next", group, "terminated")
+    done_key = ("next", group, "done")
+    term = batch.get(term_key)
+    done = batch.get(done_key)
+
+    lv = leaving
+    while lv.dim() < term.dim():
+        lv = lv.unsqueeze(-1)
+    lv = lv.expand_as(term)
+
+    # term/done may be non-writable expanded views (from the broadcast); the
+    # bitwise-or allocates a fresh contiguous tensor, so re-set it.
+    batch.set(term_key, term.bool() | lv)
+    batch.set(done_key, done.bool() | lv)
+
+
+def _setup_dynamic_entropy(loss_module: "HGTeamLoss", algorithm: "HGTeamBase") -> None:
+    """Register the learned per-group temperature ``log_alpha`` on *loss_module*.
+
+    SAC-style automatic-temperature dual ascent (Haarnoja et al., 2018): the
+    fixed-coefficient entropy bonus is replaced by a per-group ``alpha_g =
+    exp(log_alpha_g)`` trained (via ``loss_alpha`` in ``process_loss_vals``) so
+    that masked policy entropy tracks ``algorithm.target_entropy``.
+    ``log_alpha`` is an ``nn.Parameter`` so it is optimized, checkpointed, and
+    restored via the loss module's ``state_dict`` like any other weight.
+
+    ``min_log_alpha``/``max_log_alpha`` follow torchrl's SAC convention
+    (log-space bounds, clamped in place on ``log_alpha.data`` right before use)
+    so the dual variable saturates instead of drifting unboundedly when the
+    target is unreachable. Left ``None`` (no clamp) when the corresponding
+    bound is not set.
+    """
+    loss_module.register_parameter(
+        "log_alpha",
+        nn.Parameter(torch.tensor(math_log(algorithm.alpha_init), device=algorithm.device)),
+    )
+    loss_module.min_log_alpha = (
+        torch.tensor(math_log(algorithm.min_alpha), device=algorithm.device)
+        if algorithm.min_alpha is not None
+        else None
+    )
+    loss_module.max_log_alpha = (
+        torch.tensor(math_log(algorithm.max_alpha), device=algorithm.device)
+        if algorithm.max_alpha is not None
+        else None
+    )
+
+
+def _apply_dynamic_entropy(
+    algorithm: "HGTeamBase", group: str, loss_vals: TensorDictBase
+) -> None:
+    """SAC-style dual-ascent entropy regularization (replaces the fixed-coef bonus).
+
+    Requires the loss module's ``entropy_coeff`` to have been set to 1.0 (see
+    ``_get_loss``), so that ``loss_vals["loss_entropy"]`` -- the masked-mean
+    reduction already applied in ``HGTeamLoss.forward`` -- equals exactly
+    ``-H_g`` (the negative of the group's active-masked mean policy entropy),
+    differentiable w.r.t. the actor.
+
+    Sets ``loss_objective += alpha_g.detach() * loss_entropy`` (== ``-alpha_g *
+    H_g``: minimizing this maximizes entropy weighted by alpha_g, with no
+    policy gradient flowing into alpha_g itself) and adds a ``loss_alpha`` dual
+    term ``log_alpha_g * (H_g.detach() - target_entropy)`` whose gradient
+    descent raises alpha_g when entropy is below target and lowers it above.
+    Modifies ``loss_vals`` in place; deletes the raw ``loss_entropy`` key.
+    """
+    loss = algorithm.get_loss_and_updater(group)[0]
+
+    if loss.min_log_alpha is not None or loss.max_log_alpha is not None:
+        loss.log_alpha.data.clamp_(loss.min_log_alpha, loss.max_log_alpha)
+
+    alpha = loss.log_alpha.exp()
+    neg_entropy = loss_vals["loss_entropy"]  # == -H_g, differentiable
+    loss_vals.set("loss_objective", loss_vals["loss_objective"] + alpha.detach() * neg_entropy)
+
+    entropy_detached = (-neg_entropy).detach()
+    loss_vals.set(
+        "loss_alpha", loss.log_alpha * (entropy_detached - algorithm.target_entropy)
+    )
+    del loss_vals["loss_entropy"]
+
+    if algorithm.experiment is not None:
+        algorithm.experiment.logger.log(
+            {
+                f"train/dynamic_entropy/{group}_alpha": alpha.item(),
+                f"train/dynamic_entropy/{group}_policy_entropy": entropy_detached.item(),
+                f"train/dynamic_entropy/{group}_target": float(algorithm.target_entropy),
+            },
+            step=algorithm.experiment.n_iters_performed,
+        )
 
 
 class HGTeamLoss(ClipPPOLoss):
@@ -326,8 +474,18 @@ class HGTeamBase(Algorithm):
         adv_norm_ema: bool = True,
         adv_norm_ema_decay: float = 0.999,
         adv_norm_ema_warmup_iters: int = 10,
+        adv_norm_ema_warmup_reduction: str = "mean",
         # Encoder freeze schedule (T3 ablation)
         encoder_freeze_after_frames: int | None = None,
+        # Critic learning-rate multiplier (relative to experiment lr)
+        critic_lr_mult: float = 1.0,
+        # Dynamic (SAC-style dual-ascent) per-group entropy regularization
+        dynamic_entropy: bool = False,
+        target_entropy: float | None = None,
+        alpha_init: float = 1.0,
+        alpha_lr: float | None = None,
+        min_alpha: float | None = None,
+        max_alpha: float | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -340,6 +498,11 @@ class HGTeamBase(Algorithm):
         self.adv_norm_ema = adv_norm_ema
         self.adv_norm_ema_decay = adv_norm_ema_decay
         self.adv_norm_ema_warmup_iters = adv_norm_ema_warmup_iters
+        # Reduction used to seed the reference scale over the warmup window:
+        # "mean" (running mean, sensitive to the early transient spike) or
+        # "median" (running median, robust to the startup spike so the frozen
+        # reference reflects the productive-phase advantage scale).
+        self.adv_norm_ema_warmup_reduction = adv_norm_ema_warmup_reduction
 
         # Encoder freeze schedule.  None = never freeze (the shared actor GNN
         # trains for the whole run).  0 = freeze from initialisation (the
@@ -349,6 +512,31 @@ class HGTeamBase(Algorithm):
         # a frozen encoder, the instability is caused by encoder updates rather
         # than the head/critic/advantage machinery.
         self.encoder_freeze_after_frames = encoder_freeze_after_frames
+
+        # Critic LR multiplier: scales every critic param group's learning rate
+        # relative to experiment lr (the shared-GNN 1/N scaling is preserved).
+        # 1.0 = no change; used to let the critic track a fast-moving policy.
+        self.critic_lr_mult = critic_lr_mult
+
+        # Dynamic entropy regularization: replace the fixed `entropy_coef`
+        # bonus with a per-group learned temperature alpha_g, adjusted by dual
+        # ascent so masked policy entropy H_g tracks `target_entropy` (SAC-style
+        # automatic temperature; see HGTeamSAC for the off-policy analogue).
+        # False (default) preserves the exact legacy fixed-coefficient behavior.
+        self.dynamic_entropy = dynamic_entropy
+        self.target_entropy = target_entropy
+        self.alpha_init = alpha_init
+        self.alpha_lr = alpha_lr
+        self.min_alpha = min_alpha
+        self.max_alpha = max_alpha
+        if self.dynamic_entropy and self.target_entropy is None:
+            raise ValueError(
+                "dynamic_entropy=True requires an explicit target_entropy "
+                "(masked mean per-agent, per-dim nats). There is no safe "
+                "default: SAC's Gaussian '-dim(action)' heuristic does not "
+                "apply to Beta-distributed actions. Calibrate from logged "
+                "policy entropy during a healthy training window."
+            )
 
         self.share_param_critic = share_param_critic
         self.scale_mapping = scale_mapping
@@ -1490,7 +1678,10 @@ class HGTeam(HGTeamBase):
             actor_network=policy_for_loss,
             critic_network=self.get_critic(group),
             clip_epsilon=self.clip_epsilon,
-            entropy_coeff=self.entropy_coef,
+            # When dynamic_entropy, coeff=1.0 makes ClipPPOLoss's masked-reduced
+            # loss_entropy equal exactly -H_g (raw masked mean entropy), so
+            # process_loss_vals can apply the learned alpha_g weight itself.
+            entropy_coeff=1.0 if self.dynamic_entropy else self.entropy_coef,
             critic_coeff=self.critic_coef,
             loss_critic_type=self.loss_critic_type,
             normalize_advantage=False,
@@ -1518,6 +1709,13 @@ class HGTeam(HGTeamBase):
         loss_module.register_buffer(
             "_adv_ema_std_count", torch.zeros((), dtype=torch.long, device=self.device)
         )
+        # Warmup-window batch_std samples for the median seeding reduction.
+        loss_module.register_buffer(
+            "_adv_ema_samples",
+            torch.zeros(max(int(self.adv_norm_ema_warmup_iters), 1), device=self.device),
+        )
+        if self.dynamic_entropy:
+            _setup_dynamic_entropy(loss_module, self)
         return loss_module, False
 
     def _get_parameters(self, group: str, loss: ClipPPOLoss) -> dict[str, Iterable]:
@@ -1579,10 +1777,13 @@ class HGTeam(HGTeamBase):
                 critic_params, self._shared_gnn_critic
             )
 
-        return {
+        result = {
             "loss_objective": actor_params,
-            "loss_critic": critic_params,
+            "loss_critic": self._apply_critic_lr_mult(critic_params),
         }
+        if self.dynamic_entropy:
+            result["loss_alpha"] = self._alpha_param_group(loss)
+        return result
 
     def _split_shared_gnn_param_groups(
         self,
@@ -1627,6 +1828,44 @@ class HGTeam(HGTeamBase):
             {"params": other_params},
             {"params": gnn_params, "lr": scaled_lr},
         ]
+
+    def _apply_critic_lr_mult(
+        self, critic_params: list[torch.nn.Parameter] | list[dict]
+    ) -> list[torch.nn.Parameter] | list[dict]:
+        """Scale the critic's effective LR by ``self.critic_lr_mult``.
+
+        ``critic_params`` is either a plain list of Parameters (Adam then uses
+        the optimizer default lr = experiment lr) or a list of param-group
+        dicts (the shared-GNN split, whose GNN group carries an explicit
+        ``lr/N``).  To multiply the critic LR while preserving the GNN 1/N
+        scaling, we emit param-group dicts with an explicit ``lr`` on every
+        group.  A multiplier of 1.0 is a no-op.
+        """
+        mult = float(self.critic_lr_mult)
+        if mult == 1.0:
+            return critic_params
+        base_lr = self.experiment_config.lr
+        if not (len(critic_params) > 0 and isinstance(critic_params[0], dict)):
+            # Plain parameter list -> one group at base_lr * mult.
+            return [{"params": critic_params, "lr": base_lr * mult}]
+        # Param-group dicts -> scale each group's (explicit or default) lr.
+        scaled = []
+        for pg in critic_params:
+            new_pg = dict(pg)
+            new_pg["lr"] = pg.get("lr", base_lr) * mult
+            scaled.append(new_pg)
+        return scaled
+
+    def _alpha_param_group(self, loss: "HGTeamLoss") -> list:
+        """Param group for the learned per-group entropy temperature.
+
+        A dedicated (typically slower) learning rate keeps the dual-ascent
+        temperature update on a separate timescale from the policy/critic
+        updates, as required for the two-timescale convergence guarantee.
+        """
+        if self.alpha_lr is not None:
+            return [{"params": [loss.log_alpha], "lr": self.alpha_lr}]
+        return [loss.log_alpha]
 
     def _get_policy_for_collection(
         self, policy_for_loss: TensorDictModule, group: str, continuous: bool
@@ -1676,6 +1915,10 @@ class HGTeam(HGTeamBase):
                 nested_reward_key,
                 batch.get(("next", "reward")).unsqueeze(-1).expand((*group_shape, 1)),
             )
+
+        # P8: cut GAE bootstrap/trace at agent unplug boundaries (must precede
+        # the value_estimator pass).
+        _truncate_gae_at_activity_boundaries(batch, group)
 
         loss = self.get_loss_and_updater(group)[0]
         if self.minibatch_advantage:
@@ -1728,6 +1971,7 @@ class HGTeam(HGTeamBase):
                     loss,
                     self.adv_norm_ema_decay,
                     self.adv_norm_ema_warmup_iters,
+                    warmup_reduction=self.adv_norm_ema_warmup_reduction,
                     experiment=self.experiment,
                     group=group,
                 )
@@ -1765,6 +2009,7 @@ class HGTeam(HGTeamBase):
                     loss,
                     self.adv_norm_ema_decay,
                     self.adv_norm_ema_warmup_iters,
+                    warmup_reduction=self.adv_norm_ema_warmup_reduction,
                     experiment=self.experiment,
                     group=group,
                 )
@@ -1785,8 +2030,13 @@ class HGTeam(HGTeamBase):
         self, group: str, loss_vals: TensorDictBase, batch: TensorDictBase = None
     ) -> TensorDictBase:
         """Post-process loss values: merge entropy loss into objective."""
-        loss_vals.set("loss_objective", loss_vals["loss_objective"] + loss_vals["loss_entropy"])
-        del loss_vals["loss_entropy"]
+        if self.dynamic_entropy:
+            _apply_dynamic_entropy(self, group, loss_vals)
+        else:
+            loss_vals.set(
+                "loss_objective", loss_vals["loss_objective"] + loss_vals["loss_entropy"]
+            )
+            del loss_vals["loss_entropy"]
 
         # Note: embedding losses are already added to loss_objective in HGTeamLoss.forward()
         # We don't add them again here to avoid double-counting
@@ -2244,9 +2494,24 @@ class HGTeamConfig(AlgorithmConfig):
     adv_norm_ema: bool = MISSING
     adv_norm_ema_decay: float = MISSING
     adv_norm_ema_warmup_iters: int = MISSING
+    adv_norm_ema_warmup_reduction: str = MISSING  # "mean" or "median"
 
     # Encoder freeze schedule (T3 ablation): None=never, 0=from init, N=after N frames
     encoder_freeze_after_frames: int | None = MISSING
+
+    # Critic learning-rate multiplier (relative to experiment lr; 1.0 = no change)
+    critic_lr_mult: float = MISSING
+
+    # Dynamic (SAC-style dual-ascent) per-group entropy regularization.
+    # False = legacy fixed entropy_coef bonus (default). target_entropy has no
+    # safe default (see HGTeamBase.__init__) and must be set explicitly when
+    # dynamic_entropy=True.
+    dynamic_entropy: bool = MISSING
+    target_entropy: float | None = MISSING
+    alpha_init: float = MISSING
+    alpha_lr: float | None = MISSING
+    min_alpha: float | None = MISSING
+    max_alpha: float | None = MISSING
 
     @staticmethod
     def associated_class() -> type[Algorithm]:

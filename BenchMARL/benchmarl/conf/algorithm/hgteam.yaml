@@ -65,9 +65,30 @@ vib_warmup_frames: 500000 # Linearly anneal beta from 0 to vib_beta over this ma
 adv_norm_ema: True
 adv_norm_ema_decay: 0.999
 adv_norm_ema_warmup_iters: 10
+# Reduction for seeding the reference over the warmup window: "mean" (running
+# mean, sensitive to the startup transient) or "median" (running median, robust
+# to the early spike so the frozen reference reflects the productive scale).
+adv_norm_ema_warmup_reduction: "mean"
 
 # Encoder freeze schedule (T3 frozen-encoder ablation).
 # null = never freeze (default). 0 = freeze the shared actor GNN from init
 # (fixed random feature map; heads/critics still train). N = train the encoder
 # until total_frames >= N, then freeze.
 encoder_freeze_after_frames: null
+
+# Critic learning-rate multiplier relative to experiment lr (1.0 = no change).
+critic_lr_mult: 1.0
+
+# Dynamic (SAC-style dual-ascent) per-group entropy regularization.
+# When True, the fixed entropy_coef bonus is replaced by a learned per-group
+# temperature alpha_g, adjusted by dual ascent so masked policy entropy H_g
+# tracks target_entropy (nats, masked mean over active agents). False (default)
+# preserves the legacy fixed-coefficient behavior. target_entropy has NO safe
+# default (SAC's Gaussian "-dim(action)" heuristic is wrong for Beta actions)
+# and MUST be set explicitly when dynamic_entropy is True.
+dynamic_entropy: False
+target_entropy: null
+alpha_init: 1.0
+alpha_lr: null   # null = use experiment lr; set lower for the two-timescale guarantee
+min_alpha: null
+max_alpha: null
